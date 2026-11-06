@@ -3,7 +3,11 @@ import {
   type CanonicalPlannerStateV2,
 } from "./canonical-planner-state-v2";
 import type { RemoteNodeV2 } from "./remote-index-v2";
-import type { LocalFileEntry } from "./types";
+import {
+  sameSyncScope,
+  type LocalFileEntry,
+  type LocalFolderMoveHintV1,
+} from "./types";
 import type { SyncAnchorV2, SyncStateEnvelopeV2 } from "./state-envelope-v2";
 
 export type IdentityRenameActionV2 =
@@ -73,6 +77,13 @@ interface IdentityRenamePlanOptionsV2 {
     path: string;
     remoteId: string;
   }[];
+  /**
+   * Device-local host-rename evidence (`fromPath -> toPath`) bound to one
+   * committed file identity. It may prove a relocation even when the local
+   * content changed; it is single-device evidence and never replaces the
+   * remote version, destination and CAS gates below.
+   */
+  localFileMoveHints?: readonly LocalFolderMoveHintV1[];
 }
 
 /** Plan only identity-proven moves. Execution still requires local/remote CAS. */
@@ -110,14 +121,16 @@ export function planIdentityRenamesFromStateV2(
     matches.push(entry);
     unanchoredLocalByContent.set(key, matches);
   }
-  const folderIdByPath = new Map<string, string>();
-  const pathByFolderId = new Map<string, string>();
+  const committedFolderIdByPath = new Map<string, string>();
+  const committedPathByFolderId = new Map<string, string>();
   for (const [id, path] of pathByRemoteId) {
     if (state.remoteNodeById.get(id)?.kind === "folder") {
-      folderIdByPath.set(normalizeIdentityPath(path), id);
-      pathByFolderId.set(id, path);
+      committedFolderIdByPath.set(normalizeIdentityPath(path), id);
+      committedPathByFolderId.set(id, path);
     }
   }
+  const folderIdByPath = new Map(committedFolderIdByPath);
+  const pathByFolderId = new Map(committedPathByFolderId);
   for (const projected of options.projectedFolderIdentities ?? []) {
     const node = state.remoteNodeById.get(projected.remoteId);
     const key = normalizeIdentityPath(projected.path);
@@ -126,6 +139,33 @@ export function planIdentityRenamesFromStateV2(
       folderIdByPath.set(key, projected.remoteId);
       pathByFolderId.set(projected.remoteId, projected.path);
     }
+  }
+
+  // Host-rename evidence is accepted only while it is still bound to the
+  // committed anchor at its source path; a hint that survived a committed
+  // move, a scope change or a replaced identity is inert. Claims are indexed
+  // by destination so two identities cannot both claim one local file.
+  const anchorByRemoteId = new Map<string, SyncAnchorV2>();
+  for (const anchor of state.fileAnchors) {
+    if (anchor.remoteId) anchorByRemoteId.set(anchor.remoteId, anchor);
+  }
+  const hintsByRemoteId = new Map<string, LocalFolderMoveHintV1>();
+  const hintClaimsByDestination = new Map<string, LocalFolderMoveHintV1[]>();
+  for (const hint of options.localFileMoveHints ?? []) {
+    if (!sameSyncScope(hint.scope, state.scope)) continue;
+    if (hint.toPath === ".trash" || hint.toPath.startsWith(".trash/")) continue;
+    const boundAnchor = anchorByRemoteId.get(hint.remoteId);
+    if (!boundAnchor
+      || normalizeIdentityPath(hint.fromPath)
+        !== normalizeIdentityPath(boundAnchor.lastPath)) continue;
+    // The record layer keeps one hint per identity; a duplicated entry in
+    // corrupted device data must not create a phantom second claim.
+    if (hintsByRemoteId.has(hint.remoteId)) continue;
+    hintsByRemoteId.set(hint.remoteId, hint);
+    const destinationKey = normalizeIdentityPath(hint.toPath);
+    const claims = hintClaimsByDestination.get(destinationKey) ?? [];
+    claims.push(hint);
+    hintClaimsByDestination.set(destinationKey, claims);
   }
 
   const actions: IdentityRenameActionV2[] = [];
@@ -137,8 +177,13 @@ export function planIdentityRenamesFromStateV2(
       remoteIdByPath,
       localByPath,
       unanchoredLocalByContent,
+      occupiedAnchoredLocalPaths,
+      hintsByRemoteId,
+      hintClaimsByDestination,
       folderIdByPath,
       pathByFolderId,
+      committedFolderIdByPath,
+      committedPathByFolderId,
       actions,
     });
   }
@@ -160,8 +205,13 @@ function planIdentityRenameForAnchorV2(args: {
   remoteIdByPath: Map<string, string>;
   localByPath: Map<string, LocalFileEntry>;
   unanchoredLocalByContent: Map<string, LocalFileEntry[]>;
+  occupiedAnchoredLocalPaths: ReadonlySet<string>;
+  hintsByRemoteId: ReadonlyMap<string, LocalFolderMoveHintV1>;
+  hintClaimsByDestination: ReadonlyMap<string, readonly LocalFolderMoveHintV1[]>;
   folderIdByPath: Map<string, string>;
   pathByFolderId: Map<string, string>;
+  committedFolderIdByPath: Map<string, string>;
+  committedPathByFolderId: Map<string, string>;
   actions: IdentityRenameActionV2[];
 }): void {
   const {
@@ -171,8 +221,13 @@ function planIdentityRenameForAnchorV2(args: {
     remoteIdByPath,
     localByPath,
     unanchoredLocalByContent,
+    occupiedAnchoredLocalPaths,
+    hintsByRemoteId,
+    hintClaimsByDestination,
     folderIdByPath,
     pathByFolderId,
+    committedFolderIdByPath,
+    committedPathByFolderId,
     actions,
   } = args;
     if (!anchor.remoteId) return;
@@ -187,6 +242,12 @@ function planIdentityRenameForAnchorV2(args: {
     const matchingLocals = unanchoredLocalByContent.get(
       localContentKey(anchor.contentHash, anchor.size),
     ) ?? [];
+    const boundHint = anchor.remoteId
+      ? hintsByRemoteId.get(anchor.remoteId)
+      : undefined;
+    const hintedLocal = boundHint
+      ? localByPath.get(normalizeIdentityPath(boundHint.toPath))
+      : undefined;
 
     if (!remote || remote.kind !== "file" || !remotePath) {
       if (
@@ -194,14 +255,23 @@ function planIdentityRenameForAnchorV2(args: {
         && occupantId !== anchor.remoteId
         && occupant?.kind === "file"
       ) {
-        if (!oldLocal && matchingLocals.length > 0) {
+        if (!oldLocal && (matchingLocals.length > 0 || hintedLocal)) {
+          // A same-path replacement plus a proven local relocation is still
+          // ambiguous: the vanished identity cannot be proven to be the
+          // replacement. Content pairing alone missed the edited hint case;
+          // the host hint now names the real relocation, so never rebind.
+          const relocationLocals = matchingLocals.length > 0
+            ? matchingLocals
+            : [hintedLocal!];
           actions.push(conflict(
             anchor,
             anchor.lastPath,
             "replacement-with-local-relocation",
-            matchingLocals.length === 1 ? matchingLocals[0].path : undefined,
-            matchingLocals.length > 1
-              ? matchingLocals.map((entry) => entry.path)
+            relocationLocals.length === 1
+              ? relocationLocals[0].path
+              : undefined,
+            relocationLocals.length > 1
+              ? relocationLocals.map((entry) => entry.path)
               : undefined,
           ));
         } else {
@@ -258,6 +328,16 @@ function planIdentityRenameForAnchorV2(args: {
       // (file-decision-planner-v2 downloads when local matches the anchor, so
       // the remote version wins). Only a local-side change keeps the fail-
       // closed conflict for the moved path.
+      //
+      // A case/Unicode-only remote rename folds to the anchored key, so the
+      // entry the destination key holds IS `oldLocal` — a spelling alias of the
+      // moved identity, never an occupier. Reading it as occupancy produced a
+      // false `local-destination-occupied` conflict for every cloud-side
+      // capitalization change (2026-11-05, F34 family); only a destination on
+      // a different folded path can be occupied by another local file.
+      const destinationOccupied = localByPath.has(
+        normalizeIdentityPath(remotePath),
+      ) && normalizeIdentityPath(remotePath) !== anchorPathKey;
       if (localChanged) {
         actions.push(conflict(
           anchor,
@@ -265,7 +345,7 @@ function planIdentityRenameForAnchorV2(args: {
           "both-paths-diverged",
           remotePath,
         ));
-      } else if (localByPath.has(normalizeIdentityPath(remotePath))) {
+      } else if (destinationOccupied) {
         actions.push(conflict(
           anchor,
           remotePath,
@@ -304,21 +384,124 @@ function planIdentityRenameForAnchorV2(args: {
       && matchingLocals.length === 1
       && matchingLocals[0].path === remotePath) return;
 
-    // Local disappeared from the anchor path: only a unique content-identical
-    // candidate may authorize a remote identity move.
+    // Local disappeared from the anchor path. A host rename hint bound to this
+    // committed identity is stronger evidence than content pairing: it proves
+    // the relocation even when the local bytes changed. Without a usable hint
+    // the historical rule stands — only a unique content-identical candidate
+    // may authorize the move.
     if (!oldLocal) {
+      const hintResolution = resolveRelocatedLocalHintDestination({
+        anchor,
+        hint: boundHint,
+        remotePath,
+        localByPath,
+        occupiedAnchoredLocalPaths,
+        hintClaimsByDestination,
+      });
+      if (hintResolution.kind === "conflict") {
+        actions.push(hintResolution.action);
+        return;
+      }
+      if (
+        hintResolution.kind === "converged"
+        || hintResolution.kind === "blocked"
+      ) return;
+      const hintProven = hintResolution.kind === "move";
       planIdentityRenameForRelocatedLocalV2({
         anchor,
         state,
         remote,
         remotePath,
-        matchingLocals,
+        matchingLocals: hintProven
+          ? [hintResolution.destination]
+          : matchingLocals,
         remoteIdByPath,
-        folderIdByPath,
-        pathByFolderId,
+        // A hint may only land in a committed folder identity. A folder the
+        // same plan creates or moves stays with the folder layer (fail closed
+        // here) instead of widening this slice into folder projection.
+        folderIdByPath: hintProven
+          ? committedFolderIdByPath
+          : folderIdByPath,
+        pathByFolderId: hintProven
+          ? committedPathByFolderId
+          : pathByFolderId,
         actions,
       });
     }
+}
+
+type RelocatedLocalHintResolutionV2 =
+  | { kind: "none" }
+  | { kind: "blocked" }
+  | { kind: "converged" }
+  | { kind: "move"; destination: LocalFileEntry }
+  | {
+      kind: "conflict";
+      action: Extract<IdentityRenameActionV2, { type: "conflict" }>;
+    };
+
+/**
+ * Resolve the destination a host rename hint proves for a vanished local path.
+ *
+ * The hint index has already bound the hint to the committed anchor and its
+ * current source path. This phase only validates the destination against the
+ * local scan: a missing destination blocks (the file was deleted after the
+ * rename), an anchored occupant and a shared claim block as conflicts, and a
+ * destination that already equals the remote path means both sides converged.
+ */
+function resolveRelocatedLocalHintDestination(args: {
+  anchor: SyncAnchorV2;
+  hint: LocalFolderMoveHintV1 | undefined;
+  remotePath: string;
+  localByPath: Map<string, LocalFileEntry>;
+  occupiedAnchoredLocalPaths: ReadonlySet<string>;
+  hintClaimsByDestination: ReadonlyMap<string, readonly LocalFolderMoveHintV1[]>;
+}): RelocatedLocalHintResolutionV2 {
+  const {
+    anchor,
+    hint,
+    remotePath,
+    localByPath,
+    occupiedAnchoredLocalPaths,
+    hintClaimsByDestination,
+  } = args;
+  if (!hint) return { kind: "none" };
+  const destinationKey = normalizeIdentityPath(hint.toPath);
+  const destination = localByPath.get(destinationKey);
+  // The hinted destination disappeared after the rename: falling back to a
+  // content-identical copy elsewhere would claim the wrong file. Keep the
+  // ordinary deletion/conflict decision instead.
+  if (!destination) return { kind: "blocked" };
+  const claims = hintClaimsByDestination.get(destinationKey) ?? [];
+  if (claims.length > 1) {
+    return {
+      kind: "conflict",
+      action: conflict(
+        anchor,
+        destination.path,
+        "local-identity-ambiguous",
+        undefined,
+        claims
+          .filter((claim) => claim.remoteId !== hint.remoteId)
+          .map((claim) => claim.fromPath),
+      ),
+    };
+  }
+  if (occupiedAnchoredLocalPaths.has(destinationKey)) {
+    return {
+      kind: "conflict",
+      action: conflict(
+        anchor,
+        destination.path,
+        "local-destination-occupied",
+        anchor.lastPath,
+      ),
+    };
+  }
+  if (destinationKey === normalizeIdentityPath(remotePath)) {
+    return { kind: "converged" };
+  }
+  return { kind: "move", destination };
 }
 
 /**
@@ -326,13 +509,13 @@ function planIdentityRenameForAnchorV2(args: {
  * anchored path (the caller enters this phase only when no local entry
  * occupies `anchor.lastPath`).
  *
- * Only a unique content-identical local candidate may authorize relocating
- * the remote identity onto it; every other shape becomes a fail-closed
- * conflict. Every early exit is a plain return meaning "no further action for
- * this anchor": this phase is the caller's tail statement, so returning here
- * is the same as returning from `planIdentityRenameForAnchorV2`. All produced
- * actions are pushed into the shared `actions` array passed by reference, so
- * the phase owns no products of its own.
+ * The caller supplies either the hint-proven destination (one entry) or the
+ * historical unique content-identical candidates. Every other shape becomes a
+ * fail-closed conflict. Every early exit is a plain return meaning "no further
+ * action for this anchor": this phase is the caller's tail statement, so
+ * returning here is the same as returning from `planIdentityRenameForAnchorV2`.
+ * All produced actions are pushed into the shared `actions` array passed by
+ * reference, so the phase owns no products of its own.
  */
 function planIdentityRenameForRelocatedLocalV2(args: {
   anchor: SyncAnchorV2;
@@ -464,7 +647,7 @@ function conflict(
   reason: Extract<IdentityRenameActionV2, { type: "conflict" }>["reason"],
   relatedPath?: string,
   relatedPaths?: string[],
-): IdentityRenameActionV2 {
+): Extract<IdentityRenameActionV2, { type: "conflict" }> {
   return {
     type: "conflict",
     anchorId: anchor.anchorId,

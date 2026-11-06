@@ -26,7 +26,18 @@ class MemoryRecoveryAdapter {
   readonly failAfterWrite = new Set<string>();
   readonly failAfterRename = new Set<string>();
   readonly failAfterRemove = new Set<string>();
+  /** Number of pre-operation WebKit auto-commit failures per operation. */
+  readonly webkitTransactionFailures = new Map<string, number>();
   readonly mtimes = new Map<string, number>();
+
+  private failBefore(operation: "write" | "rename" | "remove"): void {
+    const remaining = this.webkitTransactionFailures.get(operation) ?? 0;
+    if (remaining <= 0) return;
+    this.webkitTransactionFailures.set(operation, remaining - 1);
+    throw new Error(
+      "Attempt to delete range from database without an in-progress transaction",
+    );
+  }
 
   async exists(path: string): Promise<boolean> {
     return this.files.has(path) || this.folders.has(path);
@@ -39,6 +50,7 @@ class MemoryRecoveryAdapter {
   }
 
   async write(path: string, value: string): Promise<void> {
+    this.failBefore("write");
     this.files.set(path, value);
     if (this.failAfterWrite.delete(path)) {
       throw new Error(`injected response loss after write: ${path}`);
@@ -46,6 +58,7 @@ class MemoryRecoveryAdapter {
   }
 
   async rename(from: string, to: string): Promise<void> {
+    this.failBefore("rename");
     const value = this.files.get(from);
     if (value === undefined) throw new Error(`missing: ${from}`);
     this.files.set(to, value);
@@ -56,6 +69,7 @@ class MemoryRecoveryAdapter {
   }
 
   async remove(path: string): Promise<void> {
+    this.failBefore("remove");
     this.files.delete(path);
     if (this.failAfterRemove.delete(path)) {
       throw new Error(`injected response loss after remove: ${path}`);
@@ -343,6 +357,35 @@ describe("IndexedDB authority recovery substrate", () => {
     );
     expect(await canonicalEnvelopeDigest(await renamed.rebuild()))
       .toBe(await canonicalEnvelopeDigest(next));
+  });
+
+  it("retries one iOS WebKit auto-committed transaction error at the recovery boundary", async () => {
+    const source = createLargeV2Envelope(10);
+
+    const writeFiles = new MemoryRecoveryAdapter();
+    const writeStore = recoveryStore(writeFiles);
+    writeFiles.webkitTransactionFailures.set("write", 1);
+    await writeStore.publishCheckpoint(source);
+    expect(writeFiles.files.has(writeStore.checkpointPath(source.meta.commitSeq)))
+      .toBe(true);
+
+    const renameFiles = new MemoryRecoveryAdapter();
+    const renameStore = recoveryStore(renameFiles);
+    renameFiles.webkitTransactionFailures.set("rename", 1);
+    await renameStore.publishCheckpoint(source);
+    expect(renameFiles.files.has(renameStore.checkpointPath(source.meta.commitSeq)))
+      .toBe(true);
+  });
+
+  it("does not retry a second iOS WebKit auto-committed transaction error", async () => {
+    const source = createLargeV2Envelope(10);
+    const files = new MemoryRecoveryAdapter();
+    const store = recoveryStore(files);
+    files.webkitTransactionFailures.set("write", 2);
+
+    await expect(store.publishCheckpoint(source)).rejects.toThrow(
+      "without an in-progress transaction",
+    );
   });
 
   it("blocks a deleted database when a prepared delta has no commit witness", async () => {

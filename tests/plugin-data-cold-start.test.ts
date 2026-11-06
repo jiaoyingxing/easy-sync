@@ -2209,8 +2209,16 @@ describe("plugin data cold-start cache", () => {
       isV2StateActive: false,
     } as never;
 
+    // Settings now settle before the state load starts; join that read first
+    // so this case still measures the state-load promise sharing.
+    await (plugin as unknown as { ensureSettingsLoaded(): Promise<void> })
+      .ensureSettingsLoaded();
     const firstLoad = plugin.ensureStateLoaded();
     const secondLoad = plugin.ensureStateLoaded();
+    // Each entry yields on the settled settings await before reaching
+    // state.load(); let those continuations run, then release the load.
+    await Promise.resolve();
+    await Promise.resolve();
     releaseLoad?.();
     await Promise.all([firstLoad, secondLoad]);
 
@@ -3141,6 +3149,31 @@ describe("plugin data cold-start cache", () => {
     expect(settings).toEqual(auth);
     expect(auth).toEqual(state);
     expect(settings).not.toBe(auth);
+  });
+
+  it("serves startup readers the shared cache without a second whole-object clone", async () => {
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({ "sync-interval": 5 });
+    const readSnapshot = (plugin as unknown as {
+      readPluginDataSnapshot(): Promise<Record<string, unknown> | null>;
+    }).readPluginDataSnapshot.bind(plugin);
+
+    // Startup consumers (settings, auth profile) read the cache directly;
+    // mutating this object is forbidden, but two reads must not pay two
+    // serializations of a potentially large data.json.
+    const [first, second] = await Promise.all([
+      readSnapshot(),
+      readSnapshot(),
+    ]);
+    expect(first).toBe(second);
+
+    // The public API keeps its defensive copy contract for mutable callers.
+    const [third, fourth] = await Promise.all([
+      plugin.loadPluginData(),
+      plugin.loadPluginData(),
+    ]);
+    expect(third).not.toBe(fourth);
+    expect(third).not.toBe(first);
   });
 
   it("A0-P reports whole-file PluginData write cost only through the existing state diagnostics", async () => {

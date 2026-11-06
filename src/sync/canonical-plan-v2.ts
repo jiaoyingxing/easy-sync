@@ -388,6 +388,7 @@ interface CanonicalPlannedFileMovementsInputV2 {
   carriedFolderMoves: readonly { sourcePath: string; targetPath: string }[];
   includeFilePath: (path: string) => boolean;
   remoteFilesById: ReadonlyMap<string, RemoteFileEntry>;
+  localFileMoveHints?: readonly LocalFolderMoveHintV1[];
 }
 
 /**
@@ -405,12 +406,13 @@ function collectPlannedFileMoveTargetsV2({
   carriedFolderMoves,
   includeFilePath,
   remoteFilesById,
+  localFileMoveHints,
 }: CanonicalPlannedFileMovementsInputV2): Map<string, string> {
   const targets = new Map<string, string>();
   for (const action of planIdentityRenamesFromStateV2(
     state,
     localFiles,
-    { projectedFolderIdentities },
+    { projectedFolderIdentities, localFileMoveHints },
   )) {
     if (action.type !== "move-local") continue;
     if (
@@ -564,6 +566,7 @@ function composeCanonicalActionsV2(
     carriedFolderMoves,
     includeFilePath,
     remoteFilesById,
+    localFileMoveHints: input.localFileMoveHints,
   });
   const createItems: SyncPlanItem[] = [];
   const moveItems: SyncPlanItem[] = [];
@@ -672,6 +675,7 @@ function composeCanonicalActionsV2(
     protectedRoots,
     fileItems,
     deferredItems,
+    localFileMoveHints: input.localFileMoveHints,
   });
   fileItems = identityResult.fileItems;
   const {
@@ -1475,6 +1479,7 @@ function applyIdentityRenameActionsV2(args: {
   protectedRoots: Set<string>;
   fileItems: SyncPlanItem[];
   deferredItems: SyncPlanItem[];
+  localFileMoveHints?: readonly LocalFolderMoveHintV1[];
 }): {
   fileItems: SyncPlanItem[];
   identityItems: SyncPlanItem[];
@@ -1490,6 +1495,7 @@ function applyIdentityRenameActionsV2(args: {
     remoteFilesById,
     protectedRoots,
     deferredItems,
+    localFileMoveHints,
   } = args;
   let { fileItems } = args;
   const identityItems: SyncPlanItem[] = [];
@@ -1498,7 +1504,7 @@ function applyIdentityRenameActionsV2(args: {
   for (const action of planIdentityRenamesFromStateV2(
     state,
     localFiles,
-    { projectedFolderIdentities },
+    { projectedFolderIdentities, localFileMoveHints },
   )) {
     if (action.type === "conflict" && !includeFilePath(action.path)) continue;
     if (

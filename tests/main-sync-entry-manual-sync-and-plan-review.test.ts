@@ -311,6 +311,42 @@ describe("main sync entry guards", () => {
     expect(render).toHaveBeenCalledOnce();
   });
 
+  it("does not mark a full-sync progress state when a side action already owns the executor", async () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      lastSyncTime: 1,
+      planReviewActive: false,
+      isV2StateActive: false,
+    } as never;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    vi.spyOn(plugin as never, "checkAccountBindingForSync").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "preparePublic113MigrationSettings")
+      .mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "reconcileCommunityPluginParticipationFromLocalBundles")
+      .mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "prepareCommunityPluginJoinsForSync")
+      .mockResolvedValue({ authorizations: [] });
+    const markStarted = vi.spyOn(plugin.progressStore, "markStarted");
+    const run = vi.fn().mockResolvedValue({
+      ...okResult(),
+      success: false,
+      message: "result.alreadyRunning",
+    });
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: true,
+      run,
+    } as never;
+
+    await plugin.startManualSync();
+
+    // 侧动作在飞时执行器只会回 alreadyRunning（早于它自己的 try/finally），
+    // 此时若先 markStarted，就会把上一轮的文件名与计数留在顶部；必须不标记。
+    expect(run).toHaveBeenCalledOnce();
+    expect(markStarted).not.toHaveBeenCalled();
+    expect(plugin.progressStore.state.startedAt).toBe(0);
+  });
+
   it("releases the sync lock when manual sync is blocked before execution", async () => {
     const plugin = makePlugin();
     plugin.syncExecutor = { isRunning: false } as never;

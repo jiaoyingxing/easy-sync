@@ -127,3 +127,18 @@ export function isV2BaseUpsertRejectionError(error: unknown): boolean {
       || error.kind === "V2 base upsert would replace another anchor"
     );
 }
+
+/**
+ * Every refusal that says "the receipt names a path the committed tree cannot
+ * bind": no remote identity at the path, a moved identity without its source
+ * deletion, or a parent path that does not match. They share one read-only
+ * repair ladder — refresh the committed tree once — and one follow-up: when
+ * the live service still projects the identity under another case/Unicode
+ * spelling, the durable receipt is what has to move to the index spelling
+ * (2026-11-05 field case F36: `科研大神/meta分析.md` vs `科研大神/Meta分析.md`).
+ */
+export function isV2StatePathRefusalError(error: unknown): boolean {
+  return isV2BaseUpsertRejectionError(error)
+    || isV2RemoteUpsertParentMismatchError(error)
+    || isV2RemoteMoveMissingSourceDeletionError(error);
+}

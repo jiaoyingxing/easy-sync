@@ -9,6 +9,7 @@
 
 import { compareText } from "./compare-text";
 import { describeError, isRecord } from "../obsidian-compat";
+import { retryIndexedDbTransaction, yieldToEventLoop } from "./indexeddb-transaction-retry";
 import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import type { RemoteNodeV2 } from "./remote-index-v2";
@@ -712,9 +713,18 @@ export class StateV2IndexedDbRecoveryStore {
         || (deltaSeq !== null && deltaSeq <= envelope.meta.commitSeq)
         || (witnessSeq !== null && witnessSeq <= envelope.meta.commitSeq)
       ) {
-        await this.adapter.remove(path);
+        await this.removeRecoveryRecordIfPresent(path);
       }
     }
+  }
+
+  /** Idempotent retirement for compaction: a WebKit auto-commit error can
+   *  arrive after the bytes were already removed, so the retry only proves
+   *  absence instead of repeating `remove` blindly. */
+  private async removeRecoveryRecordIfPresent(path: string): Promise<void> {
+    await retryIndexedDbTransaction(async () => {
+      if (await this.adapter.exists(path)) await this.adapter.remove(path);
+    });
   }
 
   async shouldCompact(
@@ -761,6 +771,18 @@ export class StateV2IndexedDbRecoveryStore {
   }
 
   private async publishImmutable(
+    target: string,
+    value:
+      | StateV2IndexedDbRecoveryCheckpointV1
+      | StateV2IndexedDbRecoveryDeltaV1
+      | StateV2IndexedDbRecoveryCommitWitnessV1,
+  ): Promise<void> {
+    await retryIndexedDbTransaction(
+      () => this.publishImmutableOnce(target, value),
+    );
+  }
+
+  private async publishImmutableOnce(
     target: string,
     value:
       | StateV2IndexedDbRecoveryCheckpointV1
@@ -923,6 +945,9 @@ export class StateV2IndexedDbRecoveryStore {
       } catch (error) {
         if (!await this.adapter.exists(path)) return;
         if (attempt === 1) throw error;
+        // The previous transaction may have auto-committed (iOS WebKit); a
+        // fresh macrotask gives the next remove a fresh transaction.
+        await yieldToEventLoop();
         continue;
       }
       if (!await this.adapter.exists(path)) return;
@@ -931,6 +956,10 @@ export class StateV2IndexedDbRecoveryStore {
   }
 
   private async recoverStagedRecords(): Promise<void> {
+    await retryIndexedDbTransaction(() => this.recoverStagedRecordsOnce());
+  }
+
+  private async recoverStagedRecordsOnce(): Promise<void> {
     const { files } = await this.adapter.list(this.directory);
     const stagedPaths = files
       .filter((path) => path.endsWith(`${FILE_SUFFIX}${STAGED_SUFFIX}`))
@@ -1037,6 +1066,10 @@ export class StateV2IndexedDbRecoveryStore {
   }
 
   private async ensureDirectory(): Promise<void> {
+    await retryIndexedDbTransaction(() => this.ensureDirectoryOnce());
+  }
+
+  private async ensureDirectoryOnce(): Promise<void> {
     if (await this.adapter.exists(this.directory)) return;
     try {
       await this.adapter.mkdir(this.directory);

@@ -36,20 +36,22 @@ const INDEXED_DB_ERROR_NAMES = new Set([
   "VersionError",
 ]);
 
-export function classifyIndexedDbError(error: unknown): IndexedDbErrorKind {
-  if (error == null) return "none";
-  const name = error instanceof Error
-    ? error.name
-    : typeof error === "object" && error !== null && "name" in error
-      && typeof error.name === "string"
-      ? error.name
-      : "";
-  const message = error instanceof Error
-    ? error.message
-    : typeof error === "object" && error !== null && "message" in error
-      && typeof error.message === "string"
-      ? error.message
-      : Object.prototype.toString.call(error);
+/** How far a wrapped cause chain is followed. Hosts wrap adapter failures in
+ *  their own Error ("Unable to delete file", "Unable to rename"), so the
+ *  database shape can sit one or two levels below the surface error. */
+const MAX_CAUSE_DEPTH = 3;
+
+function readStringField(value: unknown, field: string): string | undefined {
+  if (value == null || typeof value !== "object") return undefined;
+  if (!(field in value)) return undefined;
+  const raw = (value as Record<string, unknown>)[field];
+  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+}
+
+function classificationOf(value: unknown): IndexedDbErrorKind {
+  const name = readStringField(value, "name") ?? "";
+  const message = readStringField(value, "message")
+    ?? Object.prototype.toString.call(value);
   if (
     name === "UnknownError"
     || name === "TransactionInactiveError"
@@ -59,6 +61,35 @@ export function classifyIndexedDbError(error: unknown): IndexedDbErrorKind {
   }
   if (INDEXED_DB_ERROR_NAMES.has(name)) return "indexeddb";
   return "other";
+}
+
+export function classifyIndexedDbError(error: unknown): IndexedDbErrorKind {
+  if (error == null) return "none";
+  let current: unknown = error;
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth += 1) {
+    const kind = classificationOf(current);
+    if (kind !== "other") return kind;
+    if (current == null || typeof current !== "object") return "other";
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === undefined || cause === current || cause === null) return "other";
+    current = cause;
+  }
+  return "other";
+}
+
+/** The level of the cause chain that actually carries the database shape, so
+ *  the reported name and stack point at the layer that failed instead of the
+ *  wrapper. Falls back to the surface error. */
+function indexedDbErrorCarrier(error: unknown): unknown {
+  let current: unknown = error;
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth += 1) {
+    if (classificationOf(current) !== "other") return current;
+    if (current == null || typeof current !== "object") return error;
+    const cause = (current as { cause?: unknown }).cause;
+    if (cause === undefined || cause === current || cause === null) return error;
+    current = cause;
+  }
+  return error;
 }
 
 interface IndexedDbErrorFingerprint {
@@ -75,25 +106,24 @@ export function fingerprintIndexedDbError(
 ): IndexedDbErrorFingerprint | null {
   const dbErrorKind = classifyIndexedDbError(error);
   if (dbErrorKind === "none" || dbErrorKind === "other") return null;
+  const carrier = indexedDbErrorCarrier(error);
   const fingerprint: IndexedDbErrorFingerprint = {
-    message: error instanceof Error
-      ? error.message
-      : typeof error === "object" && error !== null && "message" in error
-        && typeof error.message === "string"
-        ? error.message
-        : Object.prototype.toString.call(error),
+    message: readStringField(error, "message")
+      ?? Object.prototype.toString.call(error),
     dbErrorKind,
   };
-  if (error instanceof Error) {
-    if (error.name) fingerprint.name = error.name;
-    const stack = error.stack;
-    if (stack) {
-      const firstFrame = stack
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line.length > 0 && !line.startsWith("Error"));
-      if (firstFrame) fingerprint.stackFirstFrame = firstFrame;
-    }
+  const name = readStringField(carrier, "name");
+  if (name) fingerprint.name = name;
+  // WebKit raises IndexedDB failures as DOMException, which is not guaranteed
+  // to be `instanceof Error`, so read `stack` off the carrier object directly.
+  const stack = readStringField(carrier, "stack")
+    ?? readStringField(error, "stack");
+  if (stack) {
+    const firstFrame = stack
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0 && !line.startsWith("Error"));
+    if (firstFrame) fingerprint.stackFirstFrame = firstFrame;
   }
   return fingerprint;
 }

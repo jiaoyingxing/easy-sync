@@ -528,22 +528,27 @@ export class StateV2IndexedDbActiveStore {
       { durability: "strict" },
     );
     try {
-      await applyRowChanges(
+      const requests: Promise<unknown>[] = [];
+      applyRowChanges(
         tx.objectStore("remoteNodes"),
         remoteNodes,
         (node) => node.id,
+        requests,
       );
-      await applyRowChanges(
+      applyRowChanges(
         tx.objectStore("anchors"),
         anchors,
         (anchor) => anchor.anchorId,
+        requests,
       );
-      await applyRowChanges(
+      applyRowChanges(
         tx.objectStore("folderAnchors"),
         folderAnchors,
         (anchor) => anchor.anchorId,
+        requests,
       );
-      await tx.objectStore("meta").put(nextMeta, STATE_META_KEY);
+      requests.push(tx.objectStore("meta").put(nextMeta, STATE_META_KEY));
+      await Promise.all(requests);
       await tx.done;
     } catch (error) {
       abortTransaction(tx);
@@ -831,7 +836,7 @@ function envelopeCounts(
   };
 }
 
-async function applyRowChanges<
+function applyRowChanges<
   Value extends RemoteNodeV2 | SyncAnchorV2 | FolderAnchorV2,
 >(
   store: {
@@ -840,11 +845,16 @@ async function applyRowChanges<
   },
   changes: { upserts: Value[]; deletes: string[] },
   keyOf: (value: Value) => string,
-): Promise<void> {
-  for (const key of changes.deletes) await store.delete(key);
-  for (const value of changes.upserts) {
-    await store.put(value, keyOf(value));
-  }
+  requests: Promise<unknown>[],
+): void {
+  // Issuing every request synchronously (no `await` between them) keeps the
+  // whole batch inside the task that created the transaction. iOS WebKit
+  // auto-commits a transaction when control leaves that task; awaiting each
+  // delete/put let a later request land on a dead handle and fail with
+  // "Attempt to delete range from database without an in-progress
+  // transaction" (2026-11-06 field recurrence; see the WebKit plan doc).
+  for (const key of changes.deletes) requests.push(store.delete(key));
+  for (const value of changes.upserts) requests.push(store.put(value, keyOf(value)));
 }
 
 async function putBatches<

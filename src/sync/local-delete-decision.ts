@@ -82,7 +82,7 @@ interface ApplyLocalDeleteDecisionsResult {
   changed: boolean;
 }
 
-const FILE_DECISION_PATH_FACT_VERSION = "local-delete-decision-path-v1";
+const FILE_DECISION_PATH_FACT_VERSION = "local-delete-decision-path-v2";
 const FOLDER_DECISION_PATH_FACT_VERSION = "local-folder-delete-decision-path-v1";
 const FILE_RECORD_TOKEN_PREFIX = "local-delete:";
 const FOLDER_RECORD_TOKEN_PREFIX = "local-folder-delete:";
@@ -174,9 +174,15 @@ export function localFolderDeleteDecisionRecordToken(
 /**
  * Exact authorization fact for one file path. Every field that can change the
  * meaning of the user's confirmation is included: the local content, the
- * ancestor content, the (absent) remote side, and the sync identity. A change
- * in any of them makes the recorded hash unmatched, so the decision is not
- * consumed.
+ * (absent) remote side, and the sync identity. A change in any of them makes
+ * the recorded hash unmatched, so the decision is not consumed.
+ *
+ * `ancestorHash` is deliberately excluded (v2, 2026-11-06): the merge base is
+ * this device's own bookkeeping — the executor moves it whenever a committed
+ * batch, re-baseline or migration lands — and no decision action reads it. A
+ * row the user confirmed before that move is still the same file pair, so
+ * hashing the base here dropped explicit confirmations for a fact the user
+ * never saw. The folder variant of this hash never included it either.
  */
 export function localDeleteDecisionPathHash(
   token: SyncDecisionToken,
@@ -198,7 +204,6 @@ export function localDeleteDecisionPathHash(
     token.remote.exists
       ? [token.remote.driveId, token.remote.eTag]
       : null,
-    token.ancestorHash,
   ]));
 }
 

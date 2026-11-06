@@ -1527,6 +1527,47 @@ describe("canonical V2 plan candidate", () => {
     ]);
   });
 
+  it("recognizes an in-scope host rename with edited content as an identity move", () => {
+    const state = envelope({
+      folders: [{ id: "notes-folder", name: "Notes" }],
+      files: [{ id: "note", name: "note.md" }],
+      folderAnchors: [folderAnchor("notes-folder", "Notes")],
+      fileAnchors: [fileAnchor("note", "note.md")],
+    });
+    const candidate = build({
+      state,
+      localFiles: [localFile("Notes/moved.md", hashB)],
+      localFolders: localFolders("Notes"),
+      localFileMoveHints: [{
+        version: 1 as const,
+        scope,
+        remoteId: "note",
+        fromPath: "note.md",
+        toPath: "Notes/moved.md",
+        observedAt: 2,
+      }],
+    });
+
+    const actions = candidate.items.map((item) => ({
+      type: item.type,
+      path: item.path,
+      renameFrom: item.renameFrom,
+    }));
+    expect(actions).toContainEqual({
+      type: SyncActionType.RenameRemote,
+      path: "Notes/moved.md",
+      renameFrom: "note.md",
+    });
+    expect(actions).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.Upload,
+      path: "Notes/moved.md",
+    }));
+    expect(actions).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.DeleteRemote,
+      path: "note.md",
+    }));
+  });
+
   it("keeps legacy move verification inside the shared ten-read budget", async () => {
     const moves = Array.from({ length: 11 }, (_, index) => ({
       id: `file-${index}`,
@@ -3712,5 +3753,92 @@ describe("local delete decisions sealed into the plan (S4)", () => {
     );
     expect(sealed.preDecisionRequiresThresholdConfirmation).toBe(false);
     expect(sealed.requiresThresholdConfirmation).toBe(true);
+  });
+});
+
+describe("sibling deferral locality", () => {
+  it("keeps an unrelated new file in the same parent when a sibling identity move is deferred", () => {
+    const state = envelope({
+      folders: [
+        { id: "proj", name: "Projects" },
+        { id: "alpha", name: "Alpha", parentId: "proj" },
+        { id: "gamma", name: "Gamma", parentId: "proj" },
+        { id: "delta", name: "Delta", parentId: "proj" },
+        { id: "archive", name: "Archive" },
+      ],
+      files: [
+        { id: "c", name: "note-c.md", parentId: "gamma", hash: "c".repeat(64), cTag: "c2" },
+        { id: "r", name: "Root.md", hash: hashA, cTag: "r2" },
+        { id: "occupant", name: "root-moved.md", parentId: "archive", hash: "c".repeat(64) },
+      ],
+      folderAnchors: [
+        folderAnchor("proj", "Projects"),
+        folderAnchor("alpha", "Projects/Alpha", "proj"),
+        folderAnchor("gamma", "Projects/Gamma", "proj"),
+        folderAnchor("delta", "Projects/Delta", "proj"),
+        folderAnchor("archive", "Archive"),
+      ],
+      fileAnchors: [
+        fileAnchor("c", "Projects/Gamma/note-c.md", hashA, 10, "c1"),
+        fileAnchor("r", "Root.md", hashA, 10, "r1"),
+      ],
+    });
+    const candidate = build({
+      state,
+      localFiles: [
+        localFile("Projects/Alpha/note-c2.md", hashB, 11),
+        localFile("Archive/root-moved.md", hashA, 10),
+        localFile("Projects/Delta/note-d.md", "d".repeat(64), 8),
+      ],
+      localFolders: localFolders(
+        "Projects",
+        "Projects/Alpha",
+        "Projects/Gamma",
+        "Projects/Delta",
+        "Archive",
+      ),
+      localFileMoveHints: [
+        {
+          version: 1,
+          scope,
+          remoteId: "c",
+          fromPath: "Projects/Gamma/note-c.md",
+          toPath: "Projects/Alpha/note-c2.md",
+          observedAt: 2,
+        },
+        {
+          version: 1,
+          scope,
+          remoteId: "r",
+          fromPath: "Root.md",
+          toPath: "Archive/root-moved.md",
+          observedAt: 2,
+        },
+      ],
+    });
+
+    expect(candidate.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: SyncActionType.Upload,
+        path: "Projects/Delta/note-d.md",
+      }),
+      expect.objectContaining({
+        type: SyncActionType.FolderDeferred,
+        path: "Projects/Gamma/note-c.md",
+        reason: "reason.identityMove.contentChanged",
+      }),
+      expect.objectContaining({
+        type: SyncActionType.FolderDeferred,
+        path: "Archive/root-moved.md",
+        reason: "reason.identityMove.remoteTargetOccupied",
+      }),
+    ]));
+    expect(candidate.items.filter((item) =>
+      isAtOrBelowPath(item.path, "Projects/Delta"))).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.Upload,
+        path: "Projects/Delta/note-d.md",
+      }),
+    ]);
   });
 });

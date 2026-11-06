@@ -212,19 +212,32 @@ export class SyncProgressStore {
     }
   }
 
-  /** Update progress within the current phase */
+  /** Update progress within the current phase.
+   *
+   *  `knownTotalBytes` is the size the plan already knows for this item. It is
+   *  not transfer progress: an item that cannot report intermediate bytes
+   *  (mobile whole-body fallbacks, non-streaming transports) still gets an
+   *  honest `0 / size` row from its first visible moment instead of an empty
+   *  right-hand slot. Real byte callbacks then advance it through
+   *  `setByteProgress`. */
   setProgress(
     current: number,
     total: number,
     currentFile: string,
     currentActionType?: SyncActionType,
+    knownTotalBytes?: number,
   ): void {
     const itemChanged = this._state.current !== current
       || this._state.currentFile !== currentFile
       || this._state.currentActionType !== currentActionType;
     if (itemChanged) {
       this._state.currentItemBytes = 0;
-      this._state.currentItemTotalBytes = 0;
+      this._state.currentItemTotalBytes =
+        knownTotalBytes !== undefined
+        && Number.isFinite(knownTotalBytes)
+        && knownTotalBytes > 0
+          ? Math.max(0, Math.floor(knownTotalBytes))
+          : 0;
       this._state.currentItemComplete = false;
     }
     this._state.current = current;

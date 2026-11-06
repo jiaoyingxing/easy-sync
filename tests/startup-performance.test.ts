@@ -55,6 +55,15 @@ describe("StartupPerformanceTracker", () => {
       },
       state: readyState,
       auth: readyAuth,
+      stages: [
+        { stage: "onload:ui-ready", atMs: 4.125 },
+        { stage: "state:ready", atMs: 12.5 },
+        { stage: "auth:ready", atMs: 750.75 },
+      ],
+      onloadReturnedMs: null,
+      layoutReadyMs: null,
+      hostLayoutWaitMs: null,
+      host: null,
     });
     expect(tracker.takeCompletedSummary()).toBeNull();
   });
@@ -116,5 +125,55 @@ describe("StartupPerformanceTracker", () => {
     tracker.markAuthReady(readyAuth);
 
     expect(tracker.takeCompletedSummary()).toBeNull();
+  });
+
+  it("separates the plugin onload segment from the host layout-ready wait", () => {
+    let now = 0;
+    const tracker = new StartupPerformanceTracker(() => now);
+
+    tracker.begin("mobile");
+    tracker.setHostFacts({
+      apiVersion: "1.11.4",
+      pluginVersion: "1.6.6",
+      visibilityAtOnload: "visible",
+    });
+    now = 10;
+    tracker.markOnloadReturned();
+    now = 110;
+    tracker.markLayoutReady();
+    now = 2;
+    tracker.markUiReady();
+    now = 20;
+    tracker.markStateReady(readyState);
+    now = 30;
+    tracker.markAuthReady(readyAuth);
+    // Marks may complete out of declaration order once work is parallel;
+    // export sorts by the recorded time instead of call order.
+    now = 8;
+    tracker.markStage("settings:loaded");
+    now = 4;
+    tracker.markStage("plugin-data:read");
+
+    const summary = tracker.takeCompletedSummary();
+    expect(summary).toMatchObject({
+      platform: "mobile",
+      onloadReturnedMs: 10,
+      layoutReadyMs: 110,
+      hostLayoutWaitMs: 100,
+      host: {
+        apiVersion: "1.11.4",
+        pluginVersion: "1.6.6",
+        visibilityAtOnload: "visible",
+      },
+    });
+    expect(summary?.stages.map((mark) => mark.stage)).toEqual([
+      "onload:ui-ready",
+      "plugin-data:read",
+      "settings:loaded",
+      "onload:returned",
+      "state:ready",
+      "auth:ready",
+      "host:layout-ready",
+    ]);
   });
 });

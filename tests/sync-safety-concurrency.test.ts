@@ -98,6 +98,7 @@ describe("Bounded small-file upload concurrency", () => {
     let peakUploads = 0;
     const events: string[] = [];
     const progressStore = new SyncProgressStore();
+    const setProgressSpy = vi.spyOn(progressStore, "setProgress");
     const uploadFile = vi.fn().mockImplementation(async (
       _vault: string,
       path: string,
@@ -173,6 +174,14 @@ describe("Bounded small-file upload concurrency", () => {
     const result = await executor.run("manual", {});
 
     expect(result.uploaded).toBe(9);
+    // 传输项开始时应把计划已知大小交给侧栏：移动端非流式/整包回退没有中间
+    // 字节回调时，名称行右侧仍能显示 0/大小，而不是一直空白。
+    expect(
+      setProgressSpy.mock.calls.some(([, , path, actionType, knownBytes]) =>
+        path === "large.bin"
+        && actionType === SyncActionType.Upload
+        && knownBytes === largeContent.byteLength),
+    ).toBe(true);
     expect(result.metrics?.fileTransfers.upload).toMatchObject({
       started: 9,
       succeeded: 9,

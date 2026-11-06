@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { I18n } from "../src/i18n";
+import EasySyncPlugin from "../src/main";
 import { AuthErrorType } from "../src/auth/types";
 import type { SyncCallbacks, SyncResult } from "../src/sync/sync-executor";
 import { SyncActionType, type SyncPlan } from "../src/sync/types";
@@ -966,7 +967,13 @@ describe("main sync entry guards", () => {
     vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
     const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
       .mockResolvedValue(true);
-
+    // Hold the settings read open: onload must return without it, and the
+    // timer/UI continuation only runs once it settles.
+    let releaseSettings!: () => void;
+    const settingsRead = new Promise<void>((resolve) => {
+      releaseSettings = resolve;
+    });
+    vi.spyOn(plugin, "loadSyncSettings").mockReturnValue(settingsRead);
     try {
       await plugin.onload();
     } finally {
@@ -986,10 +993,24 @@ describe("main sync entry guards", () => {
     expect(views[0]?.type).toBe(SYNC_VIEW_TYPE);
     expect(views[0]?.creator).toBeTypeOf("function");
     expect(registerVaultLifecycleListeners).toHaveBeenCalledOnce();
+
+    // Settings are read in the background: the timer's gates are settings
+    // values, so `startAutoSync` runs once that read settles, not in onload.
+    expect(startAutoSync).not.toHaveBeenCalled();
+    // The mocked executor exposes only what onload touches; the settings
+    // continuation propagates the real values through these setters.
+    Object.assign(plugin.syncExecutor as unknown as Record<string, unknown>, {
+      setAutomaticHandlingPolicy: vi.fn(),
+      setSyncDirection: vi.fn(),
+      setCommunityPluginSyncPolicy: vi.fn(),
+    });
+    releaseSettings();
+    await vi.advanceTimersByTimeAsync(0);
     expect(startAutoSync).toHaveBeenCalledOnce();
 
-    // Update reminder, auth+state background start, vault lifecycle listeners.
-    expect(layoutReadyCallbacks).toHaveLength(3);
+    // Startup-time mark, update reminder, auth+state background start, vault
+    // lifecycle listeners.
+    expect(layoutReadyCallbacks).toHaveLength(4);
     layoutReadyCallbacks.forEach((callback) => callback());
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(0);
@@ -1006,6 +1027,26 @@ describe("main sync entry guards", () => {
       "rename",
     ]);
     expect(runAutomaticSync).toHaveBeenCalledWith("startup");
+  });
+
+  it("keeps state and sync entries closed when the settings read rejects", async () => {
+    const plugin = makePlugin();
+    const stateLoad = vi.fn().mockResolvedValue(undefined);
+    plugin.state = {
+      load: stateLoad,
+      consumeCommunityPluginEnablementRetiredThisLoad: () => false,
+      isV2StateActive: false,
+    } as never;
+    vi.spyOn(plugin, "loadSyncSettings")
+      .mockRejectedValue(new Error("settings unreadable"));
+
+    // Settings carry direction/scope/pause. A failed read must not degrade
+    // into "plan against defaults": the entry that would have used them waits
+    // for the same rejected read and stays closed.
+    await expect(
+      EasySyncPlugin.prototype.ensureStateLoaded.call(plugin),
+    ).rejects.toThrow("settings unreadable");
+    expect(stateLoad).not.toHaveBeenCalled();
   });
 
   it("does not schedule a dirty run for EasySync internal state", async () => {

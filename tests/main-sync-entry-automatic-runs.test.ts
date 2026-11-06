@@ -189,6 +189,29 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
+  it("yields the automatic round while a single side action is in flight", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: true,
+      run,
+    } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "interval") => Promise<boolean>;
+    }).runAutomaticSync("interval");
+
+    // 恢复核对等逐条侧动作在飞时，自动轮不能在执行器外先打上整轮进度：
+    // 执行器会判 alreadyRunning，顶部却会挂上一轮的计数与当前文件。
+    expect(consumed).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
   it("routes automatic triggers with persisted V2 mutation intent to recovery instead of a normal plan", async () => {
     const plugin = makePlugin();
     plugin.syncInterval = 3;

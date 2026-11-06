@@ -17,21 +17,10 @@ import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { transform } from "esbuild";
+import { RELEASE_JS_MINIFY_CONFIG as JS_CONFIG } from "./release-minify-config.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dryRun = process.argv.includes("--dry-run");
-
-const JS_CONFIG = Object.freeze({
-  loader: "js",
-  target: "es2020",
-  format: "cjs",
-  minifyWhitespace: true,
-  minifyIdentifiers: true,
-  minifySyntax: true,
-  legalComments: "none",
-  charset: "utf8",
-  keepNames: false
-});
 
 const targets = [{ file: path.join(root, "main.js"), config: JS_CONFIG }];
 

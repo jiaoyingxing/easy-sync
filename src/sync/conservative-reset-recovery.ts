@@ -79,9 +79,11 @@ function isVaultRelativeFilePath(path: string): boolean {
 
 /**
  * True only when a rename's two paths differ solely by file-name spelling
- * (case / NFC) inside the same byte-identical parent. This is the exact shape
- * `detectRenames` produces for a local file-name case change; it is not a
- * vacuous self-move and not a relocated file.
+ * (case / NFC) inside the same byte-identical parent. Two execution chains
+ * produce it: `detectRenames` following a local file-name case change
+ * (`renameRemote`), and the identity planner following a cloud-side case-only
+ * rename (`moveLocal`, 2026-11-05). Neither is a vacuous self-move or a
+ * relocated file.
  */
 function isFileNameSpellingAlias(path: string, sourcePath: string): boolean {
   if (path === sourcePath) return false;
@@ -146,6 +148,8 @@ function conservativeResetReceiptMatchesIntent(
         remote,
         baseMatches,
         remoteMatches,
+        hintRemovals: checkpoint.fileMoveHintRemovals ?? [],
+        contentAlignedFromRemote: checkpoint.contentAlignedFromRemote === true,
       });
     case "merge":
       return Boolean(intent.target)
@@ -177,8 +181,18 @@ function conservativeResetRenameOrMoveReceiptMatchesIntent(args: {
   >["checkpoint"]["remoteUpserts"][number];
   baseMatches: (expected: Readonly<{ hash: string; size: number }>) => boolean;
   remoteMatches: (expected: Readonly<{ hash: string; size: number }>) => boolean;
+  hintRemovals: readonly string[];
+  contentAlignedFromRemote: boolean;
 }): boolean {
-  const { intent, base, remote, baseMatches, remoteMatches } = args;
+  const {
+    intent,
+    base,
+    remote,
+    baseMatches,
+    remoteMatches,
+    hintRemovals,
+    contentAlignedFromRemote,
+  } = args;
   if (!intent.expectedLocal.exists || !intent.expectedRemote.exists) return false;
   if (
     !base
@@ -186,6 +200,46 @@ function conservativeResetRenameOrMoveReceiptMatchesIntent(args: {
     || base.eTag !== remote.eTag
     || remote.driveId !== intent.expectedRemote.driveId
   ) return false;
+  // The host-rename hint shape rewires which bytes the base describes: the
+  // hint proves the remote identity moved while the local bytes were edited,
+  // so the receipt's base is the PRE-move common content (the anchor) and the
+  // intent's expectedLocal is the edited local file. That divergence is the
+  // whole point of the hint; the ordinary next-round decision uploads the
+  // edit. Admit it only when the hint names this exact identity and the
+  // preserved remote bytes still match the base size (and the planned remote
+  // hash when Graph supplied one). Every other field stays exactly as the
+  // pure-move shapes require.
+  const hintProvenMove = hintRemovals.includes(intent.expectedRemote.driveId)
+    && base.size === remote.size
+    && base.size === intent.expectedRemote.size
+    && (
+      intent.expectedRemote.sha256Hash === undefined
+      || base.hash.toLowerCase()
+        === intent.expectedRemote.sha256Hash.toLowerCase()
+    );
+  // Same-round composite (move + edited upload in one receipt): the base is
+  // the edited local bytes (size may differ from the pre-move remote), the
+  // upload read-back produced the remote entry, and the hint marker names the
+  // moved identity. This shape is only admissible with the hint marker.
+  const hintProvenComposite = hintRemovals.includes(intent.expectedRemote.driveId)
+    && base.hash.toLowerCase() === intent.expectedLocal.hash.toLowerCase()
+    && base.size === intent.expectedLocal.size
+    && base.size === remote.size
+    && (
+      remote.sha256Hash === undefined
+      || remote.sha256Hash.toLowerCase() === base.hash.toLowerCase()
+    );
+  // A1 alignment proof from the execution chain: the local target was
+  // rewritten with the exact remote bytes after a followed move (cTag
+  // evidence path, Graph returned no SHA-256). The marker is the execution
+  // chain's own read-back proof; the base is the aligned bytes and the
+  // remote entry is the post-move object.
+  const remoteAlignedShape = contentAlignedFromRemote
+    && base.size === remote.size
+    && (
+      remote.sha256Hash === undefined
+      || remote.sha256Hash.toLowerCase() === base.hash.toLowerCase()
+    );
   // Three admissible receipt shapes:
   //  1. content-aligned (A1 one-shot converge): the receipt base already
   //     equals the intended remote bytes when the remote was moved and
@@ -223,13 +277,17 @@ function conservativeResetRenameOrMoveReceiptMatchesIntent(args: {
       // (usually absent on OneDrive personal) and is never claimed from
       // the local side; bytes divergence converges through the ordinary
       // same-path decision next round.
-      return remote.size === intent.expectedRemote.size
-        && baseMatches(intent.expectedLocal);
+      return (
+        remote.size === intent.expectedRemote.size
+        && (baseMatches(intent.expectedLocal) || hintProvenMove)
+      ) || hintProvenComposite;
     }
-    return remote.sha256Hash === undefined
+    return (
+      remote.sha256Hash === undefined
       && remote.eTag === intent.expectedRemote.eTag
       && remote.size === intent.expectedRemote.size
-      && baseMatches(intent.expectedLocal);
+      && baseMatches(intent.expectedLocal)
+    ) || remoteAlignedShape;
   }
   return aligned(intent.expectedRemote) || (
     baseMatches(intent.expectedLocal)
@@ -240,7 +298,7 @@ function conservativeResetRenameOrMoveReceiptMatchesIntent(args: {
       || intent.expectedLocal.hash.toLowerCase()
         === intent.expectedRemote.sha256Hash.toLowerCase()
     )
-  );
+  ) || hintProvenMove || hintProvenComposite || remoteAlignedShape;
 }
 
 /**
@@ -275,10 +333,15 @@ export function isOrdinaryFileRecoveryRecord(
   // two paths normalize-equal. The execution receipt and recovery settlement
   // must stay admissible so this shape keeps the ordinary record contract
   // instead of becoming an unreceiptable record (field report 2026-10-22).
-  // Only renameRemote can produce it (detectRenames, same byte-identical
-  // parent); exact self-moves, parent-spelling changes and moveLocal stay
-  // rejected.
-  const fileNameSpellingAlias = intent.action === "renameRemote"
+  // Two chains produce it: `renameRemote` (detectRenames follows a local case
+  // change, same byte-identical parent) and, since 2026-11-05, `moveLocal`
+  // (the identity planner follows a CLOUD-side case-only rename by renaming
+  // the local file). Exact self-moves and parent-spelling changes stay
+  // rejected either way.
+  const fileNameSpellingAlias = (
+    intent.action === "renameRemote"
+    || intent.action === "moveLocal"
+  )
     && intent.sourcePath !== undefined
     && isFileNameSpellingAlias(intent.path, intent.sourcePath);
   if (

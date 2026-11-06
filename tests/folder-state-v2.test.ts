@@ -2144,6 +2144,31 @@ describe("V2 derived folder mappings", () => {
     ]);
   });
 
+  it("reports a cloud-side case-only folder rename as a review conflict, not a mutation", () => {
+    // 2026-11-05 probe: the file layer follows a cloud-side case-only rename
+    // by renaming the local file (logs 20261105-210902). The folder layer
+    // does not have that slice yet — an anchored folder whose cloud spelling
+    // changed reports `target-occupied`, where the "occupant" is the folder
+    // itself. Pinned as the current fail-closed shape so any future folder
+    // convergence has to change this test deliberately.
+    expect(planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    }).items).toEqual([{
+      type: "conflict",
+      path: "Notes",
+      remoteId: "notes",
+      reason: "target-occupied",
+      affectedPaths: ["notes", "Notes"],
+      impact: { files: 0, folders: 2, bytes: 0 },
+    }]);
+  });
+
   it("never derives a spelling alias or its subtree", () => {
     const input = envelope({
       folders: [

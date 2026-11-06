@@ -120,6 +120,28 @@ describe("local delete decision (S4)", () => {
       .not.toBe(localDeleteDecisionPathHash(token({ hash: hashB }), "note.md"));
   });
 
+  it("keeps the confirmation authorized when only the merge base moved", () => {
+    // 用户确认的是「删掉这份本机内容」；ancestor 是本机记账基线，系统自己会在
+    // 已提交批次 / 重基线 / 迁移时推进它，不能因此把确认作废。
+    const reviewed = token({ ancestorHash: hashA });
+    const record = decision(
+      ["note.md"],
+      [localDeleteDecisionPathHash(reviewed, "note.md")],
+    );
+    const result = apply({
+      items: [confirmItem("note.md", token({ ancestorHash: hashB }))],
+      decisions: [record],
+      localPaths: ["note.md"],
+    });
+    expect(result.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.DeleteLocal,
+        path: "note.md",
+      }),
+    ]);
+    expect(result.rejected).toEqual([]);
+  });
+
   it("converts exactly the row whose recorded facts still match", () => {
     const item = confirmItem("note.md");
     const record = decision(

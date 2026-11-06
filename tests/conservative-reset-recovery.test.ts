@@ -276,13 +276,191 @@ describe("conservative reset ordinary-file recovery contract", () => {
     expect(isOrdinaryFileRecoveryRecord(staleReceipt, scope)).toBe(false);
   });
 
-  it("admits only file-name spelling aliases for case-only renameRemote records", () => {
+  it("admits a hint-proven rename whose base keeps the pre-move content", () => {
+    // 2026-11-05 host-hint shape: the user renamed + edited + moved locally.
+    // The receipt's base is the PRE-move common content (the anchor) while the
+    // intent's expectedLocal is the edited local file. The host hint names the
+    // moved identity; the remote bytes still match the base size. Without the
+    // hint marker the same receipt stays invalid.
+    const path = "sub/note.md";
+    const sourcePath = "note.md";
+    const driveId = "id-hint-rename";
+    const checkpoint = emptyCheckpoint();
+    checkpoint.baseUpserts.push({
+      path,
+      hash: "b".repeat(64),
+      size: 10,
+      eTag: `etag-${driveId}-result`,
+    });
+    checkpoint.baseRemovals.push(sourcePath);
+    checkpoint.remoteUpserts.push(remoteEntry(path, driveId));
+    checkpoint.remoteDeletes.push(sourcePath);
+    checkpoint.fileMoveHintRemovals = [driveId];
+    const intent = {
+      version: 1 as const,
+      operationId: "op-hint-rename",
+      planRevision: 1,
+      scope,
+      action: "renameRemote" as const,
+      path,
+      sourcePath,
+      expectedLocal: local,
+      expectedRemote: {
+        exists: true as const,
+        driveId,
+        eTag: `etag-${driveId}`,
+        size: 10,
+        sha256Hash: undefined,
+      },
+      createdAt: 1,
+    };
+    const receipt = {
+      version: 1 as const,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint,
+    };
+    expect(isOrdinaryFileRecoveryRecord({ intent, receipt }, scope)).toBe(true);
+
+    const withoutHint = {
+      intent,
+      receipt: {
+        ...receipt,
+        checkpoint: { ...checkpoint, fileMoveHintRemovals: undefined },
+      },
+    };
+    expect(isOrdinaryFileRecoveryRecord(withoutHint, scope)).toBe(false);
+  });
+
+  it("admits a hint-proven composite move+upload receipt with changed size", () => {
+    // 2026-11-05 same-round convergence: the move and the edited upload share
+    // one receipt. The base is the edited local bytes (size may differ from
+    // the pre-move remote), and the hint marker names the moved identity.
+    const path = "sub/note.md";
+    const sourcePath = "note.md";
+    const driveId = "id-hint-composite";
+    const newHash = "c".repeat(64);
+    const newSize = 14;
+    const checkpoint = emptyCheckpoint();
+    checkpoint.baseUpserts.push({
+      path,
+      hash: newHash,
+      size: newSize,
+      eTag: `etag-${driveId}-result`,
+    });
+    checkpoint.baseRemovals.push(sourcePath);
+    checkpoint.remoteUpserts.push({
+      ...remoteEntry(path, driveId, newHash),
+      size: newSize,
+    });
+    checkpoint.remoteDeletes.push(sourcePath);
+    checkpoint.fileMoveHintRemovals = [driveId];
+    const intent = {
+      version: 1 as const,
+      operationId: "op-hint-composite",
+      planRevision: 1,
+      scope,
+      action: "renameRemote" as const,
+      path,
+      sourcePath,
+      expectedLocal: { exists: true as const, hash: newHash, size: newSize },
+      expectedRemote: {
+        exists: true as const,
+        driveId,
+        eTag: `etag-${driveId}`,
+        size: 10,
+        sha256Hash: undefined,
+      },
+      createdAt: 1,
+    };
+    const receipt = {
+      version: 1 as const,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint,
+    };
+    expect(isOrdinaryFileRecoveryRecord({ intent, receipt }, scope)).toBe(true);
+
+    const withoutHint = {
+      intent,
+      receipt: {
+        ...receipt,
+        checkpoint: { ...checkpoint, fileMoveHintRemovals: undefined },
+      },
+    };
+    expect(isOrdinaryFileRecoveryRecord(withoutHint, scope)).toBe(false);
+  });
+
+  it("admits a cTag-aligned moveLocal receipt with the execution marker", () => {
+    // 2026-11-05 receiver-side gap: Graph returned no SHA-256, the remote
+    // moved+edited, and the executor rewrote the local target with the exact
+    // remote bytes. The marker is the execution chain's read-back proof; the
+    // base is the aligned content. Without the marker the same receipt is a
+    // sha-unknown divergent move and must stay rejected.
+    const path = "new.md";
+    const sourcePath = "old.md";
+    const driveId = "id-cTag-aligned";
+    const checkpoint = emptyCheckpoint();
+    checkpoint.baseUpserts.push({
+      path,
+      hash: "b".repeat(64),
+      size: 20,
+      eTag: "etag-result",
+    });
+    checkpoint.baseRemovals.push(sourcePath);
+    checkpoint.remoteUpserts.push({
+      ...remoteEntry(path, driveId, "b".repeat(64)),
+      size: 20,
+      eTag: "etag-result",
+      cTag: "ctag-new",
+    });
+    checkpoint.remoteDeletes.push(sourcePath);
+    checkpoint.contentAlignedFromRemote = true;
+    const intent = {
+      version: 1 as const,
+      operationId: "op-cTag-aligned",
+      planRevision: 1,
+      scope,
+      action: "moveLocal" as const,
+      path,
+      sourcePath,
+      expectedLocal: { exists: true as const, hash: "a".repeat(64), size: 10 },
+      expectedRemote: {
+        exists: true as const,
+        driveId,
+        eTag: "etag-old",
+        size: 10,
+        sha256Hash: undefined,
+      },
+      createdAt: 1,
+    };
+    const receipt = {
+      version: 1 as const,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint,
+    };
+    expect(isOrdinaryFileRecoveryRecord({ intent, receipt }, scope)).toBe(true);
+
+    const withoutMarker = {
+      intent,
+      receipt: {
+        ...receipt,
+        checkpoint: { ...checkpoint, contentAlignedFromRemote: undefined },
+      },
+    };
+    expect(isOrdinaryFileRecoveryRecord(withoutMarker, scope)).toBe(false);
+  });
+
+  it("admits only file-name spelling aliases for case-only rename records", () => {
     // 2026-10-22 field shape: the user changes a file's letter case locally,
     // detectRenames emits renameRemote, and the two paths normalize-equal.
     // The shape is a real rename (same byte-identical parent) and must be
     // receiptable so execution and recovery keep the ordinary record
-    // contract; exact self-moves, parent spelling changes and moveLocal
-    // remain rejected.
+    // contract; exact self-moves and parent spelling changes remain rejected.
+    // 2026-11-05: a CLOUD-side case-only rename makes the identity planner emit
+    // moveLocal with the same alias shape, so that action is admitted too —
+    // with the identical byte-identical-parent predicate.
     expect(isOrdinaryFileRecoveryRecord(
       record("renameRemote", { path: "MJW.md", sourcePath: "mjw.md" }),
       scope,
@@ -295,6 +473,10 @@ describe("conservative reset ordinary-file recovery contract", () => {
       }),
       scope,
     )).toBe(true);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("moveLocal", { path: "MJW.md", sourcePath: "mjw.md" }),
+      scope,
+    )).toBe(true);
 
     expect(isOrdinaryFileRecoveryRecord(
       record("renameRemote", { path: "mjw.md", sourcePath: "mjw.md" }),
@@ -305,7 +487,11 @@ describe("conservative reset ordinary-file recovery contract", () => {
       scope,
     )).toBe(false);
     expect(isOrdinaryFileRecoveryRecord(
-      record("moveLocal", { path: "MJW.md", sourcePath: "mjw.md" }),
+      record("moveLocal", { path: "mjw.md", sourcePath: "mjw.md" }),
+      scope,
+    )).toBe(false);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("moveLocal", { path: "Dir/MJW.md", sourcePath: "dir/mjw.md" }),
       scope,
     )).toBe(false);
   });

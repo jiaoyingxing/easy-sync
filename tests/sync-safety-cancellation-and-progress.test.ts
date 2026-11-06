@@ -650,6 +650,22 @@ describe("S1a — sync run phase observability", () => {
         transfer: expect.any(Number),
         commit: expect.any(Number),
       },
+      // Observation-only per-round queue accounting (iOS "stuck with no logs"
+      // forensics). Presence is the contract; the numbers never feed a decision.
+      queues: {
+        pluginDataSave: {
+          waits: expect.any(Number),
+          maxWaitMs: expect.any(Number),
+          maxDepth: expect.any(Number),
+          warnings: expect.any(Number),
+          suppressed: expect.any(Number),
+        },
+        v2Commit: {
+          waits: expect.any(Number),
+          maxWaitMs: expect.any(Number),
+          maxDepth: expect.any(Number),
+        },
+      },
       totalMs: expect.any(Number),
     });
     for (const value of Object.values(summaryCall?.[2].phasesMs ?? {})) {

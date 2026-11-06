@@ -50,6 +50,25 @@ describe("classifyIndexedDbError", () => {
     expect(classifyIndexedDbError(undefined)).toBe("none");
     expect(classifyIndexedDbError("plain string")).toBe("other");
   });
+
+  it("classifies a host-wrapped adapter failure through its cause chain", () => {
+    // Obsidian adapter failures surface as "Unable to delete file" with the
+    // database error attached as the cause.
+    const wrapped = new Error("Unable to delete file", {
+      cause: new DOMException(
+        "Attempt to delete range from database without an in-progress transaction",
+        "UnknownError",
+      ),
+    });
+    expect(classifyIndexedDbError(wrapped)).toBe("webkit-transaction");
+  });
+
+  it("keeps an unrelated cause unrelated", () => {
+    const wrapped = new TypeError("cannot read properties of undefined", {
+      cause: new Error("Precondition failed"),
+    });
+    expect(classifyIndexedDbError(wrapped)).toBe("other");
+  });
 });
 
 describe("fingerprintIndexedDbError", () => {
@@ -69,5 +88,39 @@ describe("fingerprintIndexedDbError", () => {
     expect(fingerprint!.message).toContain("in-progress transaction");
     expect(fingerprint!.name).toBe("Error");
     expect(typeof fingerprint!.stackFirstFrame).toBe("string");
+  });
+
+  it("reads name and stack from a DOMException that is not an Error instance", () => {
+    // WebKit raises IndexedDB failures as DOMException; the first stack frame
+    // is the only field that tells the adapter layer apart from the store.
+    const domError = {
+      name: "UnknownError",
+      message: "Attempt to delete range from database without an in-progress transaction",
+      stack: [
+        "writeRecord@plugin:main.js:1200:16",
+        "delete@[native code]",
+      ].join("\n"),
+    };
+    const fingerprint = fingerprintIndexedDbError(domError);
+    expect(fingerprint).not.toBeNull();
+    expect(fingerprint!.dbErrorKind).toBe("webkit-transaction");
+    expect(fingerprint!.name).toBe("UnknownError");
+    expect(fingerprint!.stackFirstFrame).toContain("writeRecord");
+  });
+
+  it("points name and stack at the wrapped database error, not the host wrapper", () => {
+    const wrapped = new Error("Unable to delete file", {
+      cause: {
+        name: "UnknownError",
+        message: "Attempt to delete range from database without an in-progress transaction",
+        stack: "at removeRecord (plugin:main.js:900:8)",
+      },
+    });
+    const fingerprint = fingerprintIndexedDbError(wrapped);
+    expect(fingerprint).not.toBeNull();
+    expect(fingerprint!.dbErrorKind).toBe("webkit-transaction");
+    expect(fingerprint!.message).toBe("Unable to delete file");
+    expect(fingerprint!.name).toBe("UnknownError");
+    expect(fingerprint!.stackFirstFrame).toContain("removeRecord");
   });
 });

@@ -110,6 +110,44 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.currentItemTotalBytes).toBe(0);
   });
 
+  it("shows the known item size from the first visible moment", () => {
+    const progress = new SyncProgressStore();
+
+    progress.setPhase("executing");
+    progress.setProgress(
+      0,
+      3,
+      "phone-download.bin",
+      SyncActionType.Download,
+      2048,
+    );
+
+    // 移动端整包回退或非流式通道没有中间字节回调时，名称行右侧仍要显示
+    // 文件大小；这不是伪造进度，已传字节如实为 0。
+    expect(progress.state.currentItemBytes).toBe(0);
+    expect(progress.state.currentItemTotalBytes).toBe(2048);
+
+    progress.setByteProgress(512, 2048);
+    expect(progress.state.currentItemBytes).toBe(512);
+    expect(progress.state.currentItemTotalBytes).toBe(2048);
+
+    // 切到没有已知大小的动作（删除等）时，右侧字节位照旧退场。
+    progress.setProgress(1, 3, "old.md", SyncActionType.DeleteRemote);
+    expect(progress.state.currentItemBytes).toBe(0);
+    expect(progress.state.currentItemTotalBytes).toBe(0);
+  });
+
+  it("ignores a non-finite or non-positive known size", () => {
+    const progress = new SyncProgressStore();
+
+    progress.setPhase("executing");
+    progress.setProgress(0, 1, "empty.md", SyncActionType.Upload, 0);
+    expect(progress.state.currentItemTotalBytes).toBe(0);
+
+    progress.setProgress(1, 2, "bad.md", SyncActionType.Upload, Number.NaN);
+    expect(progress.state.currentItemTotalBytes).toBe(0);
+  });
+
   it("keeps byte progress monotonic and never exposes current above total", () => {
     const progress = new SyncProgressStore();
 

@@ -515,6 +515,11 @@ export interface MutationCheckpointV1 {
   folderDeletes?: Array<{ path: string; driveId: ExternalItemId }>;
   /** Device-local rename hints consumed by a committed folder mutation. */
   folderMoveHintRemovals?: string[];
+  /** Device-local file rename hints consumed by a committed file move. */
+  fileMoveHintRemovals?: string[];
+  /** A1 alignment proof: the local target was rewritten with the exact remote
+   *  bytes during a followed move (sha-unknown cTag path included). */
+  contentAlignedFromRemote?: boolean;
 }
 
 /** Durable mutation result; shared state may advance only after this exists. */

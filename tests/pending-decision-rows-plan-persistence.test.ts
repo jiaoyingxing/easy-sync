@@ -352,12 +352,23 @@ const makeCallLevelExecutor = (
       pendingIssues: [],
       remoteScope: ACTIVE_SCOPE,
       boundAccountId: ACTIVE_SCOPE.accountId,
+      baseSnapshot: [],
       getBaseEntry: () => undefined,
       ...hooks,
     } as never,
     "testVault",
   );
   return { executor, conflicts, deletes, hooks };
+};
+
+/** Bind the token a fresh plan item of the same shape would carry, so the row
+ *  is "current" (nothing stale to refresh). Used where a test needs an existing
+ *  row that the plan step must leave completely untouched. */
+const bindCurrentToken = (executor: SyncExecutor, item: SyncPlanItem): void => {
+  const createDecisionToken = (executor as unknown as {
+    createDecisionToken: (target: SyncPlanItem) => SyncPlanItem["decisionToken"];
+  }).createDecisionToken.bind(executor);
+  item.decisionToken = createDecisionToken(item);
 };
 
 const pruneStep = (
@@ -530,11 +541,13 @@ describe("planner-derived decision rows land with the plan", () => {
     expect(hooks.reconcilePendingIssues).not.toHaveBeenCalled();
   });
 
-  it("never rewrites an existing decision row (the row carries other owners' state)", async () => {
+  it("never rewrites an existing decision row's non-token state (the row carries other owners' state)", async () => {
     // 已存在的行不是纯计划派生状态：自动合并走 `state.pendingConflicts` 读回行上
     // 缓存的 `textMergeEvidence`（sync-executor 20794 起）——规划步若按路径覆写
     // 它，这条缓存就会被抹掉、下一轮重算（并多一次内容下载）。因此本通道只补缺
-    // 口：计划里有、状态里还没有的行才落地；已存在的行交给轮末 owner 刷新。
+    // 口：计划里有、状态里还没有的行才落地；已存在的行只在「token 已属本库、本机／
+    // 云端事实未变、仅 ancestor 变了」时原位换 token（另有用例钉住），其余交给
+    // 轮末 owner 刷新。
     const existingConflict = {
       ...conflictItem,
       textMergeEvidence: { version: 1, marker: "kept" },
@@ -544,6 +557,8 @@ describe("planner-derived decision rows land with the plan", () => {
       conflicts: [existingConflict],
       deletes: [existingDelete],
     });
+    bindCurrentToken(executor, existingConflict);
+    bindCurrentToken(executor, existingDelete);
 
     const step = await pruneStep(
       executor,
@@ -557,11 +572,141 @@ describe("planner-derived decision rows land with the plan", () => {
     expect(deletes).toEqual([]);
   });
 
+  it("refreshes an existing row's token when only the base ancestor moved", async () => {
+    const existingConflict = { ...conflictItem } as SyncPlanItem;
+    const { executor, hooks, conflicts } = makeCallLevelExecutor({
+      conflicts: [existingConflict],
+    });
+    const state = (executor as never as {
+      state: {
+        baseSnapshot: BaseFileEntry[];
+        getBaseEntry: (path: string) => BaseFileEntry | undefined;
+      };
+    }).state;
+    state.baseSnapshot = [{
+      path: "conflict.md",
+      hash: "a".repeat(64),
+      size: 10,
+      eTag: "etag-base-1",
+    }];
+    state.getBaseEntry = (path: string) =>
+      state.baseSnapshot.find((entry) => entry.path === path);
+    const createDecisionToken = (executor as never as {
+      createDecisionToken: (item: SyncPlanItem) => SyncPlanItem["decisionToken"];
+    }).createDecisionToken.bind(executor);
+    existingConflict.decisionToken = createDecisionToken(existingConflict);
+    state.baseSnapshot = [{
+      path: "conflict.md",
+      hash: "b".repeat(64),
+      size: 10,
+      eTag: "etag-base-1",
+    }];
+
+    const step = await pruneStep(executor, [conflictItem]);
+
+    expect(step.terminated).toBeNull();
+    expect(hooks.upsertPendingConflicts).toHaveBeenCalledOnce();
+    const refreshed = (
+      hooks.upsertPendingConflicts.mock.calls[0][0] as SyncPlanItem[]
+    )[0];
+    expect(refreshed.path).toBe("conflict.md");
+    expect(refreshed.reason).toBe(conflictItem.reason);
+    expect(refreshed.decisionToken?.ancestorHash).toBe("b".repeat(64));
+    expect(conflicts.map((row) => row.path)).toEqual(["conflict.md"]);
+  });
+
+  it("rebinds an ancestor-only stale token at the side-action guard", () => {
+    const existingConflict = { ...conflictItem } as SyncPlanItem;
+    const { executor } = makeCallLevelExecutor({
+      conflicts: [existingConflict],
+    });
+    const state = (executor as never as {
+      state: {
+        baseSnapshot: BaseFileEntry[];
+        getBaseEntry: (path: string) => BaseFileEntry | undefined;
+      };
+    }).state;
+    state.baseSnapshot = [{
+      path: "conflict.md",
+      hash: "a".repeat(64),
+      size: 10,
+      eTag: "etag-base-1",
+    }];
+    state.getBaseEntry = (path: string) =>
+      state.baseSnapshot.find((entry) => entry.path === path);
+    const createDecisionToken = (executor as never as {
+      createDecisionToken: (item: SyncPlanItem) => SyncPlanItem["decisionToken"];
+    }).createDecisionToken.bind(executor);
+    existingConflict.decisionToken = createDecisionToken(existingConflict);
+    state.baseSnapshot = [{
+      path: "conflict.md",
+      hash: "b".repeat(64),
+      size: 10,
+      eTag: "etag-base-1",
+    }];
+    const notice = vi.fn();
+    (executor as never as { notice: unknown }).notice = notice;
+
+    const guard = (executor as never as {
+      guardDecisionToken: (
+        item: SyncPlanItem,
+        key: "notice.conflict.failed",
+      ) => boolean;
+    }).guardDecisionToken.bind(executor);
+
+    expect(guard(existingConflict, "notice.conflict.failed")).toBe(true);
+    expect(existingConflict.decisionToken?.ancestorHash).toBe("b".repeat(64));
+    expect(notice).not.toHaveBeenCalled();
+  });
+
+  it("keeps a changed local-version token fail-closed at the side-action guard", () => {
+    const existingConflict = { ...conflictItem } as SyncPlanItem;
+    const { executor } = makeCallLevelExecutor({
+      conflicts: [existingConflict],
+    });
+    const state = (executor as never as {
+      state: {
+        baseSnapshot: BaseFileEntry[];
+        getBaseEntry: (path: string) => BaseFileEntry | undefined;
+      };
+    }).state;
+    state.baseSnapshot = [{
+      path: "conflict.md",
+      hash: "a".repeat(64),
+      size: 10,
+      eTag: "etag-base-1",
+    }];
+    state.getBaseEntry = (path: string) =>
+      state.baseSnapshot.find((entry) => entry.path === path);
+    const createDecisionToken = (executor as never as {
+      createDecisionToken: (item: SyncPlanItem) => SyncPlanItem["decisionToken"];
+    }).createDecisionToken.bind(executor);
+    existingConflict.decisionToken = createDecisionToken(existingConflict);
+    existingConflict.local = {
+      ...existingConflict.local!,
+      hash: "c".repeat(64),
+    };
+    const notice = vi.fn();
+    (executor as never as { notice: unknown }).notice = notice;
+
+    const guard = (executor as never as {
+      guardDecisionToken: (
+        item: SyncPlanItem,
+        key: "notice.conflict.failed",
+      ) => boolean;
+    }).guardDecisionToken.bind(executor);
+
+    expect(guard(existingConflict, "notice.conflict.failed")).toBe(false);
+    expect(existingConflict.decisionToken?.ancestorHash).toBe("a".repeat(64));
+    expect(notice).toHaveBeenCalledOnce();
+  });
+
   it("lands only the rows the state is still missing", async () => {
     const existingConflict = { ...conflictItem } as SyncPlanItem;
     const { executor, conflicts, deletes } = makeCallLevelExecutor({
       conflicts: [existingConflict],
     });
+    bindCurrentToken(executor, existingConflict);
 
     const step = await pruneStep(
       executor,
@@ -571,5 +716,103 @@ describe("planner-derived decision rows land with the plan", () => {
     expect(step.terminated).toBeNull();
     expect(conflicts).toEqual([]);
     expect(deletes.map((item) => item.path)).toEqual(["gone.md"]);
+  });
+
+  // ---- 授权事实 vs 记账事实（2026-11-06 自愈切片）-----------------------
+  //
+  // token 里只有 local/remote/vault/account/scope 是用户看过的**授权事实**；
+  // `ancestorHash` 与「信封根本没写下来」都是本机记账状态。记账状态由系统自己
+  // 推进（已提交批次、重基线、迁移），不能反过来把用户已看过的决议判成过期。
+
+  it("records the envelope for a legacy row the plan re-derived", async () => {
+    const existingConflict = {
+      ...conflictItem,
+      textMergeEvidence: { version: 1, marker: "kept" },
+      decisionToken: undefined,
+    } as unknown as SyncPlanItem;
+    const { executor, hooks, conflicts } = makeCallLevelExecutor({
+      conflicts: [existingConflict],
+    });
+
+    const step = await pruneStep(executor, [conflictItem]);
+
+    expect(step.terminated).toBeNull();
+    expect(hooks.upsertPendingConflicts).toHaveBeenCalledOnce();
+    const refreshed = (
+      hooks.upsertPendingConflicts.mock.calls[0][0] as SyncPlanItem[]
+    )[0];
+    expect(refreshed.decisionToken).toBeTruthy();
+    expect(refreshed.local?.hash).toBe(conflictItem.local?.hash);
+    expect(refreshed.remote?.eTag).toBe(conflictItem.remote?.eTag);
+    // The row's non-token state still belongs to its other owners.
+    expect(refreshed.textMergeEvidence).toEqual({ version: 1, marker: "kept" });
+    expect(conflicts.map((row) => row.path)).toEqual(["conflict.md"]);
+  });
+
+  it("does not record an envelope when the legacy row's facts left the plan", async () => {
+    const existingConflict = {
+      ...conflictItem,
+      local: { ...conflictItem.local!, hash: "c".repeat(64) },
+      decisionToken: undefined,
+    } as unknown as SyncPlanItem;
+    const { executor, hooks, conflicts } = makeCallLevelExecutor({
+      conflicts: [existingConflict],
+    });
+
+    const step = await pruneStep(executor, [conflictItem]);
+
+    expect(step.terminated).toBeNull();
+    expect(hooks.upsertPendingConflicts).not.toHaveBeenCalled();
+    expect(conflicts).toEqual([]);
+  });
+
+  it("rebinds a missing envelope at the guard from the row's recorded facts", () => {
+    const existingConflict = {
+      ...conflictItem,
+      decisionToken: undefined,
+    } as unknown as SyncPlanItem;
+    const { executor } = makeCallLevelExecutor({
+      conflicts: [existingConflict],
+    });
+    const notice = vi.fn();
+    (executor as never as { notice: unknown }).notice = notice;
+
+    const guard = (executor as never as {
+      guardDecisionToken: (
+        item: SyncPlanItem,
+        key: "notice.conflict.failed",
+      ) => boolean;
+    }).guardDecisionToken.bind(executor);
+
+    expect(guard(existingConflict, "notice.conflict.failed")).toBe(true);
+    expect(existingConflict.decisionToken?.local.hash).toBe(
+      conflictItem.local?.hash,
+    );
+    expect(existingConflict.decisionToken?.remote.eTag).toBe(
+      conflictItem.remote?.eTag,
+    );
+    expect(notice).not.toHaveBeenCalled();
+  });
+
+  it("keeps a legacy row with no recorded facts fail-closed at the guard", () => {
+    const bareRow = {
+      type: SyncActionType.ConfirmLocalDelete,
+      path: "gone.md",
+      reason: "reason.fileDeletedFromRemote",
+    } as unknown as SyncPlanItem;
+    const { executor } = makeCallLevelExecutor({ deletes: [bareRow] });
+    const notice = vi.fn();
+    (executor as never as { notice: unknown }).notice = notice;
+
+    const guard = (executor as never as {
+      guardDecisionToken: (
+        item: SyncPlanItem,
+        key: "notice.delete.failed",
+      ) => boolean;
+    }).guardDecisionToken.bind(executor);
+
+    expect(guard(bareRow, "notice.delete.failed")).toBe(false);
+    expect(bareRow.decisionToken).toBeUndefined();
+    expect(notice).toHaveBeenCalledOnce();
   });
 });

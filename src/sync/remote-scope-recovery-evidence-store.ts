@@ -7,6 +7,7 @@ import {
 } from "idb";
 import { sha256Hex } from "../crypto";
 import { isRecord } from "../obsidian-compat";
+import { retryIndexedDbTransaction } from "./indexeddb-transaction-retry";
 import { isIndexedDbVaultInstanceId } from "./indexeddb-vault-namespace";
 import { isSyncScope, type SyncScope } from "./types";
 
@@ -167,6 +168,20 @@ implements RemoteScopeRecoveryEvidenceStore {
       throw new Error("Remote scope recovery operation time is invalid");
     }
     const operationId = await remoteScopeRecoveryEvidenceOperationId(identity);
+    // This store owns its transactions (no adapter in between), but each body
+    // below reads, decides, then writes across awaits — the exact shape WebKit
+    // auto-commits. Every step is an idempotent upsert or delete-if-invalid
+    // with a read-back, so one bounded retry on a fresh transaction is safe.
+    return retryIndexedDbTransaction(
+      () => this.beginOnce(identity, operationId, now),
+    );
+  }
+
+  private async beginOnce(
+    identity: RemoteScopeRecoveryEvidenceOperationIdentityV1,
+    operationId: string,
+    now: number,
+  ): Promise<RemoteScopeRecoveryEvidenceOperationV1> {
     const db = await this.open();
     const tx = db.transaction(["operations", "receipts"], "readwrite", {
       durability: "strict",
@@ -212,6 +227,16 @@ implements RemoteScopeRecoveryEvidenceStore {
     const operationId = await firstSyncVerificationEvidenceOperationId(
       identity,
     );
+    return retryIndexedDbTransaction(
+      () => this.beginFirstSyncVerificationOnce(identity, operationId, now),
+    );
+  }
+
+  private async beginFirstSyncVerificationOnce(
+    identity: FirstSyncVerificationEvidenceOperationIdentityV2,
+    operationId: string,
+    now: number,
+  ): Promise<FirstSyncVerificationEvidenceOperationV2> {
     const db = await this.open();
     const tx = db.transaction(["operations", "receipts"], "readwrite", {
       durability: "strict",
@@ -271,7 +296,21 @@ implements RemoteScopeRecoveryEvidenceStore {
       }
       versionById.set(version.remoteId, version);
     }
+    return retryIndexedDbTransaction(
+      () => this.readValidReceiptsOnce(operationId, versionById),
+    );
+  }
 
+  private async readValidReceiptsOnce(
+    operationId: string,
+    versionById: ReadonlyMap<string, RemoteScopeRecoveryRemoteVersionV1>,
+  ): Promise<{
+    receiptsByRemoteId: ReadonlyMap<
+      string,
+      RemoteScopeRecoveryEvidenceReceiptV1
+    >;
+    invalidated: number;
+  }> {
     const db = await this.open();
     const operation = await db.get("operations", operationId);
     if (!isRemoteContentVerificationEvidenceOperation(operation)) {
@@ -314,6 +353,12 @@ implements RemoteScopeRecoveryEvidenceStore {
     if (!isRemoteScopeRecoveryEvidenceReceiptV1(receipt)) {
       throw new Error("Remote scope recovery receipt is invalid");
     }
+    await retryIndexedDbTransaction(() => this.putVerifiedOnce(receipt));
+  }
+
+  private async putVerifiedOnce(
+    receipt: RemoteScopeRecoveryEvidenceReceiptV1,
+  ): Promise<void> {
     const db = await this.open();
     const tx = db.transaction(["operations", "receipts"], "readwrite", {
       durability: "strict",
@@ -361,6 +406,10 @@ implements RemoteScopeRecoveryEvidenceStore {
 
   async retire(operationId: string): Promise<void> {
     if (!isSha256(operationId)) return;
+    await retryIndexedDbTransaction(() => this.retireOnce(operationId));
+  }
+
+  private async retireOnce(operationId: string): Promise<void> {
     const db = await this.open();
     const tx = db.transaction(["operations", "receipts"], "readwrite", {
       durability: "strict",
@@ -369,6 +418,10 @@ implements RemoteScopeRecoveryEvidenceStore {
     await tx.done;
   }
 
+  /** Deliberately not wrapped in a bounded retry: the return value is a
+   *  retirement count, so replaying a partially completed sweep would report a
+   *  number that does not match what this call removed. It is an explicit
+   *  maintenance sweep whose failure surfaces to its caller. */
   async retireFirstSyncVerificationOperations(): Promise<number> {
     const db = await this.open();
     const tx = db.transaction(["operations", "receipts"], "readwrite", {

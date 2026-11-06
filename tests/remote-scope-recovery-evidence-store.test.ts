@@ -9,7 +9,6 @@ import {
   type FirstSyncVerificationEvidenceOperationIdentityV2,
   type RemoteScopeRecoveryEvidenceOperationIdentityV1,
 } from "../src/sync/remote-scope-recovery-evidence-store";
-
 function identity(
   vaultInstanceId: string,
   patch: Partial<RemoteScopeRecoveryEvidenceOperationIdentityV1> = {},
@@ -549,6 +548,61 @@ describe("remote scope recovery evidence store", () => {
       await store.delete();
     }
   }, 30_000);
+
+  // The store owns its transactions, but every body reads, decides, then
+  // writes across awaits — the shape iOS WebKit auto-commits. These two cases
+  // pin the rule: one WebKit transaction error is replayed on a fresh
+  // transaction, any other failure is not.
+  it("retries the transaction body once after a WebKit auto-commit error", async () => {
+    const vaultInstanceId = "7".repeat(32);
+    const store = new IndexedDbRemoteScopeRecoveryEvidenceStore(vaultInstanceId);
+    try {
+      const internals = store as unknown as {
+        pruneInTransaction: (...args: unknown[]) => Promise<void>;
+      };
+      const original = internals.pruneInTransaction.bind(store);
+      let attempts = 0;
+      internals.pruneInTransaction = async (...args: unknown[]) => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new DOMException(
+            "Attempt to delete range from database without an in-progress transaction",
+            "UnknownError",
+          );
+        }
+        return original(...args);
+      };
+
+      const operation = await store.begin(identity(vaultInstanceId), 200);
+
+      expect(operation.operationId).toHaveLength(64);
+      expect(attempts).toBe(2);
+      expect((await store.summarize(operation.operationId)).receipts).toBe(0);
+    } finally {
+      await store.delete();
+    }
+  });
+
+  it("does not retry a failure that is not the WebKit transaction family", async () => {
+    const vaultInstanceId = "8".repeat(32);
+    const store = new IndexedDbRemoteScopeRecoveryEvidenceStore(vaultInstanceId);
+    try {
+      const internals = store as unknown as {
+        pruneInTransaction: (...args: unknown[]) => Promise<void>;
+      };
+      let attempts = 0;
+      internals.pruneInTransaction = async () => {
+        attempts += 1;
+        throw new Error("database is closed");
+      };
+
+      await expect(store.begin(identity(vaultInstanceId), 210)).rejects
+        .toThrow("database is closed");
+      expect(attempts).toBe(1);
+    } finally {
+      await store.delete();
+    }
+  });
 });
 
 interface FakeIndexedDbDatabaseInternals extends IDBDatabase {

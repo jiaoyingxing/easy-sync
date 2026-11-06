@@ -66,6 +66,7 @@ import {
   PUBLIC_113_NETWORK_RECOVERY_INCIDENT,
 } from "./fixtures/network-recovery-incidents";
 import { V2FilePlanTestHarness } from "./helpers/v2-file-plan-test-harness";
+import { createFileTransferMetrics } from "../src/sync/executor-metrics";
 import type {
   CommunityPluginManifestObservationV1,
 } from "../src/sync/community-plugin-bundle";
@@ -2084,7 +2085,7 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
   const newBytes = new Uint8Array(
     Array.from({ length: 20 }, (_, index) => index + 1),
   ).buffer;
-  const remoteNewEntry = (): RemoteFileEntry => ({
+  const remoteNewEntry = (hashesKnown = true): RemoteFileEntry => ({
     path: "new.md",
     driveId: "drv-a",
     parentId: TEST_SYNC_SCOPE.filesRootId,
@@ -2092,7 +2093,7 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
     mtime: 2,
     eTag: "etag-new",
     cTag: "ctag-new",
-    sha256Hash: newBytesHash,
+    ...(hashesKnown ? { sha256Hash: newBytesHash } : {}),
   });
   let oldBytesHash: string;
   let newBytesHash: string;
@@ -2101,6 +2102,8 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
     initialFiles: Array<[string, ArrayBuffer]>;
     initialRemoteEntries: RemoteFileEntry[];
     initialBaseEntries: BaseFileEntry[];
+    hashesKnown?: boolean;
+    anchorCTag?: string;
   }) {
     const diagError = vi.fn();
     const files = new Map(options.initialFiles.map(
@@ -2145,7 +2148,9 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
       downloadFile,
       getFileMetadata: vi.fn().mockImplementation(
         async (_vault: string, path: string) =>
-          path === "new.md" ? remoteNewEntry() : null,
+          path === "new.md"
+            ? remoteNewEntry(options.hashesKnown ?? true)
+            : null,
       ),
       getDelta: vi.fn().mockResolvedValue({
         value: [{
@@ -2156,7 +2161,11 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
           cTag: "ctag-new",
           lastModifiedDateTime: "2026-08-24T00:00:00.000Z",
           parentReference: { id: TEST_SYNC_SCOPE.filesRootId },
-          file: { hashes: { sha256Hash: newBytesHash } },
+          file: {
+            hashes: options.hashesKnown === false
+              ? {}
+              : { sha256Hash: newBytesHash },
+          },
         }],
         "@odata.deltaLink": "tok",
       }),
@@ -2224,6 +2233,18 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
       options.initialRemoteEntries,
       options.initialBaseEntries,
     );
+    if (options.anchorCTag) {
+      const envelope = (state as unknown as {
+        peekCommittedV2Envelope: () => {
+          anchors: {
+            byAnchorId: Record<string, { remoteCTag?: string }>;
+          };
+        };
+      }).peekCommittedV2Envelope();
+      for (const anchor of Object.values(envelope.anchors.byAnchorId)) {
+        anchor.remoteCTag = options.anchorCTag;
+      }
+    }
     const executor = new SyncExecutor(
       mockOneDrive,
       mockScanner,
@@ -2272,6 +2293,46 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
     expect(result).toMatchObject({ success: true, conflicts: 0 });
     expect(result.filesMoved).toBe(1);
     expect(context.downloadFile).toHaveBeenCalledOnce();
+    expect(context.files.has("a.md")).toBe(false);
+    expect(context.files.has("new.md")).toBe(true);
+    expect(await sha256Hex(context.files.get("new.md")!)).toBe(newBytesHash);
+    expect(context.state.mutationLedger).toHaveLength(0);
+    expect(context.state.baseSnapshot).toEqual([{
+      path: "new.md",
+      hash: newBytesHash,
+      size: newBytes.byteLength,
+      eTag: "etag-new",
+    }]);
+  });
+
+  it("aligns a followed sha-unknown remote move+edit on cTag evidence in one round", async () => {
+    const context = await makeAlignmentTestContext({
+      initialFiles: [["a.md", oldBytes]],
+      initialRemoteEntries: [{
+        path: "a.md",
+        driveId: "drv-a",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: oldBytes.byteLength,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: oldBytesHash,
+      }],
+      initialBaseEntries: [{
+        path: "a.md",
+        hash: oldBytesHash,
+        size: oldBytes.byteLength,
+        eTag: "etag-old",
+      }],
+      hashesKnown: false,
+      anchorCTag: "ctag-old",
+    });
+
+    const result = await context.executor.run("manual", {});
+
+    expect(result).toMatchObject({ success: true, conflicts: 0 });
+    expect(result.filesMoved).toBe(1);
+    expect(context.downloadFile).toHaveBeenCalled();
     expect(context.files.has("a.md")).toBe(false);
     expect(context.files.has("new.md")).toBe(true);
     expect(await sha256Hex(context.files.get("new.md")!)).toBe(newBytesHash);
@@ -2490,3 +2551,741 @@ describe("OneDrive-invalid-name unreceipted upload recovery", () => {
   });
 });
 
+
+// ---- Hint-proven rename keeps the common base at the moved bytes ----
+
+describe("hint-proven rename base truth", () => {
+  it("records the anchor content hash, not the edited local hash", async () => {
+    const remoteHash = "a".repeat(64);
+    const editedHash = "b".repeat(64);
+    const activeScope: SyncScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const movedItem: DriveItem = {
+      id: "id-old.md",
+      name: "new.md",
+      eTag: "etag-moved",
+      cTag: "ctag-moved",
+      size: 100,
+      lastModifiedDateTime: new Date(1).toISOString(),
+      parentReference: { id: "folder" },
+      file: { hashes: { sha256Hash: remoteHash } },
+    };
+    const onedrive = makeMockOneDrive({
+      moveItemById: vi.fn().mockResolvedValue(movedItem),
+      getFileMetadata: vi.fn(async (_vault: string, path: string) => {
+        if (path === "sub/new.md") {
+          return {
+            driveId: "id-old.md",
+            parentId: "folder",
+            size: 100,
+            mtime: 1,
+            eTag: "etag-moved",
+            cTag: "ctag-moved",
+            sha256Hash: remoteHash,
+          };
+        }
+        return null;
+      }),
+    });
+    const state = makeActiveV2State(
+      [{
+        path: "old.md",
+        driveId: "id-old.md",
+        parentId: activeScope.filesRootId,
+        size: 100,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: remoteHash,
+      }],
+      [{ path: "old.md", hash: remoteHash, size: 100, eTag: "etag-old" }],
+    );
+    const executor = new SyncExecutor(
+      onedrive,
+      emptyScanner(),
+      state,
+      "testVault",
+    );
+    (executor as unknown as { activeSyncScope: SyncScope })
+      .activeSyncScope = activeScope;
+    const outcome = await (executor as unknown as {
+      executeRenameRemoteItem(args: {
+        item: SyncPlanItem;
+        result: SyncResult;
+        remoteUpserts: RemoteFileEntry[];
+        remoteDeletes: string[];
+        operationEpoch: number;
+        factsChangedPolicy: "defer" | "throw";
+      }): Promise<{ executed: boolean; baseUpsert?: BaseFileEntry }>;
+    }).executeRenameRemoteItem({
+      item: {
+        type: SyncActionType.RenameRemote,
+        path: "sub/new.md",
+        renameFrom: "old.md",
+        targetParentRemoteId: "folder",
+        baseEtag: "etag-old",
+        local: {
+          path: "sub/new.md",
+          hash: editedHash,
+          size: 100,
+          mtime: 1,
+          binary: false,
+        },
+        remote: {
+          path: "old.md",
+          driveId: "id-old.md",
+          parentId: activeScope.filesRootId,
+          size: 100,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+          sha256Hash: remoteHash,
+        },
+      },
+      result: {} as SyncResult,
+      remoteUpserts: [],
+      remoteDeletes: [],
+      operationEpoch: 0,
+      factsChangedPolicy: "defer",
+    });
+
+    expect(outcome.executed).toBe(true);
+    expect(outcome.baseUpsert).toEqual({
+      path: "sub/new.md",
+      hash: remoteHash,
+      size: 100,
+      eTag: "etag-moved",
+    });
+  });
+
+  it("moves and uploads the edited bytes in the same action with the move eTag", async () => {
+    const oldContent = new TextEncoder().encode("version one\n").buffer;
+    const newContent = new TextEncoder().encode("version two\n").buffer;
+    const oldHash = await sha256Hex(oldContent);
+    const newHash = await sha256Hex(newContent);
+    const activeScope: SyncScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const movedItem: DriveItem = {
+      id: "id-note",
+      name: "renamed-note.md",
+      eTag: "etag-moved",
+      cTag: "ctag-moved",
+      size: oldContent.byteLength,
+      lastModifiedDateTime: new Date(1).toISOString(),
+      parentReference: { id: "folder" },
+      file: { hashes: {} },
+    };
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "id-note",
+      name: "renamed-note.md",
+      size: newContent.byteLength,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      lastModifiedDateTime: new Date(2).toISOString(),
+      parentReference: { id: "folder" },
+    });
+    const onedrive = makeMockOneDrive({
+      moveItemById: vi.fn().mockResolvedValue(movedItem),
+      uploadFile,
+      getFileMetadata: vi.fn(async (_vault: string, path: string) => {
+        if (path === "sub/renamed-note.md") {
+          return {
+            driveId: "id-note",
+            parentId: "folder",
+            size: oldContent.byteLength,
+            mtime: 1,
+            eTag: "etag-moved",
+            cTag: "ctag-moved",
+            sha256Hash: undefined,
+          };
+        }
+        return null;
+      }),
+    });
+    const state = makeActiveV2State(
+      [{
+        path: "test-note.md",
+        driveId: "id-note",
+        parentId: activeScope.filesRootId,
+        size: oldContent.byteLength,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: oldHash,
+      }],
+      [{
+        path: "test-note.md",
+        hash: oldHash,
+        size: oldContent.byteLength,
+        eTag: "etag-old",
+      }],
+    );
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn(async (path: string) =>
+              path === "sub/renamed-note.md"
+                ? newContent.slice(0)
+                : new ArrayBuffer(0)),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn(),
+        scanFile: vi.fn(),
+        inspectFile: vi.fn().mockResolvedValue({ status: "present" }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    (executor as unknown as { activeSyncScope: SyncScope })
+      .activeSyncScope = activeScope;
+    const result = {
+      uploaded: 0,
+      deferred: 0,
+    } as unknown as SyncResult;
+    const remoteUpserts: RemoteFileEntry[] = [];
+    const remoteDeletes: string[] = [];
+    const outcome = await (executor as unknown as {
+      executeRenameRemoteItem(args: Record<string, unknown>): Promise<{
+        executed: boolean;
+        baseUpsert?: BaseFileEntry;
+        baseRemoval?: string;
+      }>;
+    }).executeRenameRemoteItem({
+      item: {
+        type: SyncActionType.RenameRemote,
+        path: "sub/renamed-note.md",
+        renameFrom: "test-note.md",
+        targetParentRemoteId: "folder",
+        baseEtag: "etag-old",
+        local: {
+          path: "sub/renamed-note.md",
+          hash: newHash,
+          size: newContent.byteLength,
+          mtime: 1,
+          binary: false,
+        },
+        remote: {
+          path: "test-note.md",
+          driveId: "id-note",
+          parentId: activeScope.filesRootId,
+          size: oldContent.byteLength,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+        },
+      },
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      metrics: {
+        uploadBytes: 0,
+        uploadReadMs: 0,
+        activeUploads: 0,
+        peakUploads: 0,
+        fileTransfers: {
+          upload: createFileTransferMetrics(),
+          download: createFileTransferMetrics(),
+        },
+      },
+      callbacks: {},
+      operationEpoch: 0,
+      factsChangedPolicy: "defer",
+    });
+
+    expect(outcome.executed).toBe(true);
+    expect(uploadFile).toHaveBeenCalledOnce();
+    const uploadArgs = uploadFile.mock.calls[0];
+    expect(uploadArgs[1]).toBe("sub/renamed-note.md");
+    expect(uploadArgs[4]).toBe("etag-moved");
+    expect(uploadArgs[5]).toBe("id-note");
+    expect(outcome.baseUpsert).toEqual({
+      path: "sub/renamed-note.md",
+      hash: newHash,
+      size: newContent.byteLength,
+      eTag: "etag-uploaded",
+    });
+    expect(outcome.baseRemoval).toBe("test-note.md");
+    expect(remoteDeletes).toEqual(["test-note.md"]);
+    expect(remoteUpserts).toHaveLength(1);
+    expect(remoteUpserts[0]).toMatchObject({
+      path: "sub/renamed-note.md",
+      driveId: "id-note",
+      eTag: "etag-uploaded",
+      sha256Hash: newHash,
+    });
+    expect(result.filesMoved).toBe(1);
+    expect(result.uploaded).toBe(0);
+  });
+
+  it("falls back to the move-only receipt when the follow-up upload cannot run", async () => {
+    const oldContent = new TextEncoder().encode("version one\n").buffer;
+    const oldHash = await sha256Hex(oldContent);
+    const activeScope: SyncScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const movedItem: DriveItem = {
+      id: "id-note",
+      name: "renamed-note.md",
+      eTag: "etag-moved",
+      cTag: "ctag-moved",
+      size: oldContent.byteLength,
+      lastModifiedDateTime: new Date(1).toISOString(),
+      parentReference: { id: "folder" },
+      file: { hashes: {} },
+    };
+    const uploadFile = vi.fn();
+    const onedrive = makeMockOneDrive({
+      moveItemById: vi.fn().mockResolvedValue(movedItem),
+      uploadFile,
+      getFileMetadata: vi.fn(async (_vault: string, path: string) =>
+        path === "sub/renamed-note.md"
+          ? {
+            driveId: "id-note",
+            parentId: "folder",
+            size: oldContent.byteLength,
+            mtime: 1,
+            eTag: "etag-moved",
+            cTag: "ctag-moved",
+          }
+          : null),
+    });
+    const state = makeActiveV2State(
+      [{
+        path: "test-note.md",
+        driveId: "id-note",
+        parentId: activeScope.filesRootId,
+        size: oldContent.byteLength,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: oldHash,
+      }],
+      [{
+        path: "test-note.md",
+        hash: oldHash,
+        size: oldContent.byteLength,
+        eTag: "etag-old",
+      }],
+    );
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockRejectedValue(new Error("File does not exist")),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn(),
+        scanFile: vi.fn(),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    (executor as unknown as { activeSyncScope: SyncScope })
+      .activeSyncScope = activeScope;
+    const result = { uploaded: 0, deferred: 0 } as unknown as SyncResult;
+    const remoteUpserts: RemoteFileEntry[] = [];
+    const remoteDeletes: string[] = [];
+    const outcome = await (executor as unknown as {
+      executeRenameRemoteItem(args: Record<string, unknown>): Promise<{
+        executed: boolean;
+        baseUpsert?: BaseFileEntry;
+      }>;
+    }).executeRenameRemoteItem({
+      item: {
+        type: SyncActionType.RenameRemote,
+        path: "sub/renamed-note.md",
+        renameFrom: "test-note.md",
+        targetParentRemoteId: "folder",
+        baseEtag: "etag-old",
+        local: {
+          path: "sub/renamed-note.md",
+          hash: "b".repeat(64),
+          size: 12,
+          mtime: 1,
+          binary: false,
+        },
+        remote: {
+          path: "test-note.md",
+          driveId: "id-note",
+          parentId: activeScope.filesRootId,
+          size: oldContent.byteLength,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+        },
+      },
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      metrics: {
+        uploadBytes: 0,
+        uploadReadMs: 0,
+        activeUploads: 0,
+        peakUploads: 0,
+        fileTransfers: {
+          upload: createFileTransferMetrics(),
+          download: createFileTransferMetrics(),
+        },
+      },
+      callbacks: {},
+      operationEpoch: 0,
+      factsChangedPolicy: "defer",
+    });
+
+    expect(outcome.executed).toBe(true);
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(outcome.baseUpsert).toEqual({
+      path: "sub/renamed-note.md",
+      hash: oldHash,
+      size: oldContent.byteLength,
+      eTag: "etag-moved",
+    });
+    expect(remoteUpserts).toHaveLength(1);
+    expect(remoteUpserts[0]).toMatchObject({
+      path: "sub/renamed-note.md",
+      eTag: "etag-moved",
+      sha256Hash: undefined,
+    });
+    expect(result.uploaded).toBe(0);
+  });
+
+  it("settles the crash window against the target readback (anchor vs local vs blocked)", async () => {
+    const oldContent = new TextEncoder().encode("version one\n").buffer;
+    const newContent = new TextEncoder().encode("version two\n").buffer;
+    const otherContent = new TextEncoder().encode("someone else\n").buffer;
+    const oldHash = await sha256Hex(oldContent);
+    const newHash = await sha256Hex(newContent);
+    const activeScope: SyncScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const targetMetadata = {
+      driveId: "id-note",
+      parentId: "folder",
+      size: oldContent.byteLength,
+      mtime: 1,
+      eTag: "etag-moved",
+      cTag: "ctag-moved",
+      sha256Hash: undefined,
+    };
+    async function classify(downloaded: ArrayBuffer) {
+      const state = makeActiveV2State(
+        [{
+          path: "test-note.md",
+          driveId: "id-note",
+          parentId: activeScope.filesRootId,
+          size: oldContent.byteLength,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+          sha256Hash: oldHash,
+        }],
+        [{
+          path: "test-note.md",
+          hash: oldHash,
+          size: oldContent.byteLength,
+          eTag: "etag-old",
+        }],
+      );
+      const onedrive = makeMockOneDrive({
+        getFileMetadata: vi.fn(async (_vault: string, path: string) =>
+          path === "sub/renamed-note.md" ? targetMetadata : null),
+        downloadFile: vi.fn().mockResolvedValue(downloaded),
+      });
+      const executor = new SyncExecutor(
+        onedrive,
+        {
+          vault: {
+            adapter: makeMockAdapter(),
+            getFiles: vi.fn().mockReturnValue([]),
+            getName: vi.fn().mockReturnValue("testVault"),
+          },
+          scanAll: vi.fn(),
+          scanFile: vi.fn(),
+          inspectFile: vi.fn(async (path: string) =>
+            path === "sub/renamed-note.md"
+              ? {
+                status: "present",
+                entry: {
+                  path,
+                  hash: newHash,
+                  size: newContent.byteLength,
+                  mtime: 1,
+                  binary: false,
+                },
+              }
+              : { status: "missing" }),
+        } as unknown as LocalScanner,
+        state,
+        "testVault",
+      );
+      (executor as unknown as { activeSyncScope: SyncScope })
+        .activeSyncScope = activeScope;
+      return (executor as unknown as {
+        classifyUnreceiptedMutation(intent: MutationIntentV1): Promise<unknown>;
+      }).classifyUnreceiptedMutation({
+        version: 1,
+        operationId: "op-hint-crash",
+        planRevision: 1,
+        scope: activeScope,
+        action: "renameRemote",
+        path: "sub/renamed-note.md",
+        sourcePath: "test-note.md",
+        expectedLocal: {
+          exists: true,
+          hash: newHash,
+          size: newContent.byteLength,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: "id-note",
+          eTag: "etag-old",
+          size: oldContent.byteLength,
+        },
+        createdAt: 1,
+      } as MutationIntentV1);
+    }
+
+    const beforeUpload = await classify(oldContent) as {
+      baseUpserts: BaseFileEntry[];
+      fileMoveHintRemovals?: string[];
+    };
+    expect(beforeUpload.baseUpserts).toEqual([{
+      path: "sub/renamed-note.md",
+      hash: oldHash,
+      size: oldContent.byteLength,
+      eTag: "etag-moved",
+    }]);
+    expect(beforeUpload.fileMoveHintRemovals).toEqual(["id-note"]);
+
+    const afterUpload = await classify(newContent) as {
+      baseUpserts: BaseFileEntry[];
+      fileMoveHintRemovals?: string[];
+    };
+    expect(afterUpload.baseUpserts).toEqual([{
+      path: "sub/renamed-note.md",
+      hash: newHash,
+      size: newContent.byteLength,
+      eTag: "etag-moved",
+    }]);
+    expect(afterUpload.fileMoveHintRemovals).toEqual(["id-note"]);
+
+    expect(await classify(otherContent)).toBeNull();
+  });
+
+  it("settles the receiver cTag crash window against the target readback", async () => {
+    const oldContent = new TextEncoder().encode("version one\n").buffer;
+    const newContent = new TextEncoder().encode("version two\n").buffer;
+    const otherContent = new TextEncoder().encode("someone else\n").buffer;
+    const oldHash = await sha256Hex(oldContent);
+    const newHash = await sha256Hex(newContent);
+    const activeScope: SyncScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const targetMetadata = {
+      driveId: "drv-a",
+      parentId: activeScope.filesRootId,
+      size: oldContent.byteLength,
+      mtime: 1,
+      eTag: "etag-new",
+      cTag: "ctag-new",
+      sha256Hash: undefined,
+    };
+    async function classify(
+      localContent: ArrayBuffer,
+      downloaded: ArrayBuffer,
+    ) {
+      const state = makeActiveV2State(
+        [{
+          path: "old.md",
+          driveId: "drv-a",
+          parentId: activeScope.filesRootId,
+          size: oldContent.byteLength,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+          sha256Hash: oldHash,
+        }],
+        [{
+          path: "old.md",
+          hash: oldHash,
+          size: oldContent.byteLength,
+          eTag: "etag-old",
+        }],
+      );
+      const envelope = (state as unknown as {
+        peekCommittedV2Envelope: () => {
+          anchors: {
+            byAnchorId: Record<string, { remoteCTag?: string }>;
+          };
+        };
+      }).peekCommittedV2Envelope();
+      for (const anchor of Object.values(envelope.anchors.byAnchorId)) {
+        anchor.remoteCTag = "ctag-old";
+      }
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          getFileMetadata: vi.fn(async (_vault: string, path: string) =>
+            path === "new.md" ? targetMetadata : null),
+          downloadFile: vi.fn().mockResolvedValue(downloaded),
+        }),
+        {
+          vault: {
+            adapter: makeMockAdapter(),
+            getFiles: vi.fn().mockReturnValue([]),
+            getName: vi.fn().mockReturnValue("testVault"),
+          },
+          scanAll: vi.fn(),
+          scanFile: vi.fn(),
+          inspectFile: vi.fn(async (path: string) =>
+            path === "old.md"
+              ? { status: "missing" }
+              : {
+                status: "present",
+                entry: {
+                  path,
+                  hash: await sha256Hex(localContent),
+                  size: localContent.byteLength,
+                  mtime: 1,
+                  binary: false,
+                },
+              }),
+        } as unknown as LocalScanner,
+        state,
+        "testVault",
+      );
+      (executor as unknown as { activeSyncScope: SyncScope })
+        .activeSyncScope = activeScope;
+      const intent = {
+        version: 1 as const,
+        operationId: "op-move-crash",
+        planRevision: 1,
+        scope: activeScope,
+        action: "moveLocal" as const,
+        path: "new.md",
+        sourcePath: "old.md",
+        expectedLocal: {
+          exists: true as const,
+          hash: oldHash,
+          size: oldContent.byteLength,
+        },
+        expectedRemote: {
+          exists: true as const,
+          driveId: "drv-a",
+          eTag: "etag-new",
+          size: oldContent.byteLength,
+        },
+        createdAt: 1,
+      };
+      return (executor as unknown as {
+        classifyUnreceiptedMoveLocalMutation(args: {
+          intent: MutationIntentV1;
+          local: {
+            status: "present";
+            entry: LocalFileEntry;
+          };
+          observationOnly: boolean;
+        }): Promise<unknown>;
+      }).classifyUnreceiptedMoveLocalMutation({
+        intent: intent as MutationIntentV1,
+        local: {
+          status: "present",
+          entry: {
+            path: "new.md",
+            hash: await sha256Hex(localContent),
+            size: localContent.byteLength,
+            mtime: 1,
+            binary: false,
+          },
+        },
+        observationOnly: false,
+      });
+    }
+
+    const beforeAlignment = await classify(oldContent, oldContent) as {
+      baseUpserts: BaseFileEntry[];
+      remoteUpserts: RemoteFileEntry[];
+      contentAlignedFromRemote?: boolean;
+    };
+    expect(beforeAlignment.baseUpserts).toEqual([{
+      path: "new.md",
+      hash: oldHash,
+      size: oldContent.byteLength,
+      eTag: "etag-new",
+    }]);
+    expect(beforeAlignment.remoteUpserts[0].cTag).toBe("ctag-old");
+    expect(beforeAlignment.contentAlignedFromRemote).toBeUndefined();
+
+    const afterAlignment = await classify(newContent, newContent) as {
+      baseUpserts: BaseFileEntry[];
+      remoteUpserts: RemoteFileEntry[];
+      contentAlignedFromRemote?: boolean;
+    };
+    expect(afterAlignment.baseUpserts).toEqual([{
+      path: "new.md",
+      hash: newHash,
+      size: newContent.byteLength,
+      eTag: "etag-new",
+    }]);
+    expect(afterAlignment.remoteUpserts[0].cTag).toBe("ctag-new");
+    expect(afterAlignment.contentAlignedFromRemote).toBe(true);
+
+    expect(await classify(oldContent, otherContent)).toBeNull();
+  });
+
+  it("retires the consumed host rename hint with the rename receipt", () => {
+    const executor = new SyncExecutor(
+      makeMockOneDrive(),
+      emptyScanner(),
+      makeActiveV2State([], []),
+      "testVault",
+    );
+    const receipt = (executor as unknown as {
+      buildPlanItemMutationReceipt(args: Record<string, unknown>): MutationReceiptV1;
+    }).buildPlanItemMutationReceipt({
+      item: {
+        type: SyncActionType.RenameRemote,
+        path: "sub/new.md",
+        renameFrom: "old.md",
+        local: {
+          path: "sub/new.md",
+          hash: "b".repeat(64),
+          size: 100,
+          mtime: 1,
+          binary: false,
+        },
+        remote: {
+          path: "old.md",
+          driveId: "id-old.md",
+          size: 100,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+        },
+      },
+      itemResult: { executed: true },
+      itemRemoteUpserts: [],
+      itemRemoteDeletes: [],
+      mutationIntent: { operationId: "op-rename" },
+      automaticHandlingPolicy: { autoDeleteLocalFiles: false },
+      isFolderMove: () => false,
+      isFolderDelete: () => false,
+    });
+
+    expect(receipt.checkpoint.fileMoveHintRemovals).toEqual(["id-old.md"]);
+  });
+});

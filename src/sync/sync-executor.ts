@@ -56,9 +56,9 @@ import { AuthError, AuthErrorType } from "../auth/types";
 import { PLAN_REASON } from "./plan-reason";
 import {
   isV2BaseUpsertRejectionError,
-  isV2RemoteMoveMissingSourceDeletionError,
   isV2RemoteUpsertParentMismatchError,
   isV2StateAbsorptionRefusalError,
+  isV2StatePathRefusalError,
 } from "./v2-state-refusal";
 import {
   SyncActionType,
@@ -431,6 +431,7 @@ import {
   type SyncRunPhaseDurations,
   type UploadTransferObservation,
 } from "./executor-metrics";
+import { queueWaitObservation } from "./queue-wait-observation";
 import type {
   CommitReviewedFolderLocationResolutionArgs,
   CommitReviewedFolderLocationResolutionOutcome,
@@ -813,6 +814,10 @@ interface ItemExecutionResult {
   mutationApplied?: boolean;
   baseUpsert?: BaseFileEntry;
   baseRemoval?: string;
+  /** The local target was overwritten with the exact remote bytes during a
+   *  followed move (A1 alignment). The receipt gate accepts the aligned
+   *  sha-unknown shape only with this proof. */
+  contentAlignedFromRemote?: boolean;
   /** Exact remote folder identity to publish with a folder-create receipt. */
   folderUpsert?: RemoteFolderEntry;
   /** Exact remote folder identity retired by an empty-shell delete. */
@@ -1735,6 +1740,13 @@ export class SyncExecutor {
   /** Execution-layer mismatches silently converged this round
    * (candidate ①, 2026-09-06).  Reset at the start of every execute(). */
   private convergencesThisRound = 0;
+  /** One bounded remote-identity rebuild per round for the same-round
+   *  checkpoint-repair lane. A receipted mutation whose checkpoint the
+   *  committed tree refuses (stale path spelling, drifted parent) gets one
+   *  read-only refresh, then one retry; a second rebuild inside the same
+   *  round cannot reveal a different tree because every own mutation is
+   *  already checkpointed. Reset at the start of every execute(). */
+  private mutationRecoveryHierarchyRebuiltThisRound = false;
   private completeRemoteItems: DriveItem[] | null = null;
   private isolatedMutationRecoveryPathCache: {
     records: readonly Readonly<MutationLedgerEntryV1>[];
@@ -5897,33 +5909,174 @@ export class SyncExecutor {
   }
 
   private decisionTokenMatchesSnapshot(item: SyncPlanItem): boolean {
+    return this.decisionTokenMismatchReason(item) === null;
+  }
+
+  /** Why the reviewed token no longer matches the current row/run. Evidence
+   *  only: the guard still fails closed; the label makes a real-device batch
+   *  block readable (missing token vs one exact stale fact). */
+  private decisionTokenMismatchReason(item: SyncPlanItem): string | null {
     const token = item.decisionToken;
-    if (
-      !isSyncDecisionToken(token)
-      || token.vaultName !== this.vaultName
-      || token.accountId !== (this.state.boundAccountId ?? "")
-      || !sameSyncScope(token.scope, this.activeSyncScope ?? this.state.remoteScope)
-    ) return false;
-    if (token.local.exists !== Boolean(item.local)) return false;
+    if (!isSyncDecisionToken(token)) return "missing-token";
+    if (token.vaultName !== this.vaultName) return "vault";
+    if (token.accountId !== (this.state.boundAccountId ?? "")) return "account";
+    if (!sameSyncScope(token.scope, this.activeSyncScope ?? this.state.remoteScope)) {
+      return "scope";
+    }
+    if (token.local.exists !== Boolean(item.local)) return "local-existence";
     if (
       token.local.exists
-      && (!item.local || token.local.hash !== item.local.hash || token.local.size !== item.local.size)
-    ) return false;
-    if (token.remote.exists !== Boolean(item.remote)) return false;
+      && (!item.local
+        || token.local.hash !== item.local.hash
+        || token.local.size !== item.local.size)
+    ) {
+      return "local-version";
+    }
+    if (token.remote.exists !== Boolean(item.remote)) return "remote-existence";
     if (
       token.remote.exists
-      && (!item.remote || token.remote.driveId !== item.remote.driveId || token.remote.eTag !== item.remote.eTag)
-    ) return false;
+      && (!item.remote
+        || token.remote.driveId !== item.remote.driveId
+        || token.remote.eTag !== item.remote.eTag)
+    ) {
+      return "remote-version";
+    }
     const ancestor = this.state.baseSnapshot.find((entry) => entry.path === item.path);
-    return token.ancestorHash === (ancestor?.hash ?? null);
+    return token.ancestorHash === (ancestor?.hash ?? null) ? null : "ancestor";
+  }
+
+  /**
+   * What a token mismatch actually means, split by the kind of fact it is.
+   *
+   * `authorization`: a fact the user saw when they decided (vault, account,
+   * scope, the exact local bytes, the exact remote object). It changed, so the
+   * reviewed decision no longer describes the file pair; the row fails closed
+   * and the existing drift paths rebuild it.
+   *
+   * `bookkeeping`: the row's own reviewed facts are intact, but either the
+   * envelope was never recorded (`missing-token`) or this device's merge base
+   * moved (`ancestor`). The base is planner input — no decision action reads
+   * it, and this system moves it itself (committed batches, re-baseline,
+   * migration) — so treating it as authorization turns the system's own ledger
+   * writes into false authorization failures, one row at a time. Both cases
+   * are rebound from the facts already recorded on the row; every one of those
+   * facts is still re-read live before any mutation
+   * (`guardReviewedLocalVersion` / `guardReviewedRemoteVersion`).
+   *
+   * A row that recorded neither side has no reviewed facts to stand on, so a
+   * missing envelope there stays an authorization failure.
+   */
+  private decisionTokenMismatchKind(
+    mismatch: string,
+    item: SyncPlanItem,
+  ): "authorization" | "bookkeeping" {
+    if (mismatch === "ancestor") return "bookkeeping";
+    if (mismatch === "missing-token") {
+      return item.local || item.remote ? "bookkeeping" : "authorization";
+    }
+    return "authorization";
+  }
+
+  /** Existing pending row vs the fresh plan row for the same path. Compares
+   *  only the facts a decision authorizes; reason/evidence fields may differ
+   *  and are preserved from the existing row when its token is refreshed. */
+  private samePendingDecisionFacts(
+    existing: SyncPlanItem,
+    fresh: SyncPlanItem,
+  ): boolean {
+    if (Boolean(existing.local) !== Boolean(fresh.local)) return false;
+    if (
+      existing.local
+      && (!fresh.local
+        || existing.local.hash !== fresh.local.hash
+        || existing.local.size !== fresh.local.size)
+    ) return false;
+    if (Boolean(existing.remote) !== Boolean(fresh.remote)) return false;
+    if (
+      existing.remote
+      && (!fresh.remote
+        || existing.remote.driveId !== fresh.remote.driveId
+        || existing.remote.eTag !== fresh.remote.eTag)
+    ) return false;
+    return true;
+  }
+
+  /** A still-planned row may refresh its own token only when either it already
+   *  carried a token belonging to this vault/account/scope, or it never
+   *  recorded one at all, AND the local+remote facts still match the fresh
+   *  plan. The plan just re-derived this same path, so recording the fresh
+   *  token only fills the envelope gap; it never re-authorizes changed facts.
+   *  Missing tokens on a row with no recorded facts, and changed file facts,
+   *  keep the normal fail-closed path. */
+  private canRefreshPendingDecisionToken(
+    existing: SyncPlanItem,
+    fresh: SyncPlanItem,
+  ): boolean {
+    const token = existing.decisionToken;
+    if (!this.samePendingDecisionFacts(existing, fresh) || !fresh.decisionToken) {
+      return false;
+    }
+    if (!isSyncDecisionToken(token)) {
+      return this.decisionTokenMismatchKind("missing-token", existing)
+        === "bookkeeping";
+    }
+    if (
+      token.vaultName !== this.vaultName
+      || token.accountId !== (this.state.boundAccountId ?? "")
+      || !sameSyncScope(
+        token.scope,
+        this.activeSyncScope ?? this.state.remoteScope,
+      )
+    ) return false;
+    return !this.decisionTokenMatchesSnapshot(existing);
+  }
+
+  /** Rebind the fresh plan token onto an existing pending row in place. The
+   *  row keeps its reason/evidence and reviewed local/remote facts; only the
+   *  ancestor binding moves to the current base. */
+  private refreshPendingDecisionRows(
+    existingRows: readonly SyncPlanItem[],
+    planRows: readonly SyncPlanItem[],
+  ): SyncPlanItem[] {
+    const byPath = new Map(existingRows.map((row) => [row.path, row]));
+    const refreshed: SyncPlanItem[] = [];
+    for (const fresh of planRows) {
+      const existing = byPath.get(fresh.path);
+      if (!existing || !this.canRefreshPendingDecisionToken(existing, fresh)) {
+        continue;
+      }
+      refreshed.push({ ...existing, decisionToken: fresh.decisionToken });
+    }
+    return refreshed;
   }
 
   private guardDecisionToken(
     item: SyncPlanItem,
     noticeKey: "notice.conflict.failed" | "notice.delete.failed",
   ): boolean {
-    if (this.decisionTokenMatchesSnapshot(item)) return true;
-    this.diag?.warn("execute", `reviewed action blocked — missing or stale decision token for ${item.path}`);
+    const mismatch = this.decisionTokenMismatchReason(item);
+    if (mismatch === null) return true;
+    // The reviewed file facts are still the ones the row records; either the
+    // envelope was never written down (legacy row) or this device's merge base
+    // moved under it (a committed batch or re-baseline elsewhere). Rebuild the
+    // envelope from the row's own facts, then let the live local/remote guards
+    // below decide. Changed file facts, another vault/account/scope, and a row
+    // with no recorded facts all fall through to the fail-closed exit.
+    if (
+      this.decisionTokenMismatchKind(mismatch, item) === "bookkeeping"
+      && (this.activeSyncScope ?? this.state.remoteScope)
+    ) {
+      item.decisionToken = this.createDecisionToken(item);
+      this.diag?.log(
+        "execute",
+        `reviewed decision token rebound from the row's recorded facts (${mismatch}) — ${item.path}`,
+      );
+      return true;
+    }
+    this.diag?.warn(
+      "execute",
+      `reviewed action blocked — missing or stale decision token for ${item.path} (${mismatch})`,
+    );
     this.notice(noticeKey, { path: item.path, reason: this.t("notice.decisionExpired") });
     return false;
   }
@@ -11359,6 +11512,32 @@ export class SyncExecutor {
     if (missingDeleteRows.length > 0) {
       await this.state.upsertPendingDeletes(missingDeleteRows);
     }
+    // Existing rows are normally left untouched so other owners' state (for
+    // example cached text-merge evidence) survives. A batch that advanced the
+    // base snapshot, however, leaves their tokens bound to an older ancestor:
+    // the plan just re-derived the same path with the same local/remote facts,
+    // so rebind only that ancestor fact instead of making the next user click
+    // fail one row at a time (2026-11-06 field batch: 100+ expired notices).
+    const refreshedConflictRows = this.refreshPendingDecisionRows(
+      this.state.pendingConflicts,
+      planConflictRows,
+    );
+    if (refreshedConflictRows.length > 0) {
+      await this.state.upsertPendingConflicts(refreshedConflictRows);
+      this.diag?.log("execute", "refreshed pending conflict decision tokens", {
+        rows: refreshedConflictRows.length,
+      });
+    }
+    const refreshedDeleteRows = this.refreshPendingDecisionRows(
+      this.state.pendingRemoteDeletes,
+      planDeleteRows,
+    );
+    if (refreshedDeleteRows.length > 0) {
+      await this.state.upsertPendingDeletes(refreshedDeleteRows);
+      this.diag?.log("execute", "refreshed pending delete decision tokens", {
+        rows: refreshedDeleteRows.length,
+      });
+    }
     if (this.shouldStop(result, operationEpoch)) return { terminated: result };
     return { terminated: null };
   }
@@ -14095,6 +14274,8 @@ export class SyncExecutor {
       },
     };
     this.convergencesThisRound = 0;
+    this.mutationRecoveryHierarchyRebuiltThisRound = false;
+    queueWaitObservation.startWindow();
     const runStartedAt = Date.now();
     const phasesMs: SyncRunPhaseDurations = {
       recovery: 0,
@@ -15034,10 +15215,11 @@ export class SyncExecutor {
           ? this.failureReason(e)
           : e instanceof Error ? e.message : "unknown error";
         result.message = this.t("result.syncFailed", { message: runFailureMessage });
+        const dbFingerprint = fingerprintIndexedDbError(e);
         this.diag?.error(
           "execute",
           "sync run failed unexpectedly",
-          describeError(e),
+          dbFingerprint ?? describeError(e),
         );
       }
     } finally {
@@ -15090,6 +15272,7 @@ export class SyncExecutor {
         readOnlyPreview: options.readOnlyPreview === true,
         counts: projectSyncRunPhaseSummaryCounts(result),
         phasesMs,
+        queues: queueWaitObservation.snapshot(),
         totalMs: Math.max(0, Date.now() - runStartedAt),
       }, { urgent: true });
       this.recordSyncIdleObservation(result);
@@ -15749,12 +15932,26 @@ export class SyncExecutor {
     // 按开始计数会让计数整批跳（1→8→16），批内长时间不动。开始点只把当前
     // 文件名换成本项（字节进度归零、在飞徽标 +1），计数在 finally 里 +1。
     const position = countsTowardProgress ? run.settled + 1 : run.settled;
+    const fileSize = fileSizeForAction(item, item.type);
+    // 传输项把计划里已知的文件大小随开始点一起交给侧栏：移动端整包回退／
+    // 非流式通道不产生中间字节回调时，名称行右侧仍能显示 `0 / 大小`，而不是
+    // 一直空白。真实字节回调到达后由 setByteProgress 继续推进。
+    const knownTransferBytes =
+      (item.type === SyncActionType.Upload || item.type === SyncActionType.Download)
+      && !(item.type === SyncActionType.Download && preparedDownload !== undefined)
+        ? fileSize
+        : undefined;
     if (countsTowardProgress) {
-      this.progressStore?.setProgress(run.settled, run.total, item.path, item.type);
+      this.progressStore?.setProgress(
+        run.settled,
+        run.total,
+        item.path,
+        item.type,
+        knownTransferBytes,
+      );
       callbacks.onProgress?.(run.settled, run.total, item.path);
     }
 
-    const fileSize = fileSizeForAction(item, item.type);
     const localHash = item.local?.hash;
     const remoteETag = item.remote?.eTag;
     let mutationIntent: MutationIntent | null = null;
@@ -17278,19 +17475,30 @@ export class SyncExecutor {
    *  failed intent already has a receipt: the receipt proves the target
    *  change landed, so only the checkpoint commit is replayed, with one
    *  read-only remote-hierarchy rebase for the upload-parent mismatch or the
-   *  rename destination-spelling alias (the reducer's two path refusals). */
+   *  rename destination-spelling alias, and one spelling convergence when the
+   *  live service still projects the identity under another case/Unicode
+   *  spelling (the reducer's three path refusals). */
   private async recoverReceiptedMutationFailure(args: RecoverReceiptedMutationFailureArgs): Promise<SideMutationRecoveryOutcome> {
     const { error, activeIntent, activeRecord, operationEpoch, result, metrics } = args;
     try {
-      if (
-        isV2RemoteUpsertParentMismatchError(error)
-        || isV2RemoteMoveMissingSourceDeletionError(error)
-      ) {
+      if (isV2StatePathRefusalError(error)) {
         // The hierarchy may have changed after this run's initial
-        // scan. Refresh the committed identity tree once, then retry
-        // the exact receipt against that new tree. This is read-only
+        // scan. Refresh the committed identity tree once per round, then
+        // retry the exact receipt against that new tree. This is read-only
         // recovery; it never rewrites the plan or relaxes the reducer.
-        if (this.activeSyncScope) {
+        //
+        // The base-upsert class joined this lane for the 2026-11-05 field
+        // case: a download receipt at `科研大神/meta分析.md` could never
+        // commit while the committed index projected the same identity at
+        // `科研大神/Meta分析.md`, so the round stopped and every conflict
+        // click failed until another ordinary sync rebuilt the tree. The
+        // cross-round lane already repaired this class; the same-round lane
+        // did not.
+        if (
+          this.activeSyncScope
+          && !this.mutationRecoveryHierarchyRebuiltThisRound
+        ) {
+          this.mutationRecoveryHierarchyRebuiltThisRound = true;
           await this.rebuildRemoteStateFromIdentitySnapshot(
             operationEpoch,
             result,
@@ -17322,7 +17530,7 @@ export class SyncExecutor {
       }
       const checkpointStartedAt = Date.now();
       try {
-        const checkpointMetrics = await this.commitMutationCheckpoint(
+        const checkpointMetrics = await this.commitCheckpointWithSpellingConvergence(
           activeIntent.operationId,
         );
         recordCheckpointMetrics(
@@ -17474,6 +17682,19 @@ export class SyncExecutor {
           ? this.folderIdentityIdsAtOrBelow(item.renameFrom)
           : [remoteId];
       }
+    }
+    // A committed file move consumes the host rename evidence that proved it
+    // (and any stale hint for the same identity). Both file move directions
+    // share the same identity, so either one settles the hint.
+    if (
+      (item.type === SyncActionType.RenameRemote
+        || item.type === SyncActionType.MoveLocalFile)
+      && item.remote?.driveId
+    ) {
+      checkpoint.fileMoveHintRemovals = [item.remote.driveId];
+    }
+    if (itemResult.contentAlignedFromRemote) {
+      checkpoint.contentAlignedFromRemote = true;
     }
     // A folder delete settles its own confirmation row here. Without this the
     // row would outlive the checkpoint, and once the decision is consumed the
@@ -19810,7 +20031,7 @@ export class SyncExecutor {
         checkpoint,
       });
       if (!this.canContinue(operationEpoch)) return false;
-      await this.commitMutationCheckpoint(intent.operationId);
+      await this.commitSideMutationCheckpoint(intent.operationId, operationEpoch);
       return this.canContinue(operationEpoch);
     } catch (error) {
       if (error instanceof MutationNotAppliedError) {
@@ -19827,7 +20048,11 @@ export class SyncExecutor {
         throw error;
       }
 
-      if (checkpoint && await this.retrySideMutationCheckpoint(intent, checkpoint)) {
+      if (checkpoint && await this.retrySideMutationCheckpoint(
+        intent,
+        checkpoint,
+        operationEpoch,
+      )) {
         return this.canContinue(operationEpoch);
       }
       const recovery = await this.reconcileFailedMutation(intent);
@@ -19838,10 +20063,45 @@ export class SyncExecutor {
     }
   }
 
+  /**
+   * Commit one side action's receipted checkpoint, repairing a committed tree
+   * that refuses the receipt exactly once: one read-only identity rebuild,
+   * then one retry, which itself converges a case/Unicode path spelling the
+   * live service still keeps. The 2026-11-05 field case (Android 1.6.6) showed
+   * why the side lane needs this too — a divergent index spelling made every
+   * conflict click fail with an internal error until an ordinary sync rebuilt
+   * the tree. The rebuild writes no remote state and every other refusal keeps
+   * its existing fail-closed exit.
+   */
+  private async commitSideMutationCheckpoint(
+    operationId: string,
+    operationEpoch: number,
+  ): Promise<void> {
+    try {
+      await this.commitMutationCheckpoint(operationId);
+      return;
+    } catch (error) {
+      if (!isV2StatePathRefusalError(error)) throw error;
+      if (!this.activeSyncScope) throw error;
+      this.diag?.warn(
+        "state",
+        `side mutation checkpoint rejected against the committed tree; rebuilding once — ${operationId}`,
+        { error: describeError(error), mutations: 0 },
+      );
+      await this.rebuildRemoteStateFromIdentitySnapshot(
+        operationEpoch,
+        undefined,
+        this.activeSyncScope,
+      );
+      await this.commitCheckpointWithSpellingConvergence(operationId);
+    }
+  }
+
   /** Retry the exact checkpoint produced by a completed mutation. */
   private async retrySideMutationCheckpoint(
     intent: MutationIntent,
     checkpoint: MutationCheckpointV1,
+    operationEpoch: number,
   ): Promise<boolean> {
     try {
       await this.state.recordMutationReceipt({
@@ -19850,7 +20110,10 @@ export class SyncExecutor {
         completedAt: Date.now(),
         checkpoint,
       });
-      await this.commitMutationCheckpoint(intent.operationId);
+      await this.commitSideMutationCheckpoint(
+        intent.operationId,
+        operationEpoch,
+      );
       this.diag?.warn("execute", `side mutation checkpoint retried in the same action — ${intent.path}`);
       return true;
     } catch (recoveryError) {
@@ -21375,6 +21638,180 @@ export class SyncExecutor {
   }
 
   /**
+   * Absorb one already-receipted file mutation whose path differs from the
+   * committed identity tree by case/Unicode spelling only.
+   *
+   * The reducer resolves paths byte-exactly while the service resolves them
+   * case-insensitively, so a case-only divergence lands the effect and can
+   * never commit its checkpoint: the 2026-11-05 field case (F36) downloaded
+   * `科研大神/meta分析.md` while the committed index kept
+   * `科研大神/Meta分析.md`, the round stopped, auto sync paused and every
+   * conflict click failed for 45 minutes.
+   *
+   * The repair is read-mostly and only acts on proven facts: both spellings
+   * must resolve to the same live identity at the receipt's exact version, and
+   * the local file must still hold the receipt's bytes. Then the one local file
+   * moves to the committed index spelling and the receipt follows it in one
+   * atomic write. No remote write, no reducer assertion relaxed, and every
+   * unproven fact leaves the record blocked exactly as before.
+   */
+  private async convergeReceiptedMutationSpelling(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<boolean> {
+    const intent = record.intent;
+    if (
+      intent.version !== 1
+      || (intent.action !== "download" && intent.action !== "upload")
+      || intent.stateEffect !== undefined
+      || intent.target !== undefined
+      || intent.sourcePath !== undefined
+      || !record.receipt
+    ) return false;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope || envelope.remoteIndex.complete !== true) return false;
+    const checkpoint = record.receipt.checkpoint;
+    const base = checkpoint.baseUpserts.find((entry) => entry.path === intent.path);
+    const upsert = intent.action === "upload"
+      ? checkpoint.remoteUpserts.find((entry) => entry.path === intent.path)
+      : undefined;
+    if (!base || (intent.action === "upload" && !upsert)) return false;
+    const driveId = upsert?.driveId
+      ?? (intent.expectedRemote.exists ? intent.expectedRemote.driveId : undefined);
+    if (!driveId) return false;
+    const indexPath = projectRemoteIndexV2(envelope.remoteIndex).get(driveId);
+    if (
+      !indexPath
+      || indexPath === intent.path
+      || normalizeRemotePathKey(indexPath) !== normalizeRemotePathKey(intent.path)
+    ) return false;
+    const node = envelope.remoteIndex.itemsById[driveId];
+    if (
+      !node
+      || node.kind !== "file"
+      || node.eTag !== base.eTag
+      || node.size !== base.size
+      || (
+        node.contentHash !== undefined
+        && node.contentHash.toLowerCase() !== base.hash.toLowerCase()
+      )
+    ) return false;
+    // Both spellings must still be the same live identity at the receipt's
+    // version; a service that moved on again keeps the record blocked.
+    const [receiptRead, indexRead] = await Promise.all([
+      this.inspectRemotePath(intent.path),
+      this.inspectRemotePath(indexPath),
+    ]);
+    for (const read of [receiptRead, indexRead]) {
+      if (
+        !read
+        || read.driveId !== driveId
+        || read.eTag !== base.eTag
+        || read.size !== base.size
+        || (
+          read.sha256Hash !== undefined
+          && read.sha256Hash.toLowerCase() !== base.hash.toLowerCase()
+        )
+      ) return false;
+    }
+    const holdsReceiptBytes = (inspection: LocalFileInspection): boolean =>
+      inspection.status === "present"
+      && Boolean(inspection.entry)
+      && inspection.entry!.hash === base.hash
+      && inspection.entry!.size === base.size;
+    const [localAtReceipt, localAtIndex] = await Promise.all([
+      this.inspectLocalPath(intent.path),
+      this.inspectLocalPath(indexPath),
+    ]);
+    if (!localAtReceipt || !localAtIndex) return false;
+    // A case-insensitive host reports the startable path as the file it already
+    // has, so its canonical path proves the name never had to move.
+    const targetAlreadyCanonical = localAtIndex.status === "present"
+      && localAtIndex.entry?.path === indexPath
+      && holdsReceiptBytes(localAtIndex);
+    if (!targetAlreadyCanonical) {
+      if (
+        localAtReceipt.status !== "present"
+        || !holdsReceiptBytes(localAtReceipt)
+        || localAtIndex.status !== "missing"
+      ) return false;
+      await this.renameLocalFile(intent.path, indexPath);
+      const [sourceAfter, targetAfter] = await Promise.all([
+        this.inspectLocalPath(intent.path),
+        this.inspectLocalPath(indexPath),
+      ]);
+      if (
+        !targetAfter
+        || targetAfter.status !== "present"
+        || targetAfter.entry?.path !== indexPath
+        || !holdsReceiptBytes(targetAfter)
+        || (
+          sourceAfter
+          && sourceAfter.status === "present"
+          && sourceAfter.entry?.path !== indexPath
+        )
+      ) return false;
+    }
+    const nextReceipt: MutationReceiptV1 = {
+      ...record.receipt,
+      checkpoint: {
+        ...checkpoint,
+        baseUpserts: checkpoint.baseUpserts.map((entry) =>
+          entry.path === intent.path ? { ...entry, path: indexPath } : entry),
+        remoteUpserts: checkpoint.remoteUpserts.map((entry) =>
+          entry.path === intent.path ? { ...entry, path: indexPath } : entry),
+      },
+    };
+    await this.state.rebaseReceiptedRenameSpelling({
+      expected: record,
+      path: indexPath,
+      receipt: nextReceipt,
+    });
+    this.diag?.log(
+      "state",
+      `converged receipted mutation spelling to the committed index path — ${intent.path} -> ${indexPath}`,
+      { operationId: intent.operationId, mutations: 0 },
+    );
+    return true;
+  }
+
+  /**
+   * Commit one receipted checkpoint; when the committed tree still refuses its
+   * path spelling, converge that spelling once and replay the commit once.
+   * The first refusal is rethrown whenever convergence cannot prove its facts,
+   * so the caller's existing blocked/fail-closed exit is unchanged.
+   */
+  private async commitCheckpointWithSpellingConvergence(
+    operationId: string,
+  ): Promise<MutationCheckpointCommitMetrics | undefined> {
+    try {
+      return await this.commitMutationCheckpoint(operationId);
+    } catch (error) {
+      if (!isV2StatePathRefusalError(error)) throw error;
+      if (!(await this.convergeRecoveryRecordSpellings([operationId]))) {
+        throw error;
+      }
+      return await this.commitMutationCheckpoint(operationId);
+    }
+  }
+
+  /** Converge the spelling of every still-outstanding record in one commit
+   *  batch. Returns whether at least one record was rewritten; records whose
+   *  facts do not prove convergence are left exactly as they were. */
+  private async convergeRecoveryRecordSpellings(
+    operationIds: readonly string[],
+  ): Promise<boolean> {
+    let converged = false;
+    for (const operationId of operationIds) {
+      const record = this.state.mutationLedger.find(
+        (entry) => entry.intent.operationId === operationId,
+      );
+      if (!record) continue;
+      if (await this.convergeReceiptedMutationSpelling(record)) converged = true;
+    }
+    return converged;
+  }
+
+  /**
    * Detect the one parent-drift shape the existing receipt rebase cannot
    * repair: the receipt carries the live parent identity while the committed
    * index still binds the path to an older folder identity (field reports
@@ -21707,11 +22144,29 @@ export class SyncExecutor {
       const upsert = receipt.checkpoint.remoteUpserts.find(
         (entry) => entry.path === intent.path,
       );
-      return sourceLocal?.status === "missing"
-        && sourceRemote === undefined
-        && Boolean(upsert && targetRemote
-          && targetRemote.driveId === upsert.driveId
-          && targetRemote.eTag === upsert.eTag);
+      if (
+        !upsert
+        || !targetRemote
+        || targetRemote.driveId !== upsert.driveId
+        || targetRemote.eTag !== upsert.eTag
+      ) return false;
+      // A case-only cloud rename leaves the source spelling resolving to the
+      // same live identity (service resolves case-insensitively) and, on a
+      // case-insensitive host, to the same local file. Both are the move
+      // itself; only a different object or a different local file means the
+      // source survived next to the target.
+      const sourceRemoteAliasesTarget = sourceRemote === undefined
+        || sourceRemote.driveId === upsert.driveId;
+      const sourceLocalAliasesTarget = sourceLocal !== null
+        && (
+          sourceLocal.status === "missing"
+          || (
+            sourceLocal.status === "present"
+            && local.status === "present"
+            && sourceLocal.entry?.path === local.entry?.path
+          )
+        );
+      return sourceRemoteAliasesTarget && sourceLocalAliasesTarget;
     }
 
     // upload
@@ -22378,6 +22833,53 @@ export class SyncExecutor {
       checkpoint.remoteUpserts.push(target);
       return checkpoint;
     }
+    // Hint-proven move whose edited upload may or may not have landed before
+    // the receipt was lost: read the target back and settle against whichever
+    // side it matches. Never write the edited local as the base while the
+    // target still holds the pre-move bytes (that would hide the edit).
+    const committedEnvelope = this.state.getCommittedV2Envelope();
+    const expectedRemoteDriveId = intent.expectedRemote.exists
+      ? intent.expectedRemote.driveId
+      : undefined;
+    const committedAnchor = committedEnvelope && expectedRemoteDriveId
+      ? Object.values(committedEnvelope.anchors.byAnchorId).find(
+          (anchor) => anchor.remoteId === expectedRemoteDriveId,
+        )
+      : undefined;
+    if (
+      committedAnchor
+      && expectedRemoteDriveId
+      && committedAnchor.lastPath === intent.sourcePath
+      && committedAnchor.contentHash.toLowerCase()
+        !== intent.expectedLocal.hash.toLowerCase()
+    ) {
+      const bytes = await this.downloadRemoteContent(target);
+      if (!bytes || !await this.remoteStillSameObject(target)) return null;
+      const targetHash = await sha256Hex(bytes);
+      const targetMatchesAnchor = targetHash
+        === committedAnchor.contentHash.toLowerCase();
+      const targetMatchesLocal = targetHash === local.entry.hash.toLowerCase();
+      if (!targetMatchesAnchor && !targetMatchesLocal) return null;
+      this.convergencesThisRound++;
+      checkpoint.baseRemovals.push(intent.sourcePath);
+      checkpoint.baseUpserts.push(targetMatchesAnchor
+        ? {
+            path: intent.path,
+            hash: committedAnchor.contentHash,
+            size: committedAnchor.size,
+            eTag: target.eTag,
+          }
+        : {
+            path: intent.path,
+            hash: local.entry.hash,
+            size: local.entry.size,
+            eTag: target.eTag,
+          });
+      checkpoint.remoteDeletes.push(intent.sourcePath);
+      checkpoint.remoteUpserts.push(target);
+      checkpoint.fileMoveHintRemovals = [expectedRemoteDriveId];
+      return checkpoint;
+    }
     if (intent.expectedRemote.sha256Hash === undefined) {
       // F17: sha-unknown remote rename/move — settle as a plain move on the
       // move anchors (identity checked above, size preserved); the moved
@@ -22465,6 +22967,72 @@ export class SyncExecutor {
           intent.expectedRemote.driveId,
         ) === null
       ) return "not-applied";
+      // Receiver-side cTag crash window (2026-11-05 review F1/F2): the local
+      // move landed and the remote content advanced (anchor cTag differs), but
+      // the same-round alignment may or may not have landed before the receipt
+      // was lost. Read the target back and settle against the anchor (alignment
+      // not applied: keep the pre-move cTag so the next delta downloads the
+      // edit) or the local (alignment applied: mark the aligned bytes). Any
+      // other content stays blocked.
+      if (
+        sourceLocal.status === "missing"
+        && sourceRemote === undefined
+        && targetRemote
+        && local.status === "present"
+        && local.entry
+        && intent.expectedLocal.exists
+      ) {
+        const envelope = this.state.getCommittedV2Envelope();
+        const expectedDriveId = intent.expectedRemote.exists
+          ? intent.expectedRemote.driveId
+          : undefined;
+        const anchor = envelope && expectedDriveId
+          ? Object.values(envelope.anchors.byAnchorId).find(
+              (candidate) => candidate.remoteId === expectedDriveId,
+            )
+          : undefined;
+        if (
+          anchor
+          && anchor.lastPath === intent.sourcePath
+          && anchor.remoteCTag !== undefined
+          && anchor.remoteCTag !== ""
+          && targetRemote.cTag !== undefined
+          && targetRemote.cTag !== ""
+          && anchor.remoteCTag !== targetRemote.cTag
+        ) {
+          const bytes = await this.downloadRemoteContent(targetRemote);
+          if (!bytes || !await this.remoteStillSameObject(targetRemote)) return null;
+          const targetHash = await sha256Hex(bytes);
+          const matchesAnchor = targetHash === anchor.contentHash.toLowerCase();
+          const matchesLocal = targetHash === local.entry.hash.toLowerCase();
+          if (!matchesAnchor && !matchesLocal) return null;
+          const checkpoint = emptyMutationCheckpoint();
+          checkpoint.baseRemovals.push(intent.sourcePath);
+          checkpoint.remoteDeletes.push(intent.sourcePath);
+          if (matchesAnchor) {
+            checkpoint.baseUpserts.push({
+              path: intent.path,
+              hash: anchor.contentHash,
+              size: anchor.size,
+              eTag: targetRemote.eTag,
+            });
+            checkpoint.remoteUpserts.push({
+              ...targetRemote,
+              cTag: anchor.remoteCTag,
+            });
+          } else {
+            checkpoint.baseUpserts.push({
+              path: intent.path,
+              hash: local.entry.hash,
+              size: local.entry.size,
+              eTag: targetRemote.eTag,
+            });
+            checkpoint.remoteUpserts.push(targetRemote);
+            checkpoint.contentAlignedFromRemote = true;
+          }
+          return checkpoint;
+        }
+      }
       if (
         sourceLocal.status !== "missing"
         || !this.inspectionMatchesExpectation(local, intent.expectedLocal)
@@ -23347,6 +23915,8 @@ export class SyncExecutor {
           result,
           remoteUpserts,
           remoteDeletes,
+          metrics,
+          callbacks,
           operationEpoch,
           factsChangedPolicy,
         });
@@ -25188,14 +25758,30 @@ export class SyncExecutor {
       this.inspectRemotePath(item.renameFrom),
       this.inspectRemotePath(item.path),
     ]);
+    // A case-insensitive host resolves both spellings to the same canonical
+    // file, so the "destination must be empty" premise only holds for a
+    // destination naming a DIFFERENT local file.
+    const sourceCanonicalPath = sourceLocal?.status === "present"
+      ? sourceLocal.entry?.path
+      : undefined;
+    const targetIsSameFile = sourceCanonicalPath !== undefined
+      && targetLocal?.status === "present"
+      && targetLocal.entry?.path === sourceCanonicalPath;
     if (
       !sourceLocal
       || !targetLocal
       || sourceLocal.status === "uncertain"
       || targetLocal.status === "uncertain"
       || !this.localExpectationMatches(item.local, sourceLocal)
-      || targetLocal.status !== "missing"
-      || remoteSource !== undefined
+      || (targetLocal.status !== "missing" && !targetIsSameFile)
+      // The service resolves paths case-insensitively, so a case/Unicode-only
+      // remote rename still answers at the source spelling with the SAME
+      // identity. Only a different live object at the source path means the
+      // move's premise is gone (2026-11-05, F34 family).
+      || (
+        remoteSource !== undefined
+        && remoteSource.driveId !== item.remote.driveId
+      )
       || !this.remoteMatchesExpectation(remoteTarget, {
         exists: true,
         driveId: item.remote.driveId,
@@ -25217,15 +25803,24 @@ export class SyncExecutor {
       };
     }
     if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    // Even when the host already resolves both spellings to one file, the
+    // rename still asks it to store the cloud spelling (Windows/macOS do
+    // change the on-disk case), and the read-back below tolerates the alias.
     await this.renameLocalFile(item.renameFrom, item.path);
     const [sourceAfter, targetAfter] = await Promise.all([
       this.inspectLocalPath(item.renameFrom),
       this.inspectLocalPath(item.path),
     ]);
+    // On a case-insensitive host the old spelling keeps resolving after the
+    // rename; the scanner reports the file's canonical path, so "source and
+    // target lookups now name the same file" is the move, not a second copy.
+    const sourceAliasesTarget = sourceAfter?.status === "present"
+      && targetAfter?.status === "present"
+      && sourceAfter.entry?.path === targetAfter.entry?.path;
     if (
       !sourceAfter
       || !targetAfter
-      || sourceAfter.status !== "missing"
+      || (sourceAfter.status !== "missing" && !sourceAliasesTarget)
       || !this.localExpectationMatches(item.local, targetAfter)
     ) {
       throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
@@ -25243,11 +25838,34 @@ export class SyncExecutor {
     // hash the plain move receipt stays admissible (shape 3 in
     // conservative-reset-recovery) and the ordinary same-path decision
     // converges the bytes on the next round (the A1 comment contract), so
-    // alignment is limited to a proven difference.
-    const needsAlignment = item.remote.sha256Hash !== undefined
-      && (
-        item.remote.size !== targetEntry.size
-        || targetEntry.hash.toLowerCase() !== item.remote.sha256Hash.toLowerCase()
+    // alignment is limited to a proven difference. A changed remote cTag
+    // (metadata moves preserve it) proves that difference even when Graph
+    // returned no SHA-256; the receipt carries `contentAlignedFromRemote`
+    // so the admission gate can recognize the aligned shape.
+    const envelope = this.state.getCommittedV2Envelope();
+    const baseAnchor = envelope
+      ? Object.values(envelope.anchors.byAnchorId).find(
+          (candidate) => candidate.remoteId === item.remote?.driveId,
+        )
+      : undefined;
+    const remoteContentAdvanced = Boolean(
+      baseAnchor
+      && baseAnchor.lastPath === item.renameFrom
+      && baseAnchor.contentHash.toLowerCase() === item.local.hash.toLowerCase()
+      && baseAnchor.remoteCTag !== undefined
+      && baseAnchor.remoteCTag !== ""
+      && item.remote.cTag !== undefined
+      && item.remote.cTag !== ""
+      && baseAnchor.remoteCTag !== item.remote.cTag,
+    );
+    const needsAlignment = remoteContentAdvanced
+      || (
+        item.remote.sha256Hash !== undefined
+        && (
+          item.remote.size !== targetEntry.size
+          || targetEntry.hash.toLowerCase()
+            !== item.remote.sha256Hash.toLowerCase()
+        )
       );
     if (needsAlignment) {
       const aligned = await this.alignLocalTargetBytes(
@@ -25262,6 +25880,7 @@ export class SyncExecutor {
       return {
         executed: true,
         mutationApplied: true,
+        contentAlignedFromRemote: true,
         baseRemoval: item.renameFrom,
         baseUpsert: {
           path: item.path,
@@ -25300,6 +25919,9 @@ export class SyncExecutor {
      *  reads the PUT's own duration back so the pool's signal never includes
      *  the local read, the hash or the batch's checkpoint. */
     observation?: UploadTransferObservation;
+    /** Composite move+upload: the transfer belongs to the rename action, so
+     *  the round counters stay on the move row. Defaults to true. */
+    countResult?: boolean;
   }): Promise<ItemExecutionResult> {
     const {
       item,
@@ -25310,6 +25932,7 @@ export class SyncExecutor {
       operationEpoch,
       factsChangedPolicy,
       observation,
+      countResult = true,
     } = args;
     if (!item.local) return { executed: true };
     const readStartedAt = Date.now();
@@ -25335,7 +25958,7 @@ export class SyncExecutor {
           new Error(`Manual upload source disappeared: ${item.path}`),
         );
       }
-      result.deferred++;
+      if (countResult) result.deferred++;
       return {
         executed: false,
         completionActionType: SyncActionType.RetryLater,
@@ -25359,7 +25982,7 @@ export class SyncExecutor {
           new Error(`Manual upload source changed: ${item.path}`),
         );
       }
-      result.deferred++;
+      if (countResult) result.deferred++;
       return {
         executed: false,
         completionActionType: SyncActionType.RetryLater,
@@ -25442,7 +26065,7 @@ export class SyncExecutor {
       uploadResult,
       item.remote?.parentId,
     ));
-    result.uploaded++;
+    if (countResult) result.uploaded++;
     this.state.cacheBaseContent(item.path, content);
     return { executed: true, mutationApplied: true, baseUpsert };
   }
@@ -25938,6 +26561,8 @@ export class SyncExecutor {
     result: SyncResult;
     remoteUpserts: RemoteFileEntry[];
     remoteDeletes: string[];
+    metrics: ExecutionMetrics;
+    callbacks: SyncCallbacks;
     operationEpoch: number;
     factsChangedPolicy: "defer" | "throw";
   }): Promise<ItemExecutionResult> {
@@ -25946,12 +26571,26 @@ export class SyncExecutor {
       result,
       remoteUpserts,
       remoteDeletes,
+      metrics,
+      callbacks,
       operationEpoch,
       factsChangedPolicy,
     } = args;
     if (!item.renameFrom || !item.local || !item.remote) return { executed: false };
     if (!this.canContinue(operationEpoch, result)) return { executed: false };
     const envelope = this.state.getCommittedV2Envelope();
+    // A rename proves the remote bytes kept their prior identity; it does not
+    // prove they equal the local file. Hint-proven relocations may carry
+    // edited local bytes, and recording the local hash as the common base
+    // would make the next round treat the remote as changed (download over
+    // the edit) or skip the upload when Graph returned no SHA-256. Keep the
+    // committed anchor's content facts so the ordinary next-round decision
+    // uploads the edit.
+    const baseAnchor = envelope
+      ? Object.values(envelope.anchors.byAnchorId).find(
+          (candidate) => candidate.remoteId === item.remote?.driveId,
+        )
+      : undefined;
     if (envelope && inspectRenameTargetAnchorCollisionV2(envelope, {
       sourcePath: item.renameFrom,
       path: item.path,
@@ -26067,6 +26706,68 @@ export class SyncExecutor {
     ) {
       throw new Error(`Remote file move read-back failed: ${item.renameFrom} -> ${item.path}`);
     }
+    // Same-round composite: when the hint proved this move while the local
+    // bytes were edited, the move response's eTag is the only safe CAS token
+    // for the content upload. Do it now, with a scratch remote-upsert array
+    // so the receipt still carries exactly one destination entry. Config /
+    // plugin paths stay on the ordinary guarded next-round upload.
+    const configDir = getConfigDir(this.scanner.vault);
+    const normalizedConfigDir = configDir.normalize("NFC").toLowerCase();
+    const normalizedItemPath = item.path.normalize("NFC").toLowerCase();
+    const isConfigPath = normalizedItemPath === normalizedConfigDir
+      || normalizedItemPath.startsWith(`${normalizedConfigDir}/`);
+    const editedContent = Boolean(
+      baseAnchor
+      && item.local.hash.toLowerCase() !== baseAnchor.contentHash.toLowerCase(),
+    );
+    if (editedContent && !isConfigPath) {
+      const uploadItem: SyncPlanItem = {
+        type: SyncActionType.Upload,
+        path: item.path,
+        local: item.local,
+        remote: movedRemote,
+        baseEtag: updated.eTag ?? "",
+      };
+      const followUpUpserts: RemoteFileEntry[] = [];
+      let uploadOutcome: ItemExecutionResult | null = null;
+      try {
+        uploadOutcome = await this.executeUploadItem({
+          item: uploadItem,
+          result,
+          remoteUpserts: followUpUpserts,
+          metrics,
+          callbacks,
+          operationEpoch,
+          factsChangedPolicy,
+          countResult: false,
+        });
+      } catch (error) {
+        // The move is already applied; never lose its receipt because the
+        // follow-up content transfer failed. The next round owns the bytes.
+        this.diag?.warn(
+          "execute",
+          `follow-up upload after move failed; content waits for the next round — ${item.path}: ${this.failureReason(error)}`,
+        );
+      }
+      if (
+        uploadOutcome?.executed
+        && uploadOutcome.mutationApplied
+        && uploadOutcome.baseUpsert
+        && followUpUpserts.length === 1
+      ) {
+        remoteDeletes.push(item.renameFrom);
+        remoteUpserts.push(followUpUpserts[0]);
+        result.filesMoved = (result.filesMoved ?? 0) + 1;
+        return {
+          executed: true,
+          mutationApplied: true,
+          baseUpsert: uploadOutcome.baseUpsert,
+          baseRemoval: item.renameFrom,
+        };
+      }
+      // Deferred, hash drift or failure: the move-only receipt stays valid and
+      // the ordinary same-path decision uploads the edit next round.
+    }
     remoteDeletes.push(item.renameFrom);
     remoteUpserts.push(movedRemote);
     if (item.targetParentRemoteId) {
@@ -26075,7 +26776,12 @@ export class SyncExecutor {
     return {
       executed: true,
       mutationApplied: true,
-      baseUpsert: { path: item.path, hash: item.local.hash, size: item.local.size, eTag: updated.eTag ?? "" },
+      baseUpsert: {
+        path: item.path,
+        hash: baseAnchor?.contentHash ?? item.local.hash,
+        size: baseAnchor?.size ?? item.local.size,
+        eTag: updated.eTag ?? "",
+      },
       baseRemoval: item.renameFrom,
     };
   }
@@ -28507,7 +29213,9 @@ export class SyncExecutor {
    *  identity (same guard as `tryDeltaOrFullScan`). */
   private async rebuildRemoteStateFromIdentitySnapshot(
     operationEpoch: number,
-    result: SyncResult,
+    /** Round result for cancellation accounting; side actions have none and
+     *  rely on the lifecycle epoch alone. */
+    result: SyncResult | undefined,
     syncScope: SyncScope,
     persistPreparedState = true,
     preserveReviewedSourceCommitSeq?: number,
@@ -28661,7 +29369,19 @@ export class SyncExecutor {
           args.result,
           this.activeSyncScope,
         );
-        return await commit();
+        try {
+          return await commit();
+        } catch (retryError) {
+          // The live service still projects the identity under another
+          // case/Unicode spelling, so the refresh cannot make the receipt
+          // path resolvable; the durable receipt is what has to follow the
+          // committed spelling. Unproven facts rethrow this second refusal.
+          if (
+            !isV2StatePathRefusalError(retryError)
+            || !(await this.convergeRecoveryRecordSpellings(args.operationIds))
+          ) throw retryError;
+          return await commit();
+        }
       }
       // The record's receipt is already durable and the mutation already
       // reached the world; only the committed common state refuses to absorb
@@ -29872,10 +30592,25 @@ export class SyncExecutor {
     const completion = new Promise<void>((resolve) => {
       resolveCompletion = resolve;
     });
+    // Observation only: how long this entry waited behind the shared queue and
+    // behind a running round. Never feeds a decision.
+    const releaseQueue = queueWaitObservation.enter("sideAction");
+    const enqueuedAt = performance.now();
     // ponytail: one shared side-action queue keeps conflict/delete picks serial; split by lane only if real throughput needs appear
     this.sideActionQueue = this.sideActionQueue
       .catch(() => undefined)
       .then(async () => {
+        const queueWarning = queueWaitObservation.noteDequeue(
+          "sideAction",
+          performance.now() - enqueuedAt,
+        );
+        if (queueWarning) {
+          this.diag?.warn(
+            "execute",
+            "side action queue wait exceeded",
+            { ...queueWarning },
+          );
+        }
         let started = false;
         let succeeded = false;
         let taskStarted = false;
@@ -30002,6 +30737,7 @@ export class SyncExecutor {
           }
           this.activeSyncScope = null;
           this.finishSideAction(this.queuedSideActionPaths.size === 0);
+          releaseQueue();
           resolveCompletion();
         }
       });

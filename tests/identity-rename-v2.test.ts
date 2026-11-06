@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LocalFileEntry } from "../src/sync/types";
+import type { LocalFileEntry, LocalFolderMoveHintV1 } from "../src/sync/types";
 import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 import { planIdentityRenamesV2 } from "../src/sync/identity-rename-v2";
 
@@ -7,6 +7,22 @@ const hash = "a".repeat(64);
 
 function local(path: string, contentHash = hash): LocalFileEntry {
   return { path, hash: contentHash, size: 4, mtime: 1, binary: false };
+}
+
+function moveHint(
+  fromPath: string,
+  toPath: string,
+  overrides: Partial<LocalFolderMoveHintV1> = {},
+): LocalFolderMoveHintV1 {
+  return {
+    version: 1,
+    scope: envelope().scope,
+    remoteId: "file",
+    fromPath,
+    toPath,
+    observedAt: 2,
+    ...overrides,
+  };
 }
 
 function envelope(): SyncStateEnvelopeV2 {
@@ -123,6 +139,25 @@ describe("identity-safe V2 rename planning", () => {
       remoteId: "file",
       fromPath: "old.md",
       toPath: "sub/new.md",
+      expectedLocalHash: hash,
+      expectedLocalSize: 4,
+    }]);
+  });
+
+  it("moves the local file when only the cloud name spelling changed", () => {
+    // The cloud renamed `Meta分析.md` -> `meta分析.md`; the local file kept the
+    // anchored spelling. The destination folded key holds that same local
+    // entry, which is a spelling alias of the moved identity, not an occupant.
+    const state = envelope();
+    state.remoteIndex.itemsById.file!.name = "meta分析.md";
+    state.anchors.byAnchorId.anchor!.lastPath = "Meta分析.md";
+
+    expect(planIdentityRenamesV2(state, [local("Meta分析.md")])).toEqual([{
+      type: "move-local",
+      anchorId: "anchor",
+      remoteId: "file",
+      fromPath: "Meta分析.md",
+      toPath: "meta分析.md",
       expectedLocalHash: hash,
       expectedLocalSize: 4,
     }]);
@@ -313,6 +348,26 @@ describe("identity-safe V2 rename planning", () => {
     }]);
   });
 
+  it("marks a same-path replacement plus a hinted relocation as unknown", () => {
+    const state = envelope();
+    delete state.remoteIndex.itemsById.file;
+    state.remoteIndex.itemsById.rebuilt = {
+      id: "rebuilt", parentId: "root", name: "old.md", kind: "file",
+      eTag: "e2", size: 4, contentHash: "c".repeat(64),
+    };
+    expect(planIdentityRenamesV2(
+      state,
+      [local("sub/new.md", "b".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "sub/new.md",
+      reason: "replacement-with-local-relocation",
+    }]);
+  });
+
   it("marks a copy occupying the anchor path while the old identity still exists", () => {
     const state = envelope();
     state.remoteIndex.itemsById.file!.name = "moved.md";
@@ -362,5 +417,194 @@ describe("identity-safe V2 rename planning", () => {
       newName: "old.md",
       newParentId: "folder",
     }]);
+  });
+
+  it("recognizes an in-scope rename + edit + move through the host move hint", () => {
+    const edited = "b".repeat(64);
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("sub/new.md", edited)],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([{
+      type: "move-remote",
+      anchorId: "anchor",
+      remoteId: "file",
+      fromPath: "old.md",
+      toPath: "sub/new.md",
+      expectedRemoteETag: "e1",
+      newName: "new.md",
+      newParentId: "folder",
+    }]);
+  });
+
+  it("prefers the host move hint over a content-identical candidate elsewhere", () => {
+    const edited = "b".repeat(64);
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("copy.md"), local("sub/new.md", edited)],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([expect.objectContaining({
+      type: "move-remote",
+      toPath: "sub/new.md",
+    })]);
+  });
+
+  it("blocks identity pairing when the hinted destination disappeared", () => {
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("copy.md"), local("sub/other.md", "c".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", "sub/missing.md")] },
+    )).toEqual([]);
+  });
+
+  it("keeps the conflict when the hinted destination belongs to another anchor", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.other = {
+      id: "other", parentId: "folder", name: "new.md", kind: "file",
+      eTag: "e2", size: 4, contentHash: "c".repeat(64),
+    };
+    state.anchors.byAnchorId.other = {
+      anchorId: "other", remoteId: "other", lastPath: "sub/new.md",
+      contentHash: "c".repeat(64), size: 4, remoteETag: "e2",
+      confirmedAt: 1, confirmedBy: "equal-read",
+    };
+    expect(planIdentityRenamesV2(
+      state,
+      [local("sub/new.md", "b".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "sub/new.md",
+      relatedPath: "old.md",
+      reason: "local-destination-occupied",
+    }]);
+  });
+
+  it("keeps the conflict when the hinted relocation meets a remote edit", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.file!.eTag = "e2";
+    state.remoteIndex.itemsById.file!.contentHash = "b".repeat(64);
+    expect(planIdentityRenamesV2(
+      state,
+      [local("sub/new.md", "c".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "sub/new.md",
+      reason: "remote-content-changed",
+    }]);
+  });
+
+  it("keeps the conflict when the remote also moved before the hinted relocation", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.file!.parentId = "folder";
+    state.remoteIndex.itemsById.file!.name = "moved.md";
+    expect(planIdentityRenamesV2(
+      state,
+      [local("sub/new.md", "b".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "sub/new.md",
+      reason: "both-paths-diverged",
+    }]);
+  });
+
+  it("ignores a move hint from another sync scope", () => {
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("sub/new.md", "b".repeat(64))],
+      {
+        localFileMoveHints: [moveHint("old.md", "sub/new.md", {
+          scope: { ...envelope().scope, driveId: "other-drive" },
+        })],
+      },
+    )).toEqual([]);
+  });
+
+  it("ignores a move hint into the vault trash", () => {
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("sub/new.md", "b".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", ".trash/new.md")] },
+    )).toEqual([]);
+  });
+
+  it("ignores a move hint whose source no longer matches the anchor", () => {
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("sub/new.md", "b".repeat(64))],
+      { localFileMoveHints: [moveHint("elsewhere.md", "sub/new.md")] },
+    )).toEqual([]);
+  });
+
+  it("treats two identities claiming one hinted destination as ambiguous", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.file2 = {
+      id: "file2", parentId: "root", name: "old2.md", kind: "file",
+      eTag: "e2", size: 4, contentHash: "d".repeat(64),
+    };
+    state.anchors.byAnchorId.anchor2 = {
+      anchorId: "anchor2", remoteId: "file2", lastPath: "old2.md",
+      contentHash: "d".repeat(64), size: 4, remoteETag: "e2",
+      confirmedAt: 1, confirmedBy: "equal-read",
+    };
+    const actions = planIdentityRenamesV2(
+      state,
+      [local("sub/shared.md", "b".repeat(64))],
+      {
+        localFileMoveHints: [
+          moveHint("old.md", "sub/shared.md"),
+          moveHint("old2.md", "sub/shared.md", { remoteId: "file2" }),
+        ],
+      },
+    );
+    expect(actions).toHaveLength(2);
+    expect(actions).toContainEqual({
+      type: "conflict",
+      anchorId: "anchor",
+      path: "sub/shared.md",
+      relatedPaths: ["old2.md"],
+      reason: "local-identity-ambiguous",
+    });
+    expect(actions).toContainEqual({
+      type: "conflict",
+      anchorId: "anchor2",
+      path: "sub/shared.md",
+      relatedPaths: ["old.md"],
+      reason: "local-identity-ambiguous",
+    });
+  });
+
+  it("withholds a hinted move whose destination folder is only projected", () => {
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("renamed/new.md", "b".repeat(64))],
+      {
+        projectedFolderIdentities: [{ path: "renamed", remoteId: "folder" }],
+        localFileMoveHints: [moveHint("old.md", "renamed/new.md")],
+      },
+    )).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "renamed/new.md",
+      relatedPath: "old.md",
+      reason: "destination-parent-missing",
+    }]);
+  });
+
+  it("treats a hinted destination already equal to the remote path as converged", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.file!.parentId = "folder";
+    state.remoteIndex.itemsById.file!.name = "new.md";
+    expect(planIdentityRenamesV2(
+      state,
+      [local("sub/new.md", "b".repeat(64))],
+      { localFileMoveHints: [moveHint("old.md", "sub/new.md")] },
+    )).toEqual([]);
   });
 });

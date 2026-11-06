@@ -640,7 +640,7 @@ describe("main sync entry guards", () => {
     plugin.stopAutoSync();
   });
 
-  it("does not retain a file move hint when the destination stays in the sync scope", async () => {
+  it("retains a file move hint when the destination stays in the sync scope", async () => {
     const plugin = makePlugin();
     const recordLocalFileMoveHint = vi.fn().mockResolvedValue(true);
     plugin.state = { recordLocalFileMoveHint } as never;
@@ -655,7 +655,11 @@ describe("main sync entry guards", () => {
       "Notes/a.md",
     );
 
-    expect(recordLocalFileMoveHint).not.toHaveBeenCalled();
+    expect(recordLocalFileMoveHint).toHaveBeenCalledOnce();
+    expect(recordLocalFileMoveHint).toHaveBeenCalledWith(
+      "Notes/a.md",
+      "Notes/moved.md",
+    );
   });
 
   it("does not retain a file move hint when the destination is the vault trash", async () => {

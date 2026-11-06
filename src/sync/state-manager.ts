@@ -29,6 +29,7 @@ import {
 } from "./runtime-layout-migration";
 import { AncestorStoreV2 } from "./ancestor-store-v2";
 import { PLAN_REASON } from "./plan-reason";
+import { queueWaitObservation } from "./queue-wait-observation";
 import type { TransferRateFactsV1 } from "./transfer-rate";
 import {
   findScopeCrossingCoveringHintV1,
@@ -2240,9 +2241,22 @@ export class StateManager {
     // Measurement only: the queue wait belongs to the same bucket as the
     // reduction the caller asked for (`ledgerMs`), the durable write to
     // `pluginDataMs`.
+    const releaseQueue = queueWaitObservation.enter("pluginDataCommit");
     const enqueuedAt = performance.now();
     const task = this.pluginDataCommitQueue.then(async () => {
-      if (breakdown) breakdown.ledgerMs += performance.now() - enqueuedAt;
+      const queueWaitMs = performance.now() - enqueuedAt;
+      const queueWarning = queueWaitObservation.noteDequeue(
+        "pluginDataCommit",
+        queueWaitMs,
+      );
+      if (queueWarning) {
+        this.plugin.diag?.warn(
+          "state",
+          "state queue wait exceeded",
+          { ...queueWarning },
+        );
+      }
+      if (breakdown) breakdown.ledgerMs += queueWaitMs;
       const buildStartedAt = performance.now();
       const next = buildNext(this.data);
       if (breakdown) breakdown.ledgerMs += performance.now() - buildStartedAt;
@@ -2263,6 +2277,7 @@ export class StateManager {
       }
     });
     this.pluginDataCommitQueue = task.catch(() => undefined);
+    task.then(releaseQueue, releaseQueue);
     return task;
   }
 
@@ -3023,9 +3038,22 @@ export class StateManager {
   ): Promise<boolean> {
     let changed = false;
     // Measurement only: `enqueuedAt` and the marks below never feed a decision.
+    const releaseQueue = queueWaitObservation.enter("v2Commit");
     const enqueuedAt = performance.now();
     const task = this.v2StateCommitQueue.then(async () => {
-      if (breakdown) breakdown.queueMs += performance.now() - enqueuedAt;
+      const queueWaitMs = performance.now() - enqueuedAt;
+      const queueWarning = queueWaitObservation.noteDequeue(
+        "v2Commit",
+        queueWaitMs,
+      );
+      if (queueWarning) {
+        this.plugin.diag?.warn(
+          "state",
+          "state queue wait exceeded",
+          { ...queueWarning },
+        );
+      }
+      if (breakdown) breakdown.queueMs += queueWaitMs;
       if (this.v2StateLoadBlock) {
         throw new Error("V2 state writes are blocked until load recovery completes");
       }
@@ -3092,6 +3120,7 @@ export class StateManager {
       changed = true;
     });
     this.v2StateCommitQueue = task.catch(() => undefined);
+    task.then(releaseQueue, releaseQueue);
     return task.then(() => changed);
   }
 
@@ -6320,6 +6349,9 @@ export class StateManager {
     const folderMoveHintRemovals = new Set(
       checkpoints.flatMap((checkpoint) => checkpoint.folderMoveHintRemovals ?? []),
     );
+    const fileMoveHintRemovals = new Set(
+      checkpoints.flatMap((checkpoint) => checkpoint.fileMoveHintRemovals ?? []),
+    );
     const ledgerClearStartedAt = Date.now();
     await this.commitPluginData((current) => {
       const recordIndexes = new Set(records.map((expected) => {
@@ -6361,6 +6393,9 @@ export class StateManager {
         ),
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: current[KEY_LOCAL_FOLDER_MOVE_HINTS].filter(
           (hint) => !folderMoveHintRemovals.has(hint.remoteId),
+        ),
+        [KEY_LOCAL_FILE_MOVE_HINTS]: current[KEY_LOCAL_FILE_MOVE_HINTS].filter(
+          (hint) => !fileMoveHintRemovals.has(hint.remoteId),
         ),
         [KEY_LOCAL_FOLDER_DELETE_HINTS]: current[KEY_LOCAL_FOLDER_DELETE_HINTS].filter(
           (hint) => !folderMoveHintRemovals.has(hint.remoteId),
@@ -12550,7 +12585,14 @@ function isMutationReceipt(value: unknown, operationId: string): value is Mutati
       || (Array.isArray(checkpoint.folderMoveHintRemovals)
         && checkpoint.folderMoveHintRemovals.every(
           (driveId) => typeof driveId === "string",
-        )));
+        )))
+    && (checkpoint.fileMoveHintRemovals === undefined
+      || (Array.isArray(checkpoint.fileMoveHintRemovals)
+        && checkpoint.fileMoveHintRemovals.every(
+          (driveId) => typeof driveId === "string",
+        )))
+    && (checkpoint.contentAlignedFromRemote === undefined
+      || typeof checkpoint.contentAlignedFromRemote === "boolean");
 }
 
 function isBaseEntry(value: unknown): value is BaseFileEntry {

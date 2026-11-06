@@ -1,7 +1,7 @@
 import {
   structuredCloneImplementation,
 } from "./structured-clone-compat";
-import { EventRef, Menu, Notice, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { apiVersion, EventRef, Menu, Notice, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 
 import {
   fetchLatestStableVersion,
@@ -52,6 +52,7 @@ import {
   SyncPathMutationRecoveryError,
   type V2StateLoadBlockReason,
 } from "./sync/state-manager";
+import { queueWaitObservation } from "./sync/queue-wait-observation";
 import {
   IndexedDbPublic113StateStore,
   public113IndexedDbDatabaseName,
@@ -332,6 +333,12 @@ import {
   planCommunityPluginCloudCleanupMarkerSweepV1,
 } from "./sync/community-plugin-cloud-cleanup-v1";
 import { StartupPerformanceTracker } from "./startup-performance";
+import {
+  appendStartupTimingObservation,
+  buildStartupTimingObservation,
+  formatStartupTimingSection,
+  readStartupTimingObservations,
+} from "./startup-timing-observation";
 
 /** Plugin data keys for sync settings */
 const KEY_SYNC_INTERVAL = "sync-interval";
@@ -781,6 +788,12 @@ export default class EasySyncPlugin extends Plugin {
   private readonly pluginDataWriteLog = new RecentPluginDataWriteLog();
   private pluginDataCache: Record<string, unknown> | null | undefined;
   private pluginDataLoadPromise: Promise<Record<string, unknown> | null> | null = null;
+  /** Background settings read started by `onload`. The host's plugin-load
+   *  phase must stay registration-only (official load-time guide), so the
+   *  data-file read/parse is awaited by state/sync consumers instead of by
+   *  `onload` itself. A rejection is kept for those consumers: acting on
+   *  defaults before the user's settings are known is the unsafe direction. */
+  private settingsLoadPromise: Promise<void> | null = null;
 
   syncInterval = 3;
   autoSyncChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
@@ -1099,6 +1112,13 @@ export default class EasySyncPlugin extends Plugin {
     this.startupPerformance.begin(
       this.platformFacts.isMobileApp ? "mobile" : "desktop",
     );
+    this.startupPerformance.setHostFacts({
+      apiVersion,
+      pluginVersion: this.manifest.version,
+      visibilityAtOnload:
+        typeof document === "undefined" ? "" : document.visibilityState,
+    });
+    this.startupPerformance.markStage("onload:begin");
     this.diag.log("lifecycle", "====== onload start ======");
     this.diag.log(
       "lifecycle",
@@ -1110,7 +1130,13 @@ export default class EasySyncPlugin extends Plugin {
 
     const lang = I18n.detectLanguage(this.app as unknown as { vault: { getConfig: (key: string) => string } });
     this.i18n = new I18n(lang);
-    await this.loadSyncSettings();
+    this.startupPerformance.markStage("onload:i18n");
+    // Start the settings read now (the I/O overlaps every registration below)
+    // but do not await it: onload is the host's plugin-load phase, and the
+    // official load-time guide keeps data reads out of it. Consumers that
+    // decide from settings await `ensureSettingsLoaded()` first.
+    void this.beginSettingsLoad();
+    this.startupPerformance.markStage("onload:settings-kickoff");
 
     // ════ ② Auth (create, register callback, then background-init) ════
 
@@ -1130,7 +1156,9 @@ export default class EasySyncPlugin extends Plugin {
       // User profile cache: avoid network call on every cold start
       profileCache: {
         get: async () => {
-          const data = await this.loadPluginData();
+          // Startup-only read of two primitive fields: take the shared cache
+          // instead of paying a whole-object clone on the cold path.
+          const data = await this.readPluginDataSnapshot();
           const cached = data?.[KEY_PROFILE_CACHE];
           if (!isRecord(cached)) return null;
           return typeof cached.displayName === "string" && typeof cached.accountId === "string"
@@ -1284,6 +1312,7 @@ export default class EasySyncPlugin extends Plugin {
     this.syncExecutor.setCommunityPluginSyncPolicy(
       this.getEffectiveCommunityPluginSyncPolicy(),
     );
+    this.startupPerformance.markStage("onload:core-ready");
 
     // ════ ④ Register UI (Obsidian is usable from here on) ════
 
@@ -1310,7 +1339,9 @@ export default class EasySyncPlugin extends Plugin {
     this.statusBarEl = this.addStatusBarItem();
     this.initStatusBar();
     this.updateStatusBar(); // Shows "Connecting…" while auth initializes
-    this.applyMobileStatusBar();
+    // Mobile status-bar visibility is a persisted setting; it is applied by
+    // the settings-load continuation (a default flip here would flash the bar
+    // for users who turned it off).
     this.addCommand({
       id: "start-sync",
       name: this.i18n.t("command.syncNow"),
@@ -1328,11 +1359,23 @@ export default class EasySyncPlugin extends Plugin {
     this.registerRecoveryUi();
     this.startupPerformance.markUiReady();
 
+    // First layout-ready callback: record the host wait separately from the
+    // plugin's own onload segment. Push-only, guarded against a late callback
+    // after unload; it never awaits anything.
+    this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return;
+      this.startupPerformance.markLayoutReady();
+    });
+
     // Update reminder: prompt-only, silent, 24h-throttled check at the
     // startup tail (方案单 20260915-0025 §四 检查层). Registered separately
     // from the auth chain so neither can fail the other.
     this.app.workspace.onLayoutReady(() => {
-      this.runUpdateCheckFlow();
+      // The check's throttle bookkeeping comes from the settings read; wait
+      // for it so a slow cold read cannot degrade into "due" and refetch.
+      void this.ensureSettingsLoaded()
+        .then(() => this.runUpdateCheckFlow())
+        .catch(() => undefined);
     });
 
     // ════ ⑤ Background auth init + state load ════
@@ -1342,6 +1385,7 @@ export default class EasySyncPlugin extends Plugin {
     // rendering for the main thread during the interaction-blocked loading
     // phase, so the app becomes usable sooner.
     this.app.workspace.onLayoutReady(() => {
+      this.startupPerformance.markStage("auth:start");
       void this.auth!.initialize()
         .then(() => {
           const authState = this.auth?.authState;
@@ -1370,6 +1414,7 @@ export default class EasySyncPlugin extends Plugin {
           this.noteStartupReadinessSettled("auth");
         });
       // onStateChange callback fires when complete → UI auto-refreshes
+      this.startupPerformance.markStage("state:start");
       void this.ensureStateLoaded()
         .then(() => {
           const state = this.state;
@@ -1456,8 +1501,11 @@ export default class EasySyncPlugin extends Plugin {
       // instead of waiting for the next sync round.
       this.updateStatusBar();
     });
-    this.startAutoSync();
+    // `startAutoSync()` runs from the settings-load continuation: its gates
+    // read persisted interval/pause values, and arming timers from defaults
+    // would briefly contradict the user's saved configuration.
 
+    this.startupPerformance.markOnloadReturned();
     this.diag.log("lifecycle", "onload complete (auth initializing in background)");
   }
 
@@ -2703,12 +2751,27 @@ export default class EasySyncPlugin extends Plugin {
           ),
         )
       : new Set<string>();
-    this.progressStore.markStarted(
-      request.options?.recoveryOnly === true
-        ? "mutationRecovery"
-        : "fullSync",
-    );
-    this.beginSyncNotice();
+    // An already-running side action owns the shared progress store. Marking a
+    // full-sync activity here would survive the executor's `alreadyRunning`
+    // rejection (that return happens before its try/finally) and leave the top
+    // status showing the previous run's counter/current file while the body
+    // correctly shows the recovery state (iOS 2026-11-06 field screenshots).
+    const executorBusy = this.syncExecutor.isRunning
+      || this.syncExecutor.hasSideActionsInFlight;
+    if (executorBusy) {
+      this.diag.log("execute", "sync dispatch skipped progress mark — executor busy", {
+        mode: request.mode,
+        recoveryOnly: request.options?.recoveryOnly === true,
+        mutations: 0,
+      });
+    } else {
+      this.progressStore.markStarted(
+        request.options?.recoveryOnly === true
+          ? "mutationRecovery"
+          : "fullSync",
+      );
+      this.beginSyncNotice();
+    }
     let continuedAfterStateOnlyRecovery = false;
     let retainReviewedAuthorization = false;
     let result: SyncResult;
@@ -3400,6 +3463,10 @@ export default class EasySyncPlugin extends Plugin {
   /** Ensure StateManager has been loaded from disk.
    *  Idempotent — only calls load() on the first invocation. */
   async ensureStateLoaded(): Promise<void> {
+    // Settings decide direction, scope, pause and limits. Every state/sync
+    // consumer joins the same background read first, so a manual entry that
+    // lands before it settles cannot plan against defaults.
+    await this.ensureSettingsLoaded();
     if (this._stateLoaded || !this.state) return;
     this.stateLoadPromise ??= this.state.load().then(async () => {
       if (this.state?.consumeCommunityPluginEnablementRetiredThisLoad()) {
@@ -6327,9 +6394,12 @@ export default class EasySyncPlugin extends Plugin {
       }
       return;
     }
-    // Slice-2: retain the file's out-of-scope destination before scheduling.
-    // A destination inside the sync scope keeps the ordinary content-based
-    // pairing; the dirty timer must never overtake this persistence attempt.
+    // Retain the file's rename destination as device-local identity evidence
+    // before scheduling. In-scope destinations may prove an identity move even
+    // when the local bytes changed; out-of-scope destinations still open the
+    // scope-crossing exit. The dirty timer must never overtake this persistence
+    // attempt.
+    const crossesScope = this.isOutOfScopeMoveDestination(file.path, "file");
     const recorded = await this.captureLocalFileMoveHint(oldPath, file.path);
     this.invalidateCommunityPluginLocalReconciliationForPath(file.path);
     this.scheduleCommunityPluginInventoryRevisionForPaths(
@@ -6338,7 +6408,7 @@ export default class EasySyncPlugin extends Plugin {
       { path: file.path, isFolder: false },
     );
     this.markLocalDirtyHint(file.path, oldPath);
-    if (recorded) {
+    if (recorded && crossesScope) {
       this.enqueueScopeCrossingPrompt("file", oldPath, file.path);
     }
   }
@@ -6370,21 +6440,22 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /**
-   * Retain a TFile rename whose destination lies outside the sync scope
-   * (slice-2). The file layer treats an in-scope local disappearance as a
-   * remote deletion; a file that merely left the scope would otherwise be
-   * deleted from the cloud without the user being asked whether the move was
-   * intentional. Only destinations that are positively out of scope (and not
-   * the vault trash, whose deletion semantics are unchanged) are retained, so
-   * ordinary in-scope renames never touch persistence. A missing scanner
-   * means the scope cannot be judged — keep the pre-existing semantics.
+   * Retain a TFile rename as device-local identity evidence bound to the
+   * renamed object's committed V2 identity. In-scope destinations let the
+   * planner preserve that identity even when the content changed; out-of-scope
+   * destinations keep the cloud copy safe behind the scope-crossing exit. The
+   * vault trash keeps its deletion semantics, and EasySync's own bookkeeping
+   * renames (download recovery copies, state / logs / tmp paths) are never
+   * evidence of a user move: they reach the same vault events as a real rename.
    */
   private async captureLocalFileMoveHint(
     oldPath: string,
     newPath: string,
   ): Promise<boolean> {
     try {
-      if (!this.isOutOfScopeMoveDestination(newPath, "file")) return false;
+      if (newPath === ".trash" || newPath.startsWith(".trash/")) return false;
+      if (isEasySyncInternalPath(newPath, getConfigDir(this.app.vault))) return false;
+      if (this.scanner == null) return false;
       await this.ensureStateLoaded();
       const state = this.state;
       if (!state) return false;
@@ -6618,10 +6689,15 @@ export default class EasySyncPlugin extends Plugin {
     }
     if (!this.auth?.authState.isLoggedIn) return true;
     if (!this.syncExecutor) return false;
-    if (this.opLock !== null || this.syncExecutor.isRunning) return false;
+    if (
+      this.opLock !== null
+      || this.syncExecutor.isRunning
+      || this.syncExecutor.hasSideActionsInFlight
+    ) return false;
     // 冲突批量在飞时自动轮让路：批量可能持续很久，整轮同步若中途启动会把
     // 正在批量的行交给下一轮计划（含自愈侧的删云端）。只让这一条批量；
-    // 逐条 side action 的让路另立候选。
+    // 逐条 side action 同样在飞时不启动（2026-11-06 iOS 现场：恢复核对侧动作
+    // 与定时轮重叠，整轮被执行器判 alreadyRunning，顶部却挂着上一轮计数）。
     if (this.conflictBatchDirection !== null) return false;
     if (this.acquireOpLock("sync")) return false;
     let dispatched = false;
@@ -7005,8 +7081,72 @@ export default class EasySyncPlugin extends Plugin {
 
   // ---- Settings persistence ----
 
+  /**
+   * Start (or join) the one background settings read for this plugin instance.
+   *
+   * The read begins in `onload` so its I/O overlaps UI registration, but the
+   * host never waits for it: plugin load stays registration-only, per the
+   * official load-time guide. Settings-derived UI and timers are applied only
+   * after the values are known. A rejection is retained so every consumer that
+   * would act on settings fails closed instead of silently using defaults.
+   */
+  private beginSettingsLoad(): Promise<void> {
+    if (this.settingsLoadPromise) return this.settingsLoadPromise;
+    const load = this.loadSyncSettings().then(() => {
+      this.startupPerformance.markStage("settings:loaded");
+      if (this.unloaded) return;
+      // onload built the executor/scanner with defaults; propagate the real
+      // values now. Direction and handling policy are data-safety inputs, so
+      // every sync entry additionally waits for this read to settle.
+      this.applySyncPathSettings();
+      this.applyMaxFileSize();
+      this.syncExecutor?.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
+      this.syncExecutor?.setSyncDirection(this.syncDirection);
+      this.syncExecutor?.setCommunityPluginSyncPolicy(
+        this.getEffectiveCommunityPluginSyncPolicy(),
+      );
+      this.applyMobileStatusBar();
+      // Presentation refresh is best-effort: a rendering failure must not
+      // turn a successful settings read into a closed sync entry.
+      try {
+        this.updateStatusBar();
+        this.syncView?.render();
+        this.settingsTab?.refreshSyncState();
+      } catch (error) {
+        this.diag.warn(
+          "lifecycle",
+          "settings loaded but the startup UI refresh failed",
+          describeError(error),
+        );
+      }
+      this.startAutoSync();
+    }).catch((error) => {
+      this.startupPerformance.markStage("settings:failed");
+      this.diag.warn(
+        "lifecycle",
+        "background settings load failed; sync entries stay closed until reload",
+        describeError(error),
+      );
+      throw error;
+    });
+    // Consumers attach when they need settings; mark the rejection handled
+    // here so a failed read cannot surface as an unhandled rejection first.
+    void load.catch(() => undefined);
+    this.settingsLoadPromise = load;
+    return load;
+  }
+
+  /** Join the background settings read; rejects when it failed (fail-closed). */
+  private async ensureSettingsLoaded(): Promise<void> {
+    await this.beginSettingsLoad();
+  }
+
   async loadSyncSettings(): Promise<void> {
-    const data = await this.loadPluginData();
+    // Read-only access to the shared cache: the settings assignments below
+    // normalize/copy every retained value, so no whole-object clone is needed
+    // on the cold path. `loadPluginData()` keeps returning defensive copies
+    // for callers that may mutate.
+    const data = await this.readPluginDataSnapshot();
     this.setAutoSyncChangeDelaySeconds(
       data?.[KEY_AUTO_SYNC_CHANGE_DELAY_SECONDS],
     );
@@ -7104,6 +7244,9 @@ export default class EasySyncPlugin extends Plugin {
       );
       this.syncDirection = readSyncDirection(data[KEY_SYNC_DIRECTION]);
     }
+    // The read is background work now: a plugin that unloaded while it was in
+    // flight must not push settings into a torn-down session.
+    if (this.unloaded) return;
     this.applySyncPathSettings();
     this.applyMaxFileSize();
     this.applyDiagnosticSetting();
@@ -7113,7 +7256,19 @@ export default class EasySyncPlugin extends Plugin {
   /** M14: serialized PluginData write. All callers (StateManager, settings,
    *  auth profile) mutate through this queue — no interleaved load-modify-save. */
   private async updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void> {
+    // Observation only: how long this write waited behind the physical queue.
+    const releaseQueue = queueWaitObservation.enter("pluginDataSave");
+    const enqueuedAt = performance.now();
     const task = this.pluginDataQueue.then(async () => {
+      const queueWarning = queueWaitObservation.noteDequeue(
+        "pluginDataSave",
+        performance.now() - enqueuedAt,
+      );
+      if (queueWarning) {
+        this.diag.warn("state", "state queue wait exceeded", {
+          ...queueWarning,
+        });
+      }
       const startupWriteStartedAt = this.startupPerformance.isCollecting
         ? performance.now()
         : 0;
@@ -7170,6 +7325,7 @@ export default class EasySyncPlugin extends Plugin {
       }
     });
     this.pluginDataQueue = task.catch(() => undefined);
+    if (releaseQueue) task.then(releaseQueue, releaseQueue);
     return task;
   }
 
@@ -7178,13 +7334,26 @@ export default class EasySyncPlugin extends Plugin {
     return data === null ? null : clonePluginData(data);
   }
 
+  /**
+   * Read-only view of the cached plugin data for startup consumers that only
+   * read (settings, auth profile cache). Skips the defensive whole-object
+   * clone `loadPluginData()` pays on every call; the returned object must not
+   * be mutated. Writes go through `updatePluginData`, which clones first.
+   */
+  async readPluginDataSnapshot(): Promise<Readonly<Record<string, unknown>> | null> {
+    return this.ensurePluginDataCache();
+  }
+
   private async ensurePluginDataCache(): Promise<Record<string, unknown> | null> {
     if (this.pluginDataCache !== undefined) return this.pluginDataCache;
     const startedAt = performance.now();
     let topLevelKeys: number | null = null;
     this.pluginDataLoadPromise ??= this.loadData()
       .then((data: unknown) => {
-        this.pluginDataCache = isRecord(data) ? clonePluginData(data) : null;
+        // The host's loadData() parses a fresh JSON object per call and the
+        // cache is the only owner; cloning it here would pay a second full
+        // serialization before the settings/state consumers even start.
+        this.pluginDataCache = isRecord(data) ? data : null;
         topLevelKeys = this.pluginDataCache === null
           ? 0
           : Object.keys(this.pluginDataCache).length;
@@ -7195,6 +7364,7 @@ export default class EasySyncPlugin extends Plugin {
           performance.now() - startedAt,
           topLevelKeys,
         );
+        this.startupPerformance.markStage("plugin-data:read");
         this.pluginDataLoadPromise = null;
       });
     return this.pluginDataLoadPromise;
@@ -7204,6 +7374,31 @@ export default class EasySyncPlugin extends Plugin {
     const summary = this.startupPerformance.takeCompletedSummary();
     if (!summary) return;
     this.diag.log("lifecycle", "plugin cold start summary", summary);
+    // Diagnostics-only, fire-and-forget: the JSONL window can roll a startup
+    // line out under sync activity, while the bounded observation file keeps
+    // the last 40 sessions for "restart a few times and compare". Off means
+    // no file read, no write, no directory touch.
+    if (!this.diagLogEnabled) return;
+    const record = buildStartupTimingObservation(summary);
+    void appendStartupTimingObservation(
+      this.app.vault.adapter,
+      this.startupLogsDir(),
+      record,
+    ).then((written) => {
+      if (!written) {
+        this.diag.warn(
+          "lifecycle",
+          "startup timing observation could not be written",
+        );
+      }
+    });
+  }
+
+  private startupLogsDir(): string {
+    return getEasySyncPaths(
+      getConfigDir(this.app.vault),
+      this.manifest.id,
+    ).logsDir;
   }
 
   async saveSyncSettings(): Promise<void> {
@@ -10292,6 +10487,16 @@ export default class EasySyncPlugin extends Plugin {
     // pre-window bypass that lets the report show more than the newest round.
     const diagAll = diagSnapshot.entries;
     const runSummaries = diagSnapshot.runSummaries;
+    // Diagnostics-only section: the observation file only exists when logging
+    // was on, so a diagnostics-off report stays byte-for-byte unchanged.
+    if (this.diagLogEnabled) {
+      const startupRecords = await readStartupTimingObservations(
+        this.app.vault.adapter,
+        this.startupLogsDir(),
+      );
+      lines.push(...formatStartupTimingSection(startupRecords));
+      lines.push("");
+    }
     lines.push("## 云客户端同步环境");
     lines.push("");
     const cloudEnvironment = detectVaultCloudClientEnvironment(
