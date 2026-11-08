@@ -1739,6 +1739,7 @@ describe("AuthModule login persistence (transient refresh failures)", () => {
 
 describe("AuthModule.isSessionPending", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -1797,6 +1798,55 @@ describe("AuthModule.isSessionPending", () => {
     expect(auth.authState.accountId).toBe("offline-account");
     expect(auth.isSessionPending).toBe(false);
     expect(changes).toHaveBeenCalled();
+  });
+
+  it("shares one /me request when session restore and a token read verify concurrently", async () => {
+    vi.useFakeTimers();
+    let meCalls = 0;
+    const me = deferred<obsidian.RequestUrlResponse>();
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return Promise.resolve({
+          status: 200,
+          headers: {},
+          json: { access_token: "shared-at", expires_in: 3600 },
+        } as obsidian.RequestUrlResponse);
+      }
+      if (options.url.includes("graph.microsoft.com/v1.0/me")) {
+        meCalls++;
+        return me.promise;
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: {},
+        json: {},
+      } as obsidian.RequestUrlResponse);
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => "stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    // Both paths clear accountId before /me; while the first request is in
+    // flight the second must join it instead of issuing another Graph call.
+    const restoring = auth.initialize();
+    const token = auth.getAccessToken();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(meCalls).toBe(1);
+
+    me.resolve({
+      status: 200,
+      headers: {},
+      json: { displayName: "Shared User", id: "shared-account" },
+    } as obsidian.RequestUrlResponse);
+    await expect(token).resolves.toBe("shared-at");
+    await restoring;
+    expect(meCalls).toBe(1);
+    expect(auth.authState.accountId).toBe("shared-account");
   });
 });
 

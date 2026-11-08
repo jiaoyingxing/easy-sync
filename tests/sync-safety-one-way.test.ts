@@ -1696,7 +1696,10 @@ describe("one-way local-only upload action (片④)", () => {
     });
     // 第四个读点（pendingDeleteRemovals）同样按生效策略：结算回执里必须带着
     // 这条路径的待确认删除清账，否则下次同步会重新冒出同一行。
-    expect(oneWay.state.recordMutationReceipt).toHaveBeenCalledWith(
+    const combinedWrites = vi.mocked(
+      oneWay.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls;
+    expect(combinedWrites.flatMap((call) => call[0])).toContainEqual(
       expect.objectContaining({
         checkpoint: expect.objectContaining({
           pendingDeleteRemovals: [notePath],

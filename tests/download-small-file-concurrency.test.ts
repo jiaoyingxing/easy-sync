@@ -126,12 +126,12 @@ describe("small-file download concurrency (2026-10-27)", () => {
     expect(result.downloaded).toBe(entries.length);
     expect(result.errors).toBe(0);
     expect(peak).toBeGreaterThanOrEqual(2);
-    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeLessThanOrEqual(4);
     expect(result.metrics?.fileTransfers.download.peakConcurrency).toBe(peak);
 
     // The whole round refreshes every missing URL once; version checks then
-    // ride the adaptive batch (≤ the desktop ceiling of 3), so 30 files cost
-    // far fewer than 30 post-download metadata requests.
+    // ride the commit group (8 desktop / 4 mobile), so 30 files cost four
+    // post-download metadata requests instead of 30.
     const refreshCalls = getDriveItemMetadataByIds.mock.calls
       .filter((call) => call[1] === "downloadUrlRefresh");
     expect(refreshCalls).toHaveLength(1);
@@ -146,9 +146,7 @@ describe("small-file download concurrency (2026-10-27)", () => {
     });
     const verifyCalls = getDriveItemMetadataByIds.mock.calls
       .filter((call) => call[1] === "downloadVersionVerify");
-    expect(verifyCalls.length).toBeGreaterThan(0);
-    expect(verifyCalls.length).toBeLessThan(entries.length);
-    expect(verifyCalls.every((call) => call[0].length <= 3)).toBe(true);
+    expect(verifyCalls.map((call) => call[0].length)).toEqual([8, 8, 8, 6]);
     expect(verifyCalls.flatMap((call) => call[0]).sort()).toEqual(
       entries.map((entry) => entry.driveId).sort(),
     );
@@ -192,11 +190,10 @@ describe("small-file download concurrency (2026-10-27)", () => {
     const verifySizes = getDriveItemMetadataByIds.mock.calls
       .filter((call) => call[1] === "downloadVersionVerify")
       .map((call) => call[0].length);
-    // The failed batch is observed before the next wave is planned, so the
-    // immediate next version checks must be single-file batches again.
-    expect(verifySizes[0]).toBe(1);
-    expect(verifySizes[1]).toBe(1);
-    expect(verifySizes[2]).toBe(1);
-    expect(peak).toBeLessThanOrEqual(3);
+    // The failed transfer locks the direction to serial; the first verify
+    // group carries the seven successful members, and the tail group carries
+    // the two files transferred after the failure.
+    expect(verifySizes).toEqual([7, 2]);
+    expect(peak).toBeLessThanOrEqual(4);
   });
 });

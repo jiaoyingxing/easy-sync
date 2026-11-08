@@ -1459,7 +1459,9 @@ describe("main sync entry guards", () => {
 
   it("gates mutation recovery observation on the master switch rather than the scheduled interval", () => {
     const plugin = makePlugin();
-    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "account" },
+    } as never;
     plugin.state = {
       isV2StateActive: true,
       hasMutationLedgerCorruption: false,

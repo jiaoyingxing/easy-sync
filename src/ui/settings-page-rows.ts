@@ -2,18 +2,21 @@
  * 设置页（1.13+ 声明式页面）行实现。
  *
  * 每个函数把一行设置装配到一个宿主 `Setting` 上，供 `settings-tab.ts` 的
- * 声明式页面调用；写入一律走与 <1.13 弹框同一批 plugin API，文案一律复用
- * 现役 i18n 键，所以两条路径的设置语义与用词一致。
- *
- * 已登记的双轨分歧（2026-10-12，S1）：<1.13 弹框保留各自的行实现（未重写），
- * 本模块是 1.13+ 的单一实现；两边以「行名 ↔ 定义树」对账钉防漏登记，弹框侧
- * 回接到本模块列为 S2 候选。
+ * 声明式页面调用；写入一律走现役 plugin API，文案一律复用现役 i18n 键。
+ * 本模块是设置页行与排除/大文件工具的单一实现（<1.13 弹框轨道已随
+ * minAppVersion 1.13.4 退场，2026-11-07）。
  *
  * 宿主边界：`update()` 会重跑行渲染回调但不重建行节点（Resojot 1.13.7 实测），
  * 因此每个 applier 先把本行自己拥有的槽位复位（控件槽 `controlEl` 与自绘
  * desc 槽）再重画，保证反复重跑不重复追加。
  */
-import { Notice, Setting } from "obsidian";
+import {
+  ExtraButtonComponent,
+  FuzzySuggestModal,
+  Notice,
+  Setting,
+  TFolder,
+} from "obsidian";
 import type { DropdownComponent, TextComponent } from "obsidian";
 import type EasySyncPlugin from "../main";
 import type { CommunityPluginInventoryItem } from "../sync/community-plugin-inventory";
@@ -29,19 +32,13 @@ import {
   MAX_FILE_SIZE_PRESET_OPTIONS_MB,
   UNLIMITED_MAX_FILE_SIZE_MB,
 } from "../sync/types";
+import {
+  isPathExcludedByFolders,
+  normalizeExcludedFolders,
+} from "../sync/local-scanner";
+import { getConfigDir } from "../obsidian-compat";
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "./config-sync-modal";
-import {
-  openSyncExclusionFolderPicker,
-  parseMaxFileSizeInput,
-  renderExcludedFolderChips,
-  resolveMaxFileSizeSelection,
-  updateExcludedFoldersFromUi,
-} from "./sync-exclusion-modal";
-import {
-  ensureSliderValueEl,
-  paintSliderDisplay,
-} from "./auto-sync-modal";
 
 /** 每个页面宿主自持一份的钩子（声明式页面用；弹框不经过本模块）。 */
 export interface SettingsPageRowHost {
@@ -81,6 +78,160 @@ function noticeForSyncPathSettingsError(
       : "notice.syncPathSettings.recovery"
     : "notice.syncPathSettings.failed";
   new Notice(plugin.i18n.t(key));
+}
+
+// ===========================================================================
+// 排除与大型文件工具（原 <1.13 弹框实现，随旧轨退场迁入；现役唯一入口在本页行）
+// ===========================================================================
+
+export interface SyncExclusionFolderCandidate {
+  path: string;
+}
+
+export function buildSyncExclusionFolderCandidates(
+  localFolderPaths: readonly string[],
+  remoteFolderPaths: readonly string[],
+  excludedFolders: readonly string[],
+  configDir: string,
+): SyncExclusionFolderCandidate[] {
+  const unique = new Map<string, SyncExclusionFolderCandidate>();
+  for (const candidate of [...localFolderPaths, ...remoteFolderPaths]) {
+    const [normalized] = normalizeExcludedFolders([candidate], configDir);
+    if (
+      !normalized
+      || isPathExcludedByFolders(normalized, excludedFolders)
+    ) continue;
+    const key = normalized.toLocaleLowerCase("en-US");
+    if (!unique.has(key)) unique.set(key, { path: normalized });
+  }
+  return [...unique.values()].sort(
+    (left, right) => left.path.localeCompare(right.path),
+  );
+}
+
+type MaxFileSizeSelection =
+  | { kind: "preset"; value: number }
+  | { kind: "unlimited" }
+  | { kind: "custom" };
+
+export function resolveMaxFileSizeSelection(currentMb: number): MaxFileSizeSelection {
+  if (currentMb === UNLIMITED_MAX_FILE_SIZE_MB) return { kind: "unlimited" };
+  if (MAX_FILE_SIZE_PRESET_OPTIONS_MB.includes(currentMb)) {
+    return { kind: "preset", value: currentMb };
+  }
+  return { kind: "custom" };
+}
+
+/** Accepts only positive whole MiB values; everything else is a visible rejection. */
+export function parseMaxFileSizeInput(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const value = Number.parseInt(trimmed, 10);
+  return value > 0 ? value : null;
+}
+
+class SyncExclusionFolderPicker
+  extends FuzzySuggestModal<SyncExclusionFolderCandidate> {
+  constructor(
+    private plugin: EasySyncPlugin,
+    private remoteFolderPaths: readonly string[],
+    private onChoose: (folder: SyncExclusionFolderCandidate) => void,
+  ) {
+    super(plugin.app);
+    this.setPlaceholder(plugin.i18n.t("settings.syncExclusion.pickerPlaceholder"));
+  }
+
+  getItems(): SyncExclusionFolderCandidate[] {
+    const configDir = getConfigDir(this.plugin.app.vault);
+    const localFolderPaths = this.plugin.app.vault.getAllLoadedFiles()
+      .filter((file): file is TFolder => file instanceof TFolder)
+      .map((folder) => folder.path);
+    return buildSyncExclusionFolderCandidates(
+      localFolderPaths,
+      this.remoteFolderPaths,
+      this.plugin.excludedFolders,
+      configDir,
+    );
+  }
+
+  getItemText(folder: SyncExclusionFolderCandidate): string {
+    return folder.path;
+  }
+
+  onChooseItem(folder: SyncExclusionFolderCandidate): void {
+    this.onChoose(folder);
+  }
+}
+
+/**
+ * 按需打开文件夹排除选择器（设置页行专用入口；候选由调用方先取好，
+ * 因为选择器的候选读取是同步的）。
+ */
+export function openSyncExclusionFolderPicker(
+  plugin: EasySyncPlugin,
+  remoteFolderPaths: readonly string[],
+  onChoose: (folder: SyncExclusionFolderCandidate) => void,
+): void {
+  new SyncExclusionFolderPicker(plugin, remoteFolderPaths, onChoose).open();
+}
+
+interface ExclusionChipOptions {
+  disabled?: boolean;
+  removeLabel: (path: string) => string;
+  onRemove: (path: string) => Promise<boolean>;
+}
+
+export function renderExcludedFolderChips(
+  containerEl: HTMLElement,
+  paths: readonly string[],
+  options: ExclusionChipOptions,
+): void {
+  containerEl.empty();
+  containerEl.addClass("easy-sync-exclusion-chips");
+  containerEl.setAttribute("role", "list");
+
+  for (const path of paths) {
+    const chipEl = containerEl.createDiv({
+      cls: "easy-sync-exclusion-chip",
+      attr: { role: "listitem" },
+    });
+    chipEl.createSpan({
+      cls: "easy-sync-exclusion-chip-label",
+      text: path,
+    });
+
+    let removing = false;
+    const removeLabel = options.removeLabel(path);
+    const removeButton = new ExtraButtonComponent(chipEl)
+      .setIcon("x")
+      .setTooltip(removeLabel)
+      .setDisabled(options.disabled ?? false)
+      .onClick(async () => {
+        if (removing) return;
+        removing = true;
+        removeButton.setDisabled(true);
+        const removed = await options.onRemove(path);
+        if (!removed && removeButton.extraSettingsEl.isConnected) {
+          removing = false;
+          removeButton.setDisabled(options.disabled ?? false);
+        }
+      });
+    removeButton.extraSettingsEl.addClass("easy-sync-exclusion-chip-remove");
+    removeButton.extraSettingsEl.setAttribute("aria-label", removeLabel);
+  }
+}
+
+export async function updateExcludedFoldersFromUi(
+  plugin: EasySyncPlugin,
+  paths: readonly string[],
+): Promise<boolean> {
+  try {
+    await plugin.updateExcludedFolders(paths);
+    return true;
+  } catch (error) {
+    noticeForSyncPathSettingsError(plugin, error);
+    return false;
+  }
 }
 
 // ===========================================================================
@@ -534,7 +685,7 @@ export function applyMaxFileSizeRow(
 // 自动同步页
 // ===========================================================================
 
-/** 定时同步滑条（0＝关闭该项；值句与弹框同口径）。 */
+/** 定时同步滑条（0＝关闭该项；滑条填充与数值读出由宿主 1.13+ 自绘）。 */
 export function applySyncIntervalRow(
   setting: Setting,
   host: SettingsPageRowHost,
@@ -557,7 +708,6 @@ export function applySyncIntervalRow(
         .setLimits(0, 10, 1)
         .setValue(plugin.syncInterval)
         .onChange(async (value) => {
-          paintSliderDisplay(slider, value);
           lastValue = value;
           renderDesc();
           const previous = plugin.syncInterval;
@@ -575,15 +725,12 @@ export function applySyncIntervalRow(
           plugin.restartAutoSync();
           host.refresh();
         });
-      ensureSliderValueEl(slider);
-      paintSliderDisplay(slider);
-      slider.sliderEl.addEventListener("input", () => paintSliderDisplay(slider));
     });
   descEl = descTextEl(setting);
   renderDesc();
 }
 
-/** 修改后触发同步滑条（0＝关闭该项；值句与弹框同口径）。 */
+/** 修改后触发同步滑条（0＝关闭该项；滑条填充与数值读出由宿主 1.13+ 自绘）。 */
 export function applyAutoSyncChangeDelayRow(
   setting: Setting,
   host: SettingsPageRowHost,
@@ -606,7 +753,6 @@ export function applyAutoSyncChangeDelayRow(
         .setLimits(0, 10, 1)
         .setValue(plugin.autoSyncChangeDelaySeconds)
         .onChange(async (value) => {
-          paintSliderDisplay(slider, value);
           lastValue = value;
           renderDesc();
           const previous = plugin.autoSyncChangeDelaySeconds;
@@ -629,9 +775,6 @@ export function applyAutoSyncChangeDelayRow(
           }
           host.refresh();
         });
-      ensureSliderValueEl(slider);
-      paintSliderDisplay(slider);
-      slider.sliderEl.addEventListener("input", () => paintSliderDisplay(slider));
     });
   descEl = descTextEl(setting);
   renderDesc();

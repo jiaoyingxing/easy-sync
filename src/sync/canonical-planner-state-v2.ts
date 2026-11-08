@@ -51,7 +51,34 @@ export interface CanonicalPlannerStateV2 {
   baseFiles: readonly Readonly<BaseFileEntry>[];
 }
 
+/** Identity cache for the one or two committed envelopes a round keeps
+ *  projecting. Projection sorts every remote node and anchor and rebuilds the
+ *  file/base entries; one healthy round measured 15 calls (~97 ms at 288
+ *  files, linear with vault size) over the same object. Envelopes are
+ *  immutable committed snapshots (see `validateEnvelope`) and the projected
+ *  state is typed `Readonly`, so reusing the exact same object's projection is
+ *  observationally identical. Bounded to two entries, so a 50k vault never
+ *  keeps more than the active pair in memory. */
+const plannerStateCache: Array<{
+  envelope: SyncStateEnvelopeV2;
+  state: CanonicalPlannerStateV2;
+}> = [];
+const PLANNER_STATE_CACHE_LIMIT = 2;
+
 export function canonicalPlannerStateFromEnvelopeV2(
+  envelope: SyncStateEnvelopeV2,
+): CanonicalPlannerStateV2 {
+  const cached = plannerStateCache.find((entry) => entry.envelope === envelope);
+  if (cached) return cached.state;
+  const state = canonicalPlannerStateFromEnvelopeImplV2(envelope);
+  plannerStateCache.unshift({ envelope, state });
+  if (plannerStateCache.length > PLANNER_STATE_CACHE_LIMIT) {
+    plannerStateCache.length = PLANNER_STATE_CACHE_LIMIT;
+  }
+  return state;
+}
+
+function canonicalPlannerStateFromEnvelopeImplV2(
   envelope: SyncStateEnvelopeV2,
 ): CanonicalPlannerStateV2 {
   validateEnvelope(envelope);

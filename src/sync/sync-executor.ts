@@ -889,11 +889,6 @@ function excludeSelectedCommunityPluginFiles(
   };
 }
 
-type StreamDownloadAdapter = DataAdapter & {
-  appendBinary: (normalizedPath: string, data: ArrayBuffer) => Promise<void>;
-  rename: (normalizedPath: string, normalizedNewPath: string) => Promise<void>;
-};
-
 interface RemoteProjection {
   entries: RemoteFileEntry[];
   folders: RemoteFolderEntry[];
@@ -919,14 +914,85 @@ type ExactEmptyRemoteFolderInspection =
  *  evidence class: 2.6–5 MB recordings) stream into the .part carrier, where
  *  reconnects resume from the received prefix instead of losing every byte. */
 const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024;
-/** 下载流水线 (2026-10-27): stage 1 may run this many prepared small-download
- *  batches ahead of stage 3 before it waits for the oldest commit. Two kept
- *  payloads (the committing batch plus the one in or waiting for its `$batch`
- *  check) is the extra memory this overlap buys: one batch beyond what the
- *  pre-pipeline window ever held, and the ceiling the mobile prefetch note
- *  already prices as "2 × ≤8 MiB in flight". A deeper window would retain a
- *  third batch without moving the verify-bound critical path. */
-const DOWNLOAD_PIPELINE_IN_FLIGHT_BATCHES = 2;
+/** 下载提交组流水线 (2026-11-08): how many prepared commit groups may run
+ *  ahead of the open group before the producer waits. One pending group plus
+ *  the open group preserves the old 2-batch memory ceiling (the open group's
+ *  transfer batch overlaps the previous group's verify + commit). */
+const DOWNLOAD_PIPELINE_IN_FLIGHT_GROUPS = 1;
+/** 下载提交组 (2026-11-08): the download window used to persist every file
+ *  independently — one intent, one receipt and one V2 checkpoint per 18-byte
+ *  note. The upload pool has batched those three writes at 8/4 since
+ *  2026-10-26; downloads now use the same granularity so a group of prepared
+ *  payloads shares one intent write, one receipt write and one checkpoint.
+ *  Download groups keep their own 8/4 crash granularity (uploads moved to
+ *  16/4 on 2026-11-08; the two directions do not have to match), while SC-15
+ *  is unchanged: the group's intents are durable before its first local
+ *  write, its receipts before its checkpoint, and a file that failed
+ *  transfer/verify never gets an intent. */
+function downloadCommitBatch(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 4 : 8;
+}
+/** The group also stops at a byte cap: twenty 8 MiB prefetched payloads would
+ *  otherwise stay resident while the next group transfers. The caps keep the
+ *  verify window at the pre-existing memory order (16 MiB desktop / 8 MiB
+ *  mobile); the commit sub-groups are at most 8/4 files each. */
+function downloadCommitGroupBytes(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 8 * 1024 * 1024 : 16 * 1024 * 1024;
+}
+/** Verification is read-only and batched separately from persistence. The
+ *  measured `$batch` latency grew with the ID count (8 ids ≈ 2.7 s, 20 ids
+ *  5–12 s on the field link), so the verify batch stays at the approved 8/4
+ *  persistence batch: one `$batch` per group, with the next group's verify
+ *  overlapping the previous group's commits. */
+const DOWNLOAD_VERIFY_BATCH_SIZE = 8;
+/** One transfer batch still formed by `downloadPolicy.limit`; its observation
+ *  inputs are kept so the adaptive policy sees the same per-batch signal it
+ *  saw before commit groups existed. */
+interface PreparedDownloadTransferBatch {
+  batch: SyncPlanItem[];
+  prepared: PreparedDownload[];
+  batchStartedAt: number;
+  preparedAt: number;
+  batchTransferMs: number;
+  shouldBatchVersionVerification: boolean;
+  /** Errors already in the prepared slots before the group's version check.
+   *  Any increase after the check is a verification failure and must lock the
+   *  direction to serial, exactly like a failed transfer batch. */
+  errorCountBeforeVerify: number;
+}
+/** One commit group: prepared payloads from one or more transfer batches,
+ *  verified and persisted as a unit. */
+interface DownloadCommitGroup {
+  items: SyncPlanItem[];
+  prepared: PreparedDownload[];
+  transferBatches: PreparedDownloadTransferBatch[];
+  bytes: number;
+  openedAt: number;
+}
+/** One small-upload persistence batch in the two-batch pipeline. The intents
+ *  and handoffs are created once, the PUT pool fills `completions`, and the
+ *  state lane writes receipts + one checkpoint while the next batch's PUTs
+ *  run. */
+interface UploadBatchContext {
+  index: number;
+  batch: SyncPlanItem[];
+  handoffs: CleanupWaveHandoff[];
+  intents: MutationIntent[];
+  completions: DeferredMutationCompletion[];
+  batchStartedAt: number;
+  errorsBefore: number;
+  intentMs: number;
+  intentQueueMs: number;
+  networkMs: number;
+  pauseMs: number;
+  receiptMs: number;
+  checkpointMs: number;
+  putStartedAt: number;
+  commitSettledAt: number;
+  rowsSettled: boolean;
+  overlapped: boolean;
+  intentsWritten: boolean;
+}
 /** 片② 留副本换名落位的最大尝试次数（同分钟重名/既有文件同名）。 */
 const LOCAL_ONLY_COPY_MAX_ATTEMPTS = 50;
 const COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
@@ -975,14 +1041,15 @@ function deleteCheckpointWave(platform: HostPlatformFacts): number {
 /** One small-upload persistence batch: the whole batch's mutation intents are
  *  durable before its first PUT, its receipts are written in one device-local
  *  commit after the uploads, and one shared V2 checkpoint publishes it.
- *  Desktop 8 / mobile 4 is the crash granularity the user approved for
- *  uploads: an interrupted batch leaves at most that many intent-only records
- *  for the next round's observation (SC-15 unchanged — still no upload without
- *  a durable intent, still no shared baseline before its receipts). Upload
- *  concurrency inside the batch is unrelated: `UploadConcurrencyPolicy` keeps
- *  deciding how many PUTs may overlap. */
+ *  Desktop 16 / mobile 4 is the crash granularity the user approved for
+ *  uploads (2026-11-08: desktop 8→16, intent-only window 32): an interrupted
+ *  batch leaves at most that many intent-only records for the next round's
+ *  observation (SC-15 unchanged — still no upload without a durable intent,
+ *  still no shared baseline before its receipts). Upload concurrency inside
+ *  the batch is unrelated: `UploadConcurrencyPolicy` keeps deciding how many
+ *  PUTs may overlap, so a 16-file batch still runs as two 8-wide waves. */
 function uploadCheckpointBatch(platform: HostPlatformFacts): number {
-  return platform.isMobileApp ? 4 : 8;
+  return platform.isMobileApp ? 4 : 16;
 }
 /** Slice length used while waiting out a 429/509 Retry-After pause. The whole
  *  upload direction must issue no request inside the window, but cancellation
@@ -1701,6 +1768,12 @@ export class SyncExecutor {
   private running = false;
   private sideActionRunning = false;
   private sideActionQueue: Promise<void> = Promise.resolve();
+  /** Single-flight tail for work a completed round deliberately does not
+   *  await: currently only the healthy-round cloud bootstrap publication (a
+   *  non-authoritative recovery hint, two Graph round trips). It is chained
+   *  so two publications can never interleave their eTag/CAS checkpoints, and
+   *  settled before the next authority transition (next run, reset, unload). */
+  private backgroundTail: Promise<void> = Promise.resolve();
   private queuedSideActionPaths = new Set<string>();
   private sideActionBatchTotal = 0;
   private sideActionBatchSettled = 0;
@@ -6394,19 +6467,14 @@ export class SyncExecutor {
     }
   }
 
-  private getStreamDownloadAdapter(fileSize: number): StreamDownloadAdapter | null {
+  private getStreamDownloadAdapter(fileSize: number): DataAdapter | null {
     if (!this.platform.isMobileApp || fileSize < MOBILE_STREAM_DOWNLOAD_MIN_BYTES) {
       return null;
     }
-    const adapter = this.scanner.vault.adapter as StreamDownloadAdapter;
-    if (typeof adapter.appendBinary !== "function" || typeof adapter.rename !== "function") {
-      this.diag?.warn(
-        "execute",
-        `mobile streamed download unavailable — appendBinary/rename missing, fileSize=${fileSize}`,
-      );
-      return null;
-    }
-    return adapter;
+    // appendBinary/rename 自宿主 1.12.3 起必有（DataAdapter 类型已收录），
+    // minAppVersion 1.13.4 下不再做运行时探测（原「appendBinary missing」
+    // 兜底随版本抬升退场，2026-11-07）。
+    return this.scanner.vault.adapter;
   }
 
   private getDownloadTempPath(filePath: string): string {
@@ -7877,7 +7945,7 @@ export class SyncExecutor {
   }
 
   private async commitDownloadedTempFile(
-    adapter: StreamDownloadAdapter,
+    adapter: DataAdapter,
     targetPath: string,
     tempPath: string,
     expected: LocalFileEntry | undefined,
@@ -12134,9 +12202,11 @@ export class SyncExecutor {
       if (this.shouldStop(result, operationEpoch)) return { terminated: result };
       await this.state.setLastSyncTimeAndIncrementGeneration(Date.now());
       if (this.shouldStop(result, operationEpoch)) return { terminated: result };
-      await this.publishHealthyCloudBootstrapV2(
-        operationEpoch,
-      );
+      // Round-end hint publication is deliberately not awaited: the envelope
+      // is already committed and the bootstrap object is a recovery hint, not
+      // authority. `settleBackgroundTasks()` closes the window before the next
+      // authority transition.
+      this.scheduleHealthyCloudBootstrapPublication(operationEpoch);
       // Older test doubles and pre-migration state holders do not expose
       // the optional local layout cleanup hook; sync correctness must not
       // depend on this housekeeping step.
@@ -15692,21 +15762,14 @@ export class SyncExecutor {
     // per file on every platform.
 
     await this.runDownloadWindow({
+      plan,
       result,
+      callbacks,
       operationEpoch,
+      automaticHandlingPolicy,
+      run,
       downloads: run.downloads,
       downloadPolicy: run.downloadPolicy,
-      executePlanItem: (item, preparedDownload) =>
-        this.executeSinglePlanItem(
-          plan,
-          result,
-          callbacks,
-          operationEpoch,
-          automaticHandlingPolicy,
-          run,
-          item,
-          preparedDownload,
-        ),
       preparedCommunityPluginDownloads,
       metrics: run.metrics,
     });
@@ -16288,14 +16351,24 @@ export class SyncExecutor {
         // 显示，不等整批共享检查点（批末才发会让批内长时间没有任何反馈）。
         // 检查点随后仍按批提交（SC-15 粒度不变）；若它失败或被取消，调用方
         // 用 onFileReverted 把这一行翻成失败并带上原因。
-        callbacks.onFileComplete?.(
-          item.path,
-          completionActionType,
-          true,
-          itemResult.completionReason,
-          completionFileSize,
-          item.renameFrom,
-        );
+        if (item.renameFrom) {
+          callbacks.onFileComplete?.(
+            item.path,
+            completionActionType,
+            true,
+            itemResult.completionReason,
+            completionFileSize,
+            item.renameFrom,
+          );
+        } else {
+          callbacks.onFileComplete?.(
+            item.path,
+            completionActionType,
+            true,
+            itemResult.completionReason,
+            completionFileSize,
+          );
+        }
         return {
           terminated: {
             operationId: deferredMutationOperationId,
@@ -16720,6 +16793,23 @@ export class SyncExecutor {
    *  batch intents pre-written, receipts collected, one shared checkpoint
    *  per batch with per-file feedback. Runs the adaptive AIMD upload policy
    *  for the whole direction. */
+  /** Step 3a — the small-upload resident pool with a two-batch persistence
+   *  pipeline (2026-11-08).
+   *
+   *  Batch N's PUTs and batch N+1's PUTs no longer serialize behind batch N's
+   *  receipt + checkpoint commit. The state lane is a single ordered chain:
+   *  `intents(N+1) → receipts(N) → checkpoint(N) → intents(N+2) → …`. The next
+   *  batch's intent write is awaited before its first PUT, then the previous
+   *  batch's receipts + checkpoint run while those PUTs fly. The resident
+   *  pool, AIMD controller, per-file rows and 429 handling are unchanged.
+   *
+   *  Crash/cancel granularity: at most two batches of intents can be durable
+   *  before their checkpoints (desktop 16 / mobile 8), the window the user
+   *  approved for this line. A failed receipt/checkpoint flips every row of
+   *  the affected and still-uncheckpointed batches and rethrows fail-closed;
+   *  durable intents/receipts stay for the next round's mutation recovery,
+   *  never replayed blindly.
+   */
   private async runSmallUploadPoolPhase(
     plan: SyncPlan,
     result: SyncResult,
@@ -16729,39 +16819,135 @@ export class SyncExecutor {
     run: ExecutionPhaseState,
     communityPluginUploadErrors: Map<string, unknown>,
   ): Promise<void> {
-    // Step 3a — independent small uploads are persisted one batch at a time
-    // (`uploadCheckpointBatch`). The whole batch's mutation intents are
-    // durable before its first PUT, every member's receipt is written in one
-    // device-local commit after the uploads, and one shared V2 checkpoint
-    // publishes the batch. Each member reports its own row as soon as its PUT
-    // and receipt land (per-file feedback); a failed or cancelled checkpoint
-    // flips those rows instead of deciding what the user may see. Inside a
-    // batch a resident pool keeps `limit` requests in
-    // flight and refills a freed slot at once (no wave barrier), so one slow
-    // file no longer stalls its peers' round trips. `limit` follows the
-    // per-file AIMD controller, and a 429/509 pauses the whole upload
-    // direction for Retry-After before the pool resumes at half the depth.
-    for (
-      let index = 0;
-      index < run.smallUploads.length;
-      index += uploadCheckpointBatch(this.platform)
-    ) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      const batch = run.smallUploads.slice(
-        index,
-        index + uploadCheckpointBatch(this.platform),
+    const batchSize = uploadCheckpointBatch(this.platform);
+    const batches: SyncPlanItem[][] = [];
+    for (let index = 0; index < run.smallUploads.length; index += batchSize) {
+      batches.push(run.smallUploads.slice(index, index + batchSize));
+    }
+    if (batches.length === 0) return;
+
+    const contexts: UploadBatchContext[] = batches.map((batch, index) => ({
+      index,
+      batch,
+      handoffs: [],
+      intents: [],
+      completions: [],
+      batchStartedAt: 0,
+      errorsBefore: 0,
+      intentMs: 0,
+      intentQueueMs: 0,
+      networkMs: 0,
+      pauseMs: 0,
+      receiptMs: 0,
+      checkpointMs: 0,
+      putStartedAt: 0,
+      commitSettledAt: 0,
+      rowsSettled: false,
+      overlapped: false,
+      intentsWritten: false,
+    }));
+
+    // The state lane is one ordered chain. A lane error is parked in
+    // `pipelineError`; later tasks become no-ops and the round rethrows only
+    // after every in-flight PUT has settled.
+    let pipelineError: unknown = null;
+    let stateTail: Promise<void> = Promise.resolve();
+    const enqueueState = (task: () => Promise<void>): Promise<void> => {
+      const next = stateTail
+        .then(async () => {
+          if (pipelineError !== null) return;
+          await task();
+        })
+        .catch((error) => {
+          pipelineError ??= error;
+        });
+      stateTail = next;
+      return next;
+    };
+
+    const noteUploadStep = (change: UploadConcurrencyChange | null): void => {
+      if (!change) return;
+      const cause = change.cause ? ` cause=${change.cause}` : "";
+      this.diag?.log(
+        "execute",
+        `upload concurrency ${change.from} → ${change.to} reason=${change.reason}${cause}`,
+        {
+          schemaVersion: 1,
+          from: change.from,
+          to: change.to,
+          reason: change.reason,
+          cause: change.cause ?? null,
+          windowThroughput: change.windowThroughput ?? null,
+          referenceMedian: change.referenceMedian ?? null,
+          maxConcurrency: run.uploadPolicy.maxLimit,
+        },
       );
-      const batchStartedAt = Date.now();
-      const batchPerfStartedAt = performance.now();
-      const batchErrorsBefore = result.errors;
-      const intents: MutationIntent[] = [];
-      const handoffs: CleanupWaveHandoff[] = [];
-      for (const item of batch) {
+    };
+    /** One settled file → the controller. Successes carry the PUT's own
+     *  duration; failures only reach the consecutive-failure rule (a rate
+     *  limit additionally pauses the whole direction); items that settled
+     *  without a PUT (preflight, conflict, cancel) say nothing about the
+     *  link. */
+    const settleUpload = (
+      ctx: UploadBatchContext,
+      observation: UploadTransferObservation,
+    ): void => {
+      if (observation.throttled) {
+        const throttle = run.uploadPolicy.noteThrottle(
+          Date.now(),
+          observation.retryAfterSeconds,
+        );
+        ctx.pauseMs += throttle.pauseMs;
+        this.diag?.warn(
+          "execute",
+          `upload throttled — 429/509 (${
+            observation.retryAfterSeconds === null
+              ? "no Retry-After"
+              : `Retry-After ${observation.retryAfterSeconds}s`
+          }); the whole upload direction pauses ${throttle.pauseMs}ms`,
+        );
+        noteUploadStep(throttle.change);
+        return;
+      }
+      if (observation.outcome === "failure") {
+        noteUploadStep(run.uploadPolicy.noteFailure());
+        return;
+      }
+      if (observation.outcome === "success") {
+        noteUploadStep(run.uploadPolicy.noteFile({
+          bytes: observation.bytes,
+          transferMs: observation.transferMs,
+        }));
+      }
+    };
+    /** Honour a Retry-After pause: no new upload request is issued while it
+     *  runs, and cancellation stays responsive (bounded slices). */
+    const waitOutThrottlePause = async (): Promise<void> => {
+      for (;;) {
+        const remaining = run.uploadPolicy.pauseRemainingMs(Date.now());
+        if (remaining <= 0 || !this.canContinue(operationEpoch, result)) return;
+        await new Promise<void>((resolve) => compatSetTimeout(
+          () => resolve(),
+          Math.min(remaining, UPLOAD_PAUSE_POLL_MS),
+        ));
+      }
+    };
+
+    /** Build and persist one batch's intents. Idempotent: the next batch's
+     *  intents are written at the end of the previous iteration so its PUTs
+     *  can start while the previous commit runs; the loop then skips the
+     *  write. */
+    const beginIntents = async (ctx: UploadBatchContext): Promise<void> => {
+      if (ctx.intentsWritten) return;
+      ctx.intentsWritten = true;
+      ctx.batchStartedAt = Date.now();
+      ctx.errorsBefore = result.errors;
+      for (const item of ctx.batch) {
         // A member blocked by the bundle preflight never reaches a mutation
-        // attempt (`executeSinglePlanItem` throws before `executeItem`), so the batch
-        // must not leave a durable intent behind for it: the per-file path
-        // creates the intent only after that check. Same map, same key as the
-        // throw below — one expression decides both.
+        // attempt (`executeSinglePlanItem` throws before `executeItem`), so the
+        // batch must not leave a durable intent behind for it: the per-file
+        // path creates the intent only after that check. Same map, same key as
+        // the throw below — one expression decides both.
         const preflightBlocked =
           communityPluginUploadErrors.get(item.path) !== undefined;
         const intent = !preflightBlocked
@@ -16770,88 +16956,26 @@ export class SyncExecutor {
           && !item.requiresConfirmation
           ? this.createMutationIntent(item, plan.scope)
           : null;
-        if (intent) intents.push(intent);
-        handoffs.push({ intent, receipts: [] });
+        if (intent) ctx.intents.push(intent);
+        ctx.handoffs.push({ intent, receipts: [] });
       }
       const intentStartedAt = Date.now();
       const intentPerfStartedAt = performance.now();
-      await this.state.beginMutationIntents(intents);
-      const intentMs = performance.now() - intentPerfStartedAt;
+      await this.state.beginMutationIntents(ctx.intents);
+      ctx.intentMs = performance.now() - intentPerfStartedAt;
       // The batch owns the intent write, so it owns the counters the per-item
       // path would have incremented (diagnostics read them per round).
-      run.metrics.mutationPersistence.intentWrites += intents.length;
+      run.metrics.mutationPersistence.intentWrites += ctx.intents.length;
       run.metrics.mutationPersistence.stagesMs.intentPersist +=
         Date.now() - intentStartedAt;
-      const completions: DeferredMutationCompletion[] = [];
+    };
+
+    const runBatchPool = async (ctx: UploadBatchContext): Promise<void> => {
       const poolStartedAt = performance.now();
-      let pauseMs = 0;
+      ctx.putStartedAt = poolStartedAt;
       const inFlight = new Set<Promise<void>>();
-      const noteUploadStep = (change: UploadConcurrencyChange | null): void => {
-        if (!change) return;
-        const cause = change.cause ? ` cause=${change.cause}` : "";
-        this.diag?.log(
-          "execute",
-          `upload concurrency ${change.from} → ${change.to} reason=${change.reason}${cause}`,
-          {
-            schemaVersion: 1,
-            from: change.from,
-            to: change.to,
-            reason: change.reason,
-            cause: change.cause ?? null,
-            windowThroughput: change.windowThroughput ?? null,
-            referenceMedian: change.referenceMedian ?? null,
-            maxConcurrency: run.uploadPolicy.maxLimit,
-          },
-        );
-      };
-      /** One settled file → the controller. Successes carry the PUT's own
-       *  duration; failures only reach the consecutive-failure rule (a rate
-       *  limit additionally pauses the whole direction); items that settled
-       *  without a PUT (preflight, conflict, cancel) say nothing about the
-       *  link. */
-      const settleUpload = (observation: UploadTransferObservation): void => {
-        if (observation.throttled) {
-          const throttle = run.uploadPolicy.noteThrottle(
-            Date.now(),
-            observation.retryAfterSeconds,
-          );
-          pauseMs += throttle.pauseMs;
-          this.diag?.warn(
-            "execute",
-            `upload throttled — 429/509 (${
-              observation.retryAfterSeconds === null
-                ? "no Retry-After"
-                : `Retry-After ${observation.retryAfterSeconds}s`
-            }); the whole upload direction pauses ${throttle.pauseMs}ms`,
-          );
-          noteUploadStep(throttle.change);
-          return;
-        }
-        if (observation.outcome === "failure") {
-          noteUploadStep(run.uploadPolicy.noteFailure());
-          return;
-        }
-        if (observation.outcome === "success") {
-          noteUploadStep(run.uploadPolicy.noteFile({
-            bytes: observation.bytes,
-            transferMs: observation.transferMs,
-          }));
-        }
-      };
-      /** Honour a Retry-After pause: no new upload request is issued while it
-       *  runs, and cancellation stays responsive (bounded slices). */
-      const waitOutThrottlePause = async (): Promise<void> => {
-        for (;;) {
-          const remaining = run.uploadPolicy.pauseRemainingMs(Date.now());
-          if (remaining <= 0 || !this.canContinue(operationEpoch, result)) return;
-          await new Promise<void>((resolve) => compatSetTimeout(
-            () => resolve(),
-            Math.min(remaining, UPLOAD_PAUSE_POLL_MS),
-          ));
-        }
-      };
       const dispatchUpload = (offset: number): void => {
-        const item = batch[offset];
+        const item = ctx.batch[offset];
         const observation: UploadTransferObservation = {
           bytes: Math.max(0, item.local?.size ?? 0),
           transferMs: 0,
@@ -16869,11 +16993,11 @@ export class SyncExecutor {
           run,
           item,
           preflightError === undefined ? undefined : { error: preflightError },
-          handoffs[offset],
+          ctx.handoffs[offset],
           observation,
         ).then((completion) => {
-          if (completion) completions.push(completion);
-          settleUpload(observation);
+          if (completion) ctx.completions.push(completion);
+          settleUpload(ctx, observation);
         }).finally(() => {
           inFlight.delete(task);
         });
@@ -16883,8 +17007,9 @@ export class SyncExecutor {
       // slow file delays only its own slot instead of the whole wave.
       let nextOffset = 0;
       while (
-        nextOffset < batch.length
+        nextOffset < ctx.batch.length
         && this.canContinue(operationEpoch, result)
+        && pipelineError === null
       ) {
         if (run.uploadPolicy.pauseRemainingMs(Date.now()) > 0) {
           await waitOutThrottlePause();
@@ -16892,8 +17017,9 @@ export class SyncExecutor {
         }
         while (
           inFlight.size < run.uploadPolicy.limit
-          && nextOffset < batch.length
+          && nextOffset < ctx.batch.length
           && this.canContinue(operationEpoch, result)
+          && pipelineError === null
         ) {
           dispatchUpload(nextOffset++);
         }
@@ -16902,69 +17028,151 @@ export class SyncExecutor {
       }
       await Promise.all(inFlight);
       // PUT segment wall clock minus the throttling pauses it contains.
-      const networkMs = Math.max(
+      ctx.networkMs = Math.max(
         0,
-        performance.now() - poolStartedAt - pauseMs,
+        performance.now() - poolStartedAt - ctx.pauseMs,
       );
-      // Receipts stay durable even when the round was cancelled inside the
-      // batch: the per-item path also wrote them before checking the epoch, so
-      // the next round's mutation recovery commits the checkpoint without
-      // re-observing the cloud. Only the shared checkpoint waits for the epoch.
-      const receipts = handoffs.flatMap((handoff) => handoff.receipts);
-      let receiptMs = 0;
-      if (receipts.length > 0) {
-        const receiptStartedAt = Date.now();
-        const receiptPerfStartedAt = performance.now();
-        await this.state.recordMutationReceipts(receipts);
-        run.metrics.mutationPersistence.stagesMs.receiptPersist +=
-          Date.now() - receiptStartedAt;
-        receiptMs = performance.now() - receiptPerfStartedAt;
-      }
-      let checkpointMs = 0;
+    };
+
+    const commitBatch = async (ctx: UploadBatchContext): Promise<void> => {
+      const receipts = ctx.handoffs.flatMap((handoff) => handoff.receipts);
       let checkpointedOperations = 0;
       let checkpointBreakdown: V2CommitBreakdown | undefined;
-      if (this.canContinue(operationEpoch, result)) {
-        const checkpointStartedAt = performance.now();
-        checkpointBreakdown = await this.commitDeferredCheckpointBatch(
-          completions,
-          run,
-          callbacks,
-          operationEpoch,
-          result,
-        );
-        checkpointMs = performance.now() - checkpointStartedAt;
-        checkpointedOperations = completions.length;
-      } else if (completions.length > 0) {
-        // 取消落在批末：这些文件的 PUT 与回执都已落地，但共享检查点按契约
-        // 等 epoch，没有提交——先前逐条显示的「完成」本轮不成立，按实际
-        // 结果翻成失败（原因用现役取消句），下一轮由回执恢复结算。
-        this.revertDeferredCompletions(completions, this.t("result.cancelled"), callbacks);
+      let cancelled = false;
+      try {
+        // Receipts stay durable even when the round was cancelled inside the
+        // batch: the per-item path also wrote them before checking the epoch,
+        // so the next round's mutation recovery commits the checkpoint without
+        // re-observing the cloud. Only the shared checkpoint waits for the
+        // epoch.
+        if (receipts.length > 0) {
+          const receiptStartedAt = Date.now();
+          const receiptPerfStartedAt = performance.now();
+          await this.state.recordMutationReceipts(receipts);
+          run.metrics.mutationPersistence.stagesMs.receiptPersist +=
+            Date.now() - receiptStartedAt;
+          ctx.receiptMs = performance.now() - receiptPerfStartedAt;
+        }
+        if (this.canContinue(operationEpoch, result)) {
+          // The shared checkpoint owns the row flip on failure (it reverts
+          // every completion before rethrowing).
+          ctx.rowsSettled = true;
+          const checkpointStartedAt = performance.now();
+          checkpointBreakdown = await this.commitDeferredCheckpointBatch(
+            ctx.completions,
+            run,
+            callbacks,
+            operationEpoch,
+            result,
+          );
+          ctx.checkpointMs = performance.now() - checkpointStartedAt;
+          checkpointedOperations = ctx.completions.length;
+        } else {
+          cancelled = true;
+          this.revertDeferredCompletions(
+            ctx.completions,
+            this.t("result.cancelled"),
+            callbacks,
+          );
+          ctx.rowsSettled = true;
+        }
+      } catch (error) {
+        if (!ctx.rowsSettled) {
+          // A receipt write failed before the checkpoint: the rows already
+          // went out, so flip them before the fail-closed rethrow.
+          this.revertDeferredCompletions(
+            ctx.completions,
+            this.failureReason(error),
+            callbacks,
+          );
+          ctx.rowsSettled = true;
+        }
+        throw error;
+      } finally {
+        ctx.commitSettledAt = performance.now();
+        this.diag?.log("execute", "upload batch settled", {
+          batch: ctx.index,
+          files: ctx.batch.length,
+          intents: ctx.intents.length,
+          receipts: receipts.length,
+          checkpointOperations: checkpointedOperations,
+          // Phase decomposition of the batch's fixed cost: the one intent
+          // write, the PUT segment (resident pool), the one receipt write and
+          // the one shared checkpoint. `pauseMs` is the part of the PUT
+          // segment that a 429/509 Retry-After held idle, so it is excluded
+          // from `networkMs`. `intentQueueMs` is how long the intent write
+          // waited behind the previous batch's commit; `overlapped` is the
+          // real-machine proof that this batch's PUTs began before that
+          // commit settled.
+          intentMs: Math.max(0, Math.round(ctx.intentMs)),
+          intentQueueMs: Math.max(0, Math.round(ctx.intentQueueMs)),
+          networkMs: Math.max(0, Math.round(ctx.networkMs)),
+          pauseMs: Math.max(0, Math.round(ctx.pauseMs)),
+          concurrency: run.uploadPolicy.limit,
+          receiptMs: Math.max(0, Math.round(ctx.receiptMs)),
+          checkpointMs: Math.max(0, Math.round(ctx.checkpointMs)),
+          checkpointBreakdown,
+          totalMs: Math.max(0, Math.round(performance.now() - ctx.batchStartedAt)),
+          elapsedMs: Math.max(0, Date.now() - ctx.batchStartedAt),
+          overlapped: ctx.overlapped,
+          cancelled,
+          failed: result.errors > ctx.errorsBefore,
+        });
       }
-      this.diag?.log("execute", "upload batch settled", {
-        files: batch.length,
-        intents: intents.length,
-        receipts: receipts.length,
-        checkpointOperations: checkpointedOperations,
-        // Phase decomposition of the batch's fixed cost: the one intent write,
-        // the PUT segment (resident pool), the one receipt write and the one
-        // shared checkpoint. `pauseMs` is the part of the PUT segment that a
-        // 429/509 Retry-After held idle, so it is excluded from `networkMs`.
-        intentMs: Math.max(0, Math.round(intentMs)),
-        networkMs: Math.max(0, Math.round(networkMs)),
-        pauseMs: Math.max(0, Math.round(pauseMs)),
-        concurrency: run.uploadPolicy.limit,
-        receiptMs: Math.max(0, Math.round(receiptMs)),
-        checkpointMs: Math.max(0, Math.round(checkpointMs)),
-        // The same commit, split into its own phases: the counterpart of the
-        // `v2 commit breakdown` line this batch's checkpoint also logs, carried
-        // here so one row answers "where did checkpointMs go". A batch that
-        // needed the hierarchy-refresh retry reports the attempt that settled;
-        // observation only — nothing below reads it back.
-        checkpointBreakdown,
-        totalMs: Math.max(0, Math.round(performance.now() - batchPerfStartedAt)),
-        elapsedMs: Math.max(0, Date.now() - batchStartedAt),
-        failed: result.errors > batchErrorsBefore,
-      });
+    };
+
+    let previous: UploadBatchContext | null = null;
+    for (let index = 0; index < contexts.length; index++) {
+      if (pipelineError !== null || !this.canContinue(operationEpoch, result)) {
+        break;
+      }
+      const ctx = contexts[index];
+      if (!ctx.intentsWritten) {
+        const queuedAt = performance.now();
+        await enqueueState(async () => {
+          ctx.intentQueueMs = Math.max(0, performance.now() - queuedAt);
+          await beginIntents(ctx);
+        });
+      }
+      if (pipelineError !== null) break;
+      ctx.overlapped = previous !== null && previous.commitSettledAt === 0;
+      await runBatchPool(ctx);
+      if (pipelineError !== null) break;
+      // The next batch's intents must be durable before its first PUT, and
+      // before this batch's receipts/checkpoint so the two overlap. The state
+      // lane runs `intents(N+1) → receipts(N) → checkpoint(N)`.
+      if (index + 1 < contexts.length && this.canContinue(operationEpoch, result)) {
+        const next = contexts[index + 1];
+        if (!next.intentsWritten) {
+          const queuedAt = performance.now();
+          await enqueueState(async () => {
+            next.intentQueueMs = Math.max(0, performance.now() - queuedAt);
+            await beginIntents(next);
+          });
+        }
+      }
+      void enqueueState(async () => commitBatch(ctx));
+      previous = ctx;
+    }
+    // Wait for every queued state task (including a commit whose PUTs were
+    // already in flight when the loop stopped).
+    await stateTail;
+
+    const revertUnsettledRows = (reason: string): void => {
+      for (const ctx of contexts) {
+        if (ctx.rowsSettled) continue;
+        this.revertDeferredCompletions(ctx.completions, reason, callbacks);
+        ctx.rowsSettled = true;
+      }
+    };
+    if (pipelineError !== null) {
+      revertUnsettledRows(this.failureReason(pipelineError));
+      throw pipelineError instanceof Error
+        ? pipelineError
+        : new Error(describeThrownValue(pipelineError));
+    }
+    if (!this.canContinue(operationEpoch, result)) {
+      revertUnsettledRows(this.t("result.cancelled"));
     }
   }
 
@@ -17133,15 +17341,28 @@ export class SyncExecutor {
     // shared checkpoint's independence assertion requires. Folder shells keep
     // their child-first order in Step 5.
     const settledDecisionEntries: Array<{ token: string; path: string }> = [];
+    const cleanupWaveSize = deleteCheckpointWave(this.platform);
+    /** Wave members whose only copy is local (`DeleteLocal`), for the
+     *  wave-scoped remote-absence proof. */
+    const localDeletePathsForWave = (startIndex: number): string[] =>
+      run.cleanupItems
+        .slice(startIndex, startIndex + cleanupWaveSize)
+        .filter((item) => item.type === SyncActionType.DeleteLocal
+          && item.local !== undefined)
+        .map((item) => item.path);
+    /** One-wave lookahead: started after the current wave's DELETE segment and
+     *  awaited at the next wave's start, so the read overlaps the current
+     *  wave's receipts + checkpoint instead of blocking the next erase. */
+    let prefetchedAbsence: Promise<Set<string> | null> | null = null;
     for (
       let index = 0;
       index < run.cleanupItems.length;
-      index += deleteCheckpointWave(this.platform)
+      index += cleanupWaveSize
     ) {
       if (!this.canContinue(operationEpoch, result)) break;
       const wave = run.cleanupItems.slice(
         index,
-        index + deleteCheckpointWave(this.platform),
+        index + cleanupWaveSize,
       );
       // Preflight: no intent write and no DELETE may run for a wave the shared
       // checkpoint would refuse later (see the guard's own comment).
@@ -17176,18 +17397,21 @@ export class SyncExecutor {
        *  already lost them (`DeleteLocal`, see `localDeleteAbsenceProof`).
        *  Only members that will really run are read for: the branch returns
        *  early without one. */
-      const localDeletePaths = wave
-        .filter((item) => item.type === SyncActionType.DeleteLocal
-          && item.local !== undefined)
-        .map((item) => item.path);
+      const localDeletePaths = localDeletePathsForWave(index);
       // One batched absence read for the whole wave, before its first erase:
       // the wave-level proof replaces one metadata GET per file (the per-file
       // fixed cost that kept this path at 186 ms/file on iOS). A failed read
       // returns an empty set, so every member falls back to the ordinary
       // per-file check; the per-file local re-check is untouched either way.
-      const localDeleteAbsent = localDeletePaths.length === 0
-        ? null
-        : await this.verifyRemoteDeleteBatchAbsence(localDeletePaths);
+      // The next wave's read is started below, after this wave's DELETEs, and
+      // overlaps this wave's receipts + checkpoint.
+      if (prefetchedAbsence === null) {
+        prefetchedAbsence = localDeletePaths.length === 0
+          ? Promise.resolve(null)
+          : this.verifyRemoteDeleteBatchAbsence(localDeletePaths);
+      }
+      const localDeleteAbsent = await prefetchedAbsence;
+      prefetchedAbsence = null;
       /** One sample per wave member: the whole `executeSinglePlanItem` call, so
        *  local preparation and the DELETE round trip are both inside. */
       const deleteItemMs: number[] = [];
@@ -17227,24 +17451,52 @@ export class SyncExecutor {
         this.deleteRequestTimingSink = null;
         this.localDeleteAbsenceProof = null;
       }
+      // Start the next wave's absence read now: it overlaps this wave's
+      // receipts, deletion-ledger write and checkpoint. A failed read still
+      // degrades to per-item checks at the next wave.
+      if (this.canContinue(operationEpoch, result)) {
+        const nextLocalDeletePaths = localDeletePathsForWave(
+          index + cleanupWaveSize,
+        );
+        prefetchedAbsence = nextLocalDeletePaths.length === 0
+          ? Promise.resolve(null)
+          : this.verifyRemoteDeleteBatchAbsence(nextLocalDeletePaths);
+      }
       const receipts = handoffs.flatMap((handoff) => handoff.receipts);
       let receiptMs = 0;
+      let ledgerMs = 0;
       if (receipts.length > 0) {
         const receiptStartedAt = Date.now();
         const receiptPerfStartedAt = performance.now();
         try {
-          await this.state.recordMutationReceipts(receipts);
+          // One device-local write for the receipts and the recovery clues.
+          // If it fails, the receipts are the safety-critical half: retry them
+          // alone and only log the lost ledger clues (the per-file clue has
+          // the same contract).
+          await this.state.recordMutationReceiptsAndCloudDeletions(
+            receipts,
+            ledgerSink,
+          );
+        } catch (error) {
+          const ledgerFallbackStartedAt = performance.now();
+          try {
+            await this.state.recordMutationReceipts(receipts);
+          } finally {
+            ledgerMs += performance.now() - ledgerFallbackStartedAt;
+          }
+          if (ledgerSink.length > 0) {
+            this.diag?.warn(
+              "execute",
+              `cloud deletion wave could not be recorded for recovery — ${ledgerSink.length} file(s)`,
+              describeError(error),
+            );
+          }
+        } finally {
           run.metrics.mutationPersistence.stagesMs.receiptPersist +=
             Date.now() - receiptStartedAt;
           receiptMs = performance.now() - receiptPerfStartedAt;
-        } catch (error) {
-          run.metrics.mutationPersistence.stagesMs.receiptPersist +=
-            Date.now() - receiptStartedAt;
-          throw error;
         }
-      }
-      let ledgerMs = 0;
-      if (ledgerSink.length > 0) {
+      } else if (ledgerSink.length > 0) {
         const ledgerPerfStartedAt = performance.now();
         // Same contract as the per-file clue: a failed ledger write must never
         // turn already-applied deletes into failures, so it only logs.
@@ -17886,18 +18138,19 @@ export class SyncExecutor {
     };
   }
 
-  /** Step 3b download window — three-stage pipeline plus a URL lookahead
-   *  (2026-10-27).
+  /** Step 3b download window — transfer lanes plus one commit-group pipeline
+   *  (2026-11-08; the URL lookahead is unchanged from 2026-10-27).
    *
-   *  Only the read-only network stages of independent small downloads
-   *  overlap. Three lanes, each in plan order:
+   *  Only the read-only network stages of independent small downloads overlap.
+   *  The window now has two lanes:
    *
-   *  1. transfer: build the batch, take its URLs from the lookahead, download
-   *               + hash;
-   *  2. verify:   one `$batch` identity re-read for the batch's hashless
-   *               files, then the adaptive-policy observation;
-   *  3. commit:   the batch's per-file `executeSinglePlanItem` — intent, local CAS,
-   *               receipt, checkpoint — strictly serial and in batch order.
+   *  1. transfer: build `downloadPolicy.limit` batches, take their URLs from
+   *               the lookahead, download + hash, append the prepared payloads
+   *               to the open commit group;
+   *  2. group:    one `$batch` identity re-read for the group's hashless
+   *               files, the adaptive-policy observation replayed per source
+   *               transfer batch, then one intent write, one receipt write and
+   *               one V2 checkpoint for the whole group.
    *
    *  The URL lookahead (`startDownloadUrlLookahead` below) replaced the
    *  up-front refresh of every missing `downloadUrl` (P1): that call made
@@ -17908,39 +18161,42 @@ export class SyncExecutor {
    *  a batch waits only for the chunk that covers it, so content downloads and
    *  the remaining URL chunks overlap.
    *
-   *  Batch N's verify and its local commits therefore run while batch N+1's
+   *  A group's verify and local commits therefore run while the next group's
    *  content is already transferring and hashing; the row for a file still
-   *  appears from its own commit as soon as its batch verified, never after
-   *  the next batch. SC-15 is unchanged: the commit lane is the only state
-   *  writer, so two batches' checkpoints cannot interleave, `commitSeq` keeps
+   *  appears from its own commit as soon as its group verified, never after
+   *  the next group. SC-15 is unchanged: the group lane is the only state
+   *  writer, so groups' checkpoints cannot interleave, `commitSeq` keeps
    *  advancing in order, and every checkpoint stays behind its own receipts.
    *  Failure semantics are unchanged: a transfer error rides in the prepared
    *  slot, an eTag drift still fails that item closed with
-   *  `DownloadRemoteVersionChangedError`, and neighbouring batches keep their
+   *  `DownloadRemoteVersionChangedError`, and neighbouring groups keep their
    *  own outcomes. A member that cannot be prefetched (large file, rename,
-   *  bundle) is a barrier: both lanes drain first, so only the read-only
+   *  bundle) is a barrier: the group lane drains first, so only the read-only
    *  small-file stage is ever concurrent.
    */
   private async runDownloadWindow(args: {
+    plan: SyncPlan;
     result: SyncResult;
+    callbacks: SyncCallbacks;
     operationEpoch: number;
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+    run: ExecutionPhaseState;
     downloads: SyncPlanItem[];
     downloadPolicy: DownloadConcurrencyPolicy;
-    executePlanItem: (
-      item: SyncPlanItem,
-      preparedDownload?: PreparedDownload,
-    ) => Promise<DeferredMutationCompletion | undefined>;
     preparedCommunityPluginDownloads: Awaited<
       ReturnType<SyncExecutor["prepareCommunityPluginBundleDownloads"]>
     >;
     metrics: ExecutionMetrics;
   }): Promise<void> {
     const {
+      plan,
       result,
+      callbacks,
       operationEpoch,
+      automaticHandlingPolicy,
+      run,
       downloads,
       downloadPolicy,
-      executePlanItem,
       preparedCommunityPluginDownloads,
       metrics,
     } = args;
@@ -17963,127 +18219,193 @@ export class SyncExecutor {
       : null;
     let downloadIndex = 0;
 
-    // Pipeline bookkeeping. Neither tail rejects: a lane failure is parked in
-    // `pipelineError`, the producer stops handing off batches, and the window
-    // rethrows it only after every handed-off batch has settled (no dangling
-    // transfer, state write or unhandled rejection).
+    // Commit-group bookkeeping (2026-11-08). The transfer lane keeps forming
+    // `downloadPolicy.limit` batches; prepared batches append to one open
+    // commit group. When the group reaches the persistence batch (8/4) or its
+    // byte cap it is handed to the serial group lane, and the next transfer
+    // batch may start while the previous group verifies + commits. At most one
+    // group is pending plus the open one, preserving the old 2-batch memory
+    // bound. A group failure is parked in `groupError`; the producer stops and
+    // the window rethrows only after every handed-off group settled (no
+    // dangling transfer, state write or unhandled rejection).
     let verifyTail: Promise<void> = Promise.resolve();
     let commitTail: Promise<void> = Promise.resolve();
-    let pipelineError: unknown = null;
-    /** Handed-off batches not yet committed, oldest first. This is the
-     *  backpressure gate that keeps at most
-     *  {@link DOWNLOAD_PIPELINE_IN_FLIGHT_BATCHES} prepared payloads alive. */
-    const pendingBatches: Promise<void>[] = [];
+    let groupError: unknown = null;
+    const pendingGroups: Promise<void>[] = [];
+    const verifyBatchSize = DOWNLOAD_VERIFY_BATCH_SIZE;
+    const commitBatchSize = downloadCommitBatch(this.platform);
+    const commitByteLimit = downloadCommitGroupBytes(this.platform);
+    const createOpenGroup = (): DownloadCommitGroup => ({
+      items: [],
+      prepared: [],
+      transferBatches: [],
+      bytes: 0,
+      openedAt: performance.now(),
+    });
+    let openGroup: DownloadCommitGroup = createOpenGroup();
 
-    const commitPreparedBatch = async (
-      batch: SyncPlanItem[],
-      prepared: PreparedDownload[],
-    ): Promise<void> => {
-      if (!this.canContinue(operationEpoch, result)) {
-        // Same accounting as the former post-prefetch cancellation gate: a
-        // prepared batch that never commits counts as cancelled exactly once,
-        // and its files report nothing (they were not attempted).
-        metrics.fileTransfers.download.cancelled += batch.length;
-        return;
-      }
-      for (let index = 0; index < batch.length; index++) {
-        if (!this.canContinue(operationEpoch, result)) break;
-        await executePlanItem(batch[index], prepared[index]);
-      }
+    const awaitOldestGroup = async (): Promise<void> => {
+      const oldest = pendingGroups.shift();
+      if (oldest) await oldest;
     };
 
-    const handOffPreparedBatch = (
-      batch: SyncPlanItem[],
-      prepared: PreparedDownload[],
-      batchStartedAt: number,
-      preparedAt: number,
-      batchTransferMs: number,
-      shouldBatchVersionVerification: boolean,
-    ): void => {
-      // Capture the tails this batch must respect; later hand-offs append to
-      // them, so reading the fields inside a deferred callback would chain a
-      // batch behind its successors.
+    /** Close the open group when it is full (or forced at a barrier / window
+     *  end). Waiting for the previous group before handing off the new one is
+     *  the backpressure: the transfer lane then runs beside exactly one
+     *  committing group. */
+    const flushGroup = async (force: boolean): Promise<void> => {
+      if (groupError !== null) return;
+      if (openGroup.items.length === 0) return;
+      if (
+        !force
+        && openGroup.items.length < verifyBatchSize
+        && openGroup.bytes < commitByteLimit
+      ) return;
+      if (pendingGroups.length >= DOWNLOAD_PIPELINE_IN_FLIGHT_GROUPS) {
+        await awaitOldestGroup();
+      }
+      if (groupError !== null) return;
+      const group = openGroup;
+      openGroup = createOpenGroup();
+      // Verify lane and commit lane are separate: verify group N+1 may run
+      // while group N's persistence slices commit. Commits stay serial in
+      // plan order; the transfer lane keeps filling the next verify group.
       const previousVerify = verifyTail;
       const previousCommit = commitTail;
       const verified = previousVerify.then(async () => {
-        if (pipelineError !== null) return;
-        await this.verifyDownloadBatchAfterTransfer({
-          batch,
-          prepared,
+        if (groupError !== null) return;
+        await this.verifyDownloadGroup({
+          group,
           metadataBatchClient,
-          shouldBatchVersionVerification,
+          canBatchMetadata,
           downloadPolicy,
           metrics,
-          batchStartedAt,
-          preparedAt,
-          verifyStartedAt: Date.now(),
-          batchTransferMs,
         });
       });
       verifyTail = verified.catch((error) => {
-        pipelineError ??= error;
+        groupError ??= error;
       });
       const committed = verified
         .then(() => previousCommit)
         .then(async () => {
-          if (pipelineError !== null) return;
-          await commitPreparedBatch(batch, prepared);
+          if (groupError !== null) return;
+          // One verify group can span several persistence groups: commit the
+          // approved 8/4 slices in order, with the same intent/receipt/
+          // checkpoint contract as before.
+          for (
+            let offset = 0;
+            offset < group.items.length;
+            offset += commitBatchSize
+          ) {
+            await this.commitVerifiedDownloadGroup({
+              plan,
+              result,
+              callbacks,
+              operationEpoch,
+              automaticHandlingPolicy,
+              run,
+              items: group.items.slice(offset, offset + commitBatchSize),
+              prepared: group.prepared.slice(offset, offset + commitBatchSize),
+              metrics,
+            });
+          }
         })
         .catch((error) => {
-          pipelineError ??= error;
+          groupError ??= error;
         });
       commitTail = committed;
-      pendingBatches.push(committed);
+      pendingGroups.push(committed);
     };
 
-    const awaitOldestPreparedBatch = async (): Promise<void> => {
-      const oldest = pendingBatches.shift();
-      if (oldest) await oldest;
-    };
-    /** Barrier / window end: wait until every handed-off batch committed (or
-     *  failed) so a non-prefetchable member never runs beside a pipeline
-     *  commit and the caller only sees a settled window. */
-    const drainPreparedBatches = async (): Promise<void> => {
-      while (pendingBatches.length > 0) await awaitOldestPreparedBatch();
+    /** Barrier / window end: settle every prepared group so a non-prefetchable
+     *  member never runs beside a group commit and the caller sees a settled
+     *  window. */
+    const drainGroups = async (): Promise<void> => {
+      await flushGroup(true);
+      while (pendingGroups.length > 0) await awaitOldestGroup();
+      await verifyTail;
+      await commitTail;
     };
 
     while (downloadIndex < downloads.length && this.canContinue(operationEpoch, result)) {
-      if (pipelineError !== null) break;
+      if (groupError !== null) break;
       const first = downloads[downloadIndex];
       const preparedCommunityPluginDownload =
         preparedCommunityPluginDownloads.get(first.path);
       if (preparedCommunityPluginDownload) {
         // Not a pipeline member: the bundle bytes are already in memory and
         // its commit is one local write. Run it in plan order, alone.
-        await drainPreparedBatches();
-        if (pipelineError !== null) break;
-        await executePlanItem(first, preparedCommunityPluginDownload);
+        await drainGroups();
+        if (groupError !== null) break;
+        await this.executeSinglePlanItem(
+          plan,
+          result,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          run,
+          first,
+          preparedCommunityPluginDownload,
+        );
         downloadIndex++;
         continue;
       }
       const eligible = await this.canPrefetchDownload(first);
       if (!eligible) {
-        await drainPreparedBatches();
-        if (pipelineError !== null) break;
+        await drainGroups();
+        if (groupError !== null) break;
         // A non-prefetchable member (large file, rename/move) still downloads
         // from the lookahead's batched URL instead of its own waterfall.
         await downloadUrlLookahead?.awaitCoverage([first]);
-        await executePlanItem(first);
+        await this.executeSinglePlanItem(
+          plan,
+          result,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          run,
+          first,
+        );
         downloadIndex++;
         continue;
       }
 
-      if (pendingBatches.length >= DOWNLOAD_PIPELINE_IN_FLIGHT_BATCHES) {
-        await awaitOldestPreparedBatch();
-        if (pipelineError !== null || !this.canContinue(operationEpoch, result)) break;
-      }
+      // The commit-group backpressure lives in `flushGroup`: while one group
+      // commits, the next group's transfers continue; a full group waits for
+      // the previous commit before it is handed off. No separate batch gate.
 
+      // Cap this transfer batch by the open group's remaining capacity so a
+      // 7-item group cannot overshoot the 8/4 persistence batch by a whole
+      // transfer wave. The byte stop keeps the group near its memory cap; the
+      // first item always enters (a single oversized file is its own group).
+      const remainingGroupItems = Math.max(
+        1,
+        commitBatchSize - openGroup.items.length,
+      );
+      const remainingGroupBytes = Math.max(
+        0,
+        commitByteLimit - openGroup.bytes,
+      );
+      const transferBatchLimit = Math.min(
+        downloadPolicy.limit,
+        remainingGroupItems,
+      );
+      let plannedBatchBytes = first.remote?.size ?? 0;
       const batch: SyncPlanItem[] = [first];
       downloadIndex++;
-      while (downloadIndex < downloads.length && batch.length < downloadPolicy.limit) {
+      while (
+        downloadIndex < downloads.length
+        && batch.length < transferBatchLimit
+      ) {
         const candidate = downloads[downloadIndex];
+        const candidateBytes = candidate.remote?.size ?? 0;
+        if (
+          batch.length >= 1
+          && plannedBatchBytes + candidateBytes > remainingGroupBytes
+        ) break;
         if (!await this.canPrefetchDownload(candidate)) break;
         batch.push(candidate);
+        plannedBatchBytes += candidateBytes;
         downloadIndex++;
       }
 
@@ -18195,97 +18517,364 @@ export class SyncExecutor {
           );
         }
       }));
-      // Hand the prepared payload to the batch-ordered verify lane and return
-      // to stage 1 at once: the next batch's transfers now run beside this
-      // batch's `$batch` check and its serial local commits.
-      handOffPreparedBatch(
+      // Observed immediately after this transfer batch, before the group's
+      // verify lane: the adaptive policy must be able to ramp while the group
+      // is still filling (the old per-batch pipeline observed at the same
+      // point). A verification failure discovered later re-observes the batch
+      // with `failed: true` and locks the direction to serial.
+      const preparedAt = Date.now();
+      const preparedBytes = prepared.reduce(
+        (sum, item) => sum + (item.downloaded?.size ?? 0),
+        0,
+      );
+      const transferFailed = prepared.some((item) => item.error !== undefined);
+      const observationElapsedMs = Math.max(0, preparedAt - batchStartedAt);
+      downloadPolicy.observeBatch({
+        files: prepared.length,
+        bytes: preparedBytes,
+        elapsedMs: observationElapsedMs,
+        transferMs: batchTransferMs,
+        failed: transferFailed,
+        degradedPath: this.onedrive.hasDegradedDownloadPathThisRound(),
+      });
+      this.diag?.log("execute", "adaptive download batch", {
+        schemaVersion: 1,
+        files: batch.length,
+        bytes: preparedBytes,
+        elapsedMs: observationElapsedMs,
+        transferMs: Math.max(0, batchTransferMs),
+        failed: transferFailed,
+        nextConcurrency: downloadPolicy.limit,
+        lockedSerial: downloadPolicy.isLockedSerial,
+        preparedMs: observationElapsedMs,
+        verifyMs: 0,
+        verifyQueueMs: 0,
+      });
+      const errorCountBeforeVerify = prepared.filter(
+        (item) => item.error !== undefined,
+      ).length;
+      // Append this transfer batch's prepared payloads to the open commit
+      // group and return to stage 1 at once. When the group is full it is
+      // handed to the serial group lane, so the next batch's transfers run
+      // beside the previous group's `$batch` check and local commits.
+      openGroup.items.push(...batch);
+      openGroup.prepared.push(...prepared);
+      openGroup.transferBatches.push({
         batch,
         prepared,
         batchStartedAt,
-        Date.now(),
+        preparedAt,
         batchTransferMs,
         shouldBatchVersionVerification,
-      );
+        errorCountBeforeVerify,
+      });
+      openGroup.bytes += preparedBytes;
+      await flushGroup(false);
     }
-    await drainPreparedBatches();
+    await drainGroups();
+    if (groupError !== null && openGroup.items.length > 0) {
+      // The window stopped before this open group reached the lane: its files
+      // were prefetched but never attempted, so they count as cancelled
+      // exactly once (the old post-prefetch cancellation gate).
+      metrics.fileTransfers.download.cancelled += openGroup.items.length;
+      openGroup = createOpenGroup();
+    }
     // A normally completed window consumed every chunk, so settling the
     // lookahead here is a no-op guard that no URL read outlives the window. A
     // failed or cancelled window deliberately does not queue behind it: the
     // read is tied to the run's abort signal, and an error must not wait for a
     // slow metadata request. Nothing durable is written there — only plan
     // items and log lines.
-    if (pipelineError === null && this.canContinue(operationEpoch, result)) {
+    if (groupError === null && this.canContinue(operationEpoch, result)) {
       await downloadUrlLookahead?.drain();
     }
-    if (pipelineError !== null) {
-      throw pipelineError instanceof Error
-        ? pipelineError
-        : new Error(describeThrownValue(pipelineError));
+    if (groupError !== null) {
+      throw groupError instanceof Error
+        ? groupError
+        : new Error(describeThrownValue(groupError));
     }
   }
 
-  /** Stage 2 of the download pipeline: one batch's post-transfer version
-   *  check plus its adaptive-policy observation.
-   *
-   *  The check itself is the pre-pipeline block verbatim: every file without a
-   *  Graph SHA-256 is re-read by driveId through one `$batch` (the client's own
-   *  per-item fallback included), a missing item or eTag drift replaces that
-   *  item's prepared slot with `DownloadRemoteVersionChangedError`, and the
-   *  payload gate (`verifyDownloadedPayload`) still runs per file. `prepared`
-   *  is mutated in place; the commit lane reads the result. Nothing here writes
-   *  durable state, so it may overlap the previous batch's commits.
-   */
-  private async verifyDownloadBatchAfterTransfer(args: {
-    batch: SyncPlanItem[];
-    prepared: PreparedDownload[];
+  /** Stage 2 of the download window: one `$batch` identity re-read for the
+   *  whole verify group's hashless files, then the adaptive-policy failure
+   *  observation per source transfer batch. Read-only; the commit lane below
+   *  persists the approved 8/4 slices. */
+  private async verifyDownloadGroup(args: {
+    group: DownloadCommitGroup;
     metadataBatchClient: ((
       driveItemIds: readonly string[],
       metadataReason?: OneDriveMetadataReason,
     ) => Promise<Map<string, DriveItem | null>>) | null;
-    shouldBatchVersionVerification: boolean;
+    canBatchMetadata: boolean;
     downloadPolicy: DownloadConcurrencyPolicy;
     metrics: ExecutionMetrics;
-    /** Wall clock when stage 1 began preparing this batch. */
-    batchStartedAt: number;
-    /** Wall clock when stage 1 finished (transfer + hash, before this lane). */
-    preparedAt: number;
-    /** Wall clock when this lane actually began the batch's check. */
-    verifyStartedAt: number;
-    batchTransferMs: number;
-  }): Promise<void> {
+  }): Promise<number> {
     const {
-      batch,
-      prepared,
+      group,
       metadataBatchClient,
-      shouldBatchVersionVerification,
+      canBatchMetadata,
       downloadPolicy,
       metrics,
-      batchStartedAt,
-      preparedAt,
-      verifyStartedAt,
-      batchTransferMs,
     } = args;
-    const hashlessVerificationIndexes = prepared.flatMap((preparedItem, index) =>
-      preparedItem.error === undefined
-        && preparedItem.downloaded
-        && !batch[index].remote?.sha256Hash
-        ? [index]
-        : []
+    const verifyStartedAt = performance.now();
+    const remoteVerifyMs = await this.verifyDownloadGroupAfterTransfer({
+      group,
+      metadataBatchClient,
+      canBatchMetadata,
+      metrics,
+    });
+    // The transfer-time observation already ran before this group reached the
+    // lane (so the adaptive policy can ramp while the group fills). A
+    // verification failure is the only new evidence here: re-observe only the
+    // source batch that gained failures, with `failed: true`, so the direction
+    // locks to serial exactly like a failed transfer batch.
+    for (const transferBatch of group.transferBatches) {
+      const errorCountAfterVerify = transferBatch.prepared.filter(
+        (item) => item.error !== undefined,
+      ).length;
+      if (errorCountAfterVerify <= transferBatch.errorCountBeforeVerify) {
+        continue;
+      }
+      downloadPolicy.observeBatch({
+        files: transferBatch.prepared.length,
+        bytes: transferBatch.prepared.reduce(
+          (sum, item) => sum + (item.downloaded?.size ?? 0),
+          0,
+        ),
+        elapsedMs: 0,
+        transferMs: transferBatch.batchTransferMs,
+        failed: true,
+        // Required member of OneDriveClient: a rename here fails type-check
+        // instead of silently disabling the degraded-path lock.
+        degradedPath: this.onedrive.hasDegradedDownloadPathThisRound(),
+      });
+      this.diag?.log("execute", "download verify failure locked serial", {
+        schemaVersion: 1,
+        files: transferBatch.prepared.length,
+        verifyFailures: errorCountAfterVerify
+          - transferBatch.errorCountBeforeVerify,
+        nextConcurrency: downloadPolicy.limit,
+      });
+    }
+    this.diag?.log("execute", "download verify batch", {
+      files: group.items.length,
+      transferBatches: group.transferBatches.length,
+      verifyMs: Math.max(0, Math.round(remoteVerifyMs)),
+      failed: group.prepared.some((item) => item.error !== undefined),
+      nextConcurrency: downloadPolicy.limit,
+      totalMs: Math.max(0, Math.round(performance.now() - verifyStartedAt)),
+    });
+    return remoteVerifyMs;
+  }
+
+  /** Stage 3 of the download window: persist one verified group of at most
+   *  8/4 items as one intent write, one receipt write and one V2 checkpoint.
+   *
+   *  SC-15 is unchanged: every intent is durable before the group's first
+   *  local write, the group's receipts are durable before its checkpoint, and
+   *  a file whose transfer/verify failed never gets an intent (its prepared
+   *  slot carries the error into its own failure exit). The local writes stay
+   *  strictly serial on the commit lane. */
+  private async commitVerifiedDownloadGroup(args: {
+    plan: SyncPlan;
+    result: SyncResult;
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+    run: ExecutionPhaseState;
+    items: SyncPlanItem[];
+    prepared: PreparedDownload[];
+    metrics: ExecutionMetrics;
+  }): Promise<void> {
+    const {
+      plan,
+      result,
+      callbacks,
+      operationEpoch,
+      automaticHandlingPolicy,
+      run,
+      items,
+      prepared,
+      metrics,
+    } = args;
+    const groupPerfStartedAt = performance.now();
+    if (!this.canContinue(operationEpoch, result)) {
+      // Same accounting as the former post-prefetch cancellation gate: a
+      // prepared group that never commits counts as cancelled exactly once,
+      // and its files report nothing (they were not attempted).
+      metrics.fileTransfers.download.cancelled += items.length;
+      return;
+    }
+
+    // Batch intents first: the whole group is durable before its first local
+    // write. A prepared transfer/verify error never gets an intent, exactly
+    // like the upload pool's preflight-blocked members; that member still
+    // runs through its own failure exit below.
+    const handoffs: CleanupWaveHandoff[] = [];
+    const intents: MutationIntent[] = [];
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      const itemPrepared = prepared[index];
+      const blockedBeforeMutation = itemPrepared.error !== undefined;
+      const intent = !blockedBeforeMutation
+        && plan.scope
+        && isMutationAction(item.type)
+        && !item.requiresConfirmation
+        ? this.createMutationIntent(item, plan.scope)
+        : null;
+      if (intent) intents.push(intent);
+      handoffs.push({ intent, receipts: [] });
+    }
+    const intentStartedAt = Date.now();
+    const intentPerfStartedAt = performance.now();
+    await this.state.beginMutationIntents(intents);
+    const intentMs = performance.now() - intentPerfStartedAt;
+    run.metrics.mutationPersistence.intentWrites += intents.length;
+    run.metrics.mutationPersistence.stagesMs.intentPersist +=
+      Date.now() - intentStartedAt;
+
+    const completions: DeferredMutationCompletion[] = [];
+    const executeStartedAt = performance.now();
+    for (let index = 0; index < items.length; index++) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      const completion = await this.executeSinglePlanItem(
+        plan,
+        result,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        run,
+        items[index],
+        prepared[index],
+        handoffs[index],
+      );
+      if (completion) completions.push(completion);
+    }
+    const executeMs = performance.now() - executeStartedAt;
+
+    // Receipts stay durable even when the round was cancelled inside the
+    // group (the per-item path also writes before checking the epoch); only
+    // the shared checkpoint waits for the epoch.
+    const receipts = handoffs.flatMap((handoff) => handoff.receipts);
+    let receiptMs = 0;
+    if (receipts.length > 0) {
+      const receiptStartedAt = Date.now();
+      const receiptPerfStartedAt = performance.now();
+      // One bounded retry, mirroring the per-item path's receipt recovery: a
+      // whole-body state write can lose a race with another device's commit,
+      // and the receipt is the evidence the checkpoint needs. The retry is
+      // idempotent (same operationIds, same intents).
+      let receiptError: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await this.state.recordMutationReceipts(receipts);
+          receiptError = undefined;
+          break;
+        } catch (error) {
+          receiptError = error;
+          this.diag?.warn(
+            "state",
+            `download receipt batch attempt ${attempt + 1} failed`,
+            { files: receipts.length, error: describeError(error) },
+          );
+        }
+      }
+      if (receiptError !== undefined) {
+        // The rows already went out as each local write settled; a failed
+        // receipt write means they are not durable, so flip them before the
+        // fail-closed rethrow (same rule as a failed checkpoint).
+        this.revertDeferredCompletions(
+          completions,
+          this.failureReason(receiptError),
+          callbacks,
+        );
+        throw receiptError instanceof Error
+          ? receiptError
+          : new Error(describeThrownValue(receiptError));
+      }
+      receiptMs = performance.now() - receiptPerfStartedAt;
+      run.metrics.mutationPersistence.stagesMs.receiptPersist +=
+        Date.now() - receiptStartedAt;
+    }
+
+    let checkpointMs = 0;
+    let checkpointBreakdown: V2CommitBreakdown | undefined;
+    if (this.canContinue(operationEpoch, result)) {
+      const checkpointStartedAt = performance.now();
+      checkpointBreakdown = await this.commitDeferredCheckpointBatch(
+        completions,
+        run,
+        callbacks,
+        operationEpoch,
+        result,
+      );
+      checkpointMs = performance.now() - checkpointStartedAt;
+    } else if (completions.length > 0) {
+      this.revertDeferredCompletions(
+        completions,
+        this.t("result.cancelled"),
+        callbacks,
+      );
+    }
+
+    this.diag?.log("execute", "download batch settled", {
+      files: items.length,
+      intents: intents.length,
+      receipts: receipts.length,
+      checkpointOperations: completions.length,
+      transferBatches: 0,
+      intentMs: Math.max(0, Math.round(intentMs)),
+      verifyMs: 0,
+      executeMs: Math.max(0, Math.round(executeMs)),
+      receiptMs: Math.max(0, Math.round(receiptMs)),
+      checkpointMs: Math.max(0, Math.round(checkpointMs)),
+      checkpointBreakdown,
+      totalMs: Math.max(0, Math.round(performance.now() - groupPerfStartedAt)),
+      failed: prepared.some((item) => item.error !== undefined),
+    });
+  }
+
+  /** One `$batch` identity re-read for the whole commit group's hashless
+   *  files, then the per-file payload gate. A missing item or eTag drift
+   *  marks that file's prepared slot failed with
+   *  `DownloadRemoteVersionChangedError`; a failed batch call marks every
+   *  hashless slot failed. Nothing here writes durable state. Returns the
+   *  check's own wall clock so the policy observation can attribute it. */
+  private async verifyDownloadGroupAfterTransfer(args: {
+    group: DownloadCommitGroup;
+    metadataBatchClient: ((
+      driveItemIds: readonly string[],
+      metadataReason?: OneDriveMetadataReason,
+    ) => Promise<Map<string, DriveItem | null>>) | null;
+    canBatchMetadata: boolean;
+    metrics: ExecutionMetrics;
+  }): Promise<number> {
+    const { group, metadataBatchClient, canBatchMetadata, metrics } = args;
+    const prepared = group.prepared;
+    const hashlessVerificationIndexes = prepared.flatMap(
+      (preparedItem, index) =>
+        preparedItem.error === undefined
+          && preparedItem.downloaded
+          && !group.items[index].remote?.sha256Hash
+          ? [index]
+          : [],
     );
     let remoteVerifyMs = 0;
     if (
       metadataBatchClient
-      && shouldBatchVersionVerification
+      && canBatchMetadata
       && hashlessVerificationIndexes.length > 0
     ) {
       const remoteVerifyStartedAt = Date.now();
       try {
         const currentById = await metadataBatchClient(
-          hashlessVerificationIndexes.map((index) => batch[index].remote!.driveId),
+          hashlessVerificationIndexes.map(
+            (index) => group.items[index].remote!.driveId,
+          ),
           "downloadVersionVerify",
         );
         for (const index of hashlessVerificationIndexes) {
-          const item = batch[index];
+          const item = group.items[index];
           const current = currentById.get(item.remote!.driveId);
           try {
             if (!refreshedMetadataMatchesIdentity(current, item.remote!.driveId, item.remote!.eTag)) {
@@ -18298,12 +18887,15 @@ export class SyncExecutor {
               true,
             );
           } catch (error) {
-            prepared[index] = { error };
+            // Mutate the existing slot instead of replacing it: the same
+            // object is referenced by the group's source transfer batch, and
+            // that batch's failure flag is what the adaptive policy reads.
+            prepared[index].error = error;
           }
         }
       } catch (error) {
         for (const index of hashlessVerificationIndexes) {
-          prepared[index] = { error };
+          prepared[index].error = error;
         }
       } finally {
         remoteVerifyMs = Date.now() - remoteVerifyStartedAt;
@@ -18311,43 +18903,7 @@ export class SyncExecutor {
           remoteVerifyMs;
       }
     }
-    const failed = prepared.some((item) => item.error !== undefined);
-    const downloadedBytes = prepared.reduce(
-      (sum, item) => sum + (item.downloaded?.size ?? 0),
-      0,
-    );
-    // Keep the pre-pipeline meaning of the batch wall clock: preparation up to
-    // the hand-off plus this check. The wait behind an earlier batch's check is
-    // pipeline queueing, not batch cost, and must not read as a slow link.
-    const elapsedMs = Math.max(0, preparedAt - batchStartedAt) + remoteVerifyMs;
-    downloadPolicy.observeBatch({
-      files: prepared.length,
-      bytes: downloadedBytes,
-      elapsedMs,
-      transferMs: batchTransferMs,
-      failed,
-      // Required member of OneDriveClient: a rename here fails type-check
-      // instead of silently disabling the degraded-path lock.
-      degradedPath: this.onedrive.hasDegradedDownloadPathThisRound(),
-    });
-    this.diag?.log("execute", "adaptive download batch", {
-      schemaVersion: 1,
-      files: batch.length,
-      bytes: downloadedBytes,
-      elapsedMs: Math.max(0, elapsedMs),
-      transferMs: Math.max(0, batchTransferMs),
-      failed,
-      nextConcurrency: downloadPolicy.limit,
-      lockedSerial: downloadPolicy.isLockedSerial,
-      // Pipeline observation only (nothing reads these back): stage-1 wall,
-      // the check's own wall, and how long the check queued behind the
-      // previous batch. A non-zero queue is the expected real-machine proof
-      // that stage 1 ran ahead — the next batch's downloads overlapped this
-      // check instead of waiting for it.
-      preparedMs: Math.max(0, preparedAt - batchStartedAt),
-      verifyMs: Math.max(0, remoteVerifyMs),
-      verifyQueueMs: Math.max(0, verifyStartedAt - preparedAt),
-    });
+    return remoteVerifyMs;
   }
 
   /** Reconcile every durable mutation record before reading a cursor or planning. */
@@ -22392,8 +22948,8 @@ export class SyncExecutor {
     remote: RemoteFileEntry,
     expected: BaseFileEntry,
   ): Promise<boolean> {
-    const adapter = this.scanner.vault.adapter as StreamDownloadAdapter;
-    if (typeof adapter.rename !== "function") return false;
+    // rename 自宿主 1.12.3 起必有，minAppVersion 1.13.4 下不再探测。
+    const adapter = this.scanner.vault.adapter;
     const readyPath = `${this.getDownloadTempPath(path)}.receipt-ready`;
     await this.ensureParentDirs(readyPath);
     await this.removePathIfExists(readyPath);
@@ -23369,10 +23925,8 @@ export class SyncExecutor {
     target: { hash: string; size: number },
     payload: ArrayBuffer,
   ): Promise<void> {
-    const adapter = this.scanner.vault.adapter as StreamDownloadAdapter;
-    if (typeof adapter.rename !== "function") {
-      throw new Error(`Local adapter cannot commit a merged file safely: ${path}`);
-    }
+    // rename 自宿主 1.12.3 起必有，minAppVersion 1.13.4 下不再探测。
+    const adapter = this.scanner.vault.adapter;
     const readyPath = `${this.getDownloadTempPath(path)}.merge-ready`;
     await this.ensureParentDirs(readyPath);
     await this.removePathIfExists(readyPath);
@@ -24646,6 +25200,7 @@ export class SyncExecutor {
   private async publishHealthyCloudBootstrapV2(
     operationEpoch: number,
   ): Promise<void> {
+    const startedAt = Date.now();
     const state = this.state as StateManager & {
       getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
       hasV2RecoveryJournal?: StateManager["hasV2RecoveryJournal"];
@@ -24718,20 +25273,57 @@ export class SyncExecutor {
         this.diag?.log(
           "state",
           `V2 cloud bootstrap published revision ${result.revision}`,
+          { elapsedMs: Math.max(0, Date.now() - startedAt) },
         );
       } else if (result.dirty) {
         this.diag?.warn(
           "state",
           `V2 cloud bootstrap remains dirty: ${result.reason ?? "unknown"}`,
+          {
+            elapsedMs: Math.max(0, Date.now() - startedAt),
+            mutations: 0,
+          },
         );
       }
     } catch (error) {
       this.diag?.warn(
         "state",
         "V2 cloud bootstrap publication deferred",
-        describeError(error),
+        {
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+          error: describeError(error),
+          mutations: 0,
+        },
       );
     }
+  }
+
+  /**
+   * Run the healthy-round cloud bootstrap publication off the round's critical
+   * path.
+   *
+   * The bootstrap object is a non-authoritative recovery hint derived from the
+   * already committed envelope: a missed publication only costs the next cold
+   * start one more observation, and the existing code already treats a failed
+   * publication as "deferred". Publishing it before returning therefore made
+   * every content-changing round wait two Graph round trips after the last
+   * file (measured 2.9–4.9 s on the test vault) for a hint no local authority
+   * depends on. Chaining keeps a single writer, and `settleBackgroundTasks()`
+   * closes the window before a reset invalidates the state it was derived
+   * from; a following round is never blocked by it.
+   */
+  private scheduleHealthyCloudBootstrapPublication(
+    operationEpoch: number,
+  ): void {
+    const task = this.backgroundTail
+      .catch(() => undefined)
+      .then(() => this.publishHealthyCloudBootstrapV2(operationEpoch));
+    this.backgroundTail = task.catch(() => undefined);
+  }
+
+  /** Await work the previous round left off its critical path. */
+  async settleBackgroundTasks(): Promise<void> {
+    await this.backgroundTail;
   }
 
   private async persistSeededBaseEntries(entries: BaseFileEntry[]): Promise<void> {
@@ -32198,15 +32790,36 @@ export class SyncExecutor {
     // The receipt is written even when the wave was cancelled: the per-item
     // path also records it before checking the epoch, and the next round's
     // mutation recovery can then commit the checkpoint without re-reading the
-    // (already erased) local file.
+    // (already erased) local file. Receipts and deletion clues share one
+    // device-local write; a failed combined write retries the receipt half
+    // alone so a ledger-only failure stays non-fatal.
     let receiptMs = 0;
+    let ledgerMs = 0;
     if (receipts.length > 0) {
       const receiptStartedAt = performance.now();
-      await this.state.recordMutationReceipts(receipts);
-      receiptMs = performance.now() - receiptStartedAt;
-    }
-    let ledgerMs = 0;
-    if (ledgerSink.length > 0) {
+      try {
+        await this.state.recordMutationReceiptsAndCloudDeletions(
+          receipts,
+          ledgerSink,
+        );
+      } catch (error) {
+        const ledgerFallbackStartedAt = performance.now();
+        try {
+          await this.state.recordMutationReceipts(receipts);
+        } finally {
+          ledgerMs += performance.now() - ledgerFallbackStartedAt;
+        }
+        if (ledgerSink.length > 0) {
+          this.diag?.warn(
+            "execute",
+            `confirm delete wave could not record ${ledgerSink.length} deletion clue(s)`,
+            describeError(error),
+          );
+        }
+      } finally {
+        receiptMs = performance.now() - receiptStartedAt;
+      }
+    } else if (ledgerSink.length > 0) {
       const ledgerStartedAt = performance.now();
       // Same contract as the per-file clue: a failed ledger write must never
       // turn already-applied deletes into failures, so it only logs.

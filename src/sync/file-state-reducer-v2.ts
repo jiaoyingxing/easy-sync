@@ -401,6 +401,159 @@ export function reduceFileStateEnvelopeV2Deletions(
 }
 
 /**
+ * Batched V2 file reducer for a checkpoint of independent ordinary-file
+ * upserts (uploads and downloads, 2026-11-08).
+ *
+ * Every ledger entry must be a plain `upload`/`download` receipt that only
+ * upserts its own path: no source move, no state effect, no remote/base
+ * deletion, no folder rows and no pending-row removals. Those shapes are
+ * exactly what the upload pool and the download commit group produce; any
+ * other receipt returns `null` so the caller keeps the one-record-at-a-time
+ * reducer.
+ *
+ * One projection, one anchor sweep and one validation replace N full-vault
+ * reduces. The per-record reducer is O(vault) per call; batching a group of
+ * eight downloads spent 500 ms in validation alone on the desktop field
+ * state. The final envelope is the same logical state (remote index, anchors,
+ * base view); the batch advances `commitSeq` by one, exactly like the existing
+ * batched deletion reducer.
+ */
+export function reduceFileStateEnvelopeV2Upserts(
+  envelope: SyncStateEnvelopeV2,
+  ledgerEntries: readonly MutationLedgerEntryV1[],
+  buildTimings?: { validateMs: number },
+): SyncStateEnvelopeV2 | null {
+  if (ledgerEntries.length === 0) return null;
+  const validateStartedAt = performance.now();
+  validateEnvelope(envelope);
+  if (buildTimings) buildTimings.validateMs += performance.now() - validateStartedAt;
+
+  interface BatchUpsert {
+    entry: BaseFileEntry;
+    action: MutationAction;
+    completedAt: number;
+  }
+  const remoteUpserts: RemoteFileEntry[] = [];
+  const baseUpserts: BatchUpsert[] = [];
+  let committedAt = envelope.meta.committedAt;
+  for (const ledgerEntry of ledgerEntries) {
+    const { intent, receipt } = ledgerEntry;
+    if (!receipt) return null;
+    if (intent.version !== 1 || receipt.version !== 1) return null;
+    if (receipt.operationId !== intent.operationId) return null;
+    if (intent.action !== "upload" && intent.action !== "download") return null;
+    if (intent.sourcePath !== undefined || intent.stateEffect !== undefined) return null;
+    if (!sameSyncScope(intent.scope, envelope.scope)) return null;
+    if (!Number.isFinite(receipt.completedAt)) return null;
+    const checkpoint = receipt.checkpoint;
+    try {
+      assertFileReceiptShape(
+        intent.action,
+        intent.path,
+        intent.sourcePath,
+        intent.stateEffect,
+        checkpoint,
+      );
+    } catch {
+      // Fall back to the authoritative per-record path, which raises the
+      // precise shape error for a malformed receipt.
+      return null;
+    }
+    if (
+      checkpoint.remoteDeletes.length > 0
+      || checkpoint.baseRemovals.length > 0
+      || checkpoint.pendingConflictRemovals.length > 0
+      || checkpoint.pendingDeleteRemovals.length > 0
+      || (checkpoint.folderUpserts?.length ?? 0) > 0
+      || (checkpoint.folderDeletes?.length ?? 0) > 0
+      || (checkpoint.folderMoveHintRemovals?.length ?? 0) > 0
+    ) {
+      return null;
+    }
+    if (intent.action === "download") {
+      // A download only advances the base/anchor; the remote node already
+      // exists and its version was verified before the local write.
+      if (
+        checkpoint.remoteUpserts.length !== 0
+        || checkpoint.baseUpserts.length !== 1
+      ) {
+        return null;
+      }
+    } else if (
+      checkpoint.remoteUpserts.length !== 1
+      || checkpoint.baseUpserts.length !== 1
+    ) {
+      return null;
+    }
+    remoteUpserts.push(...checkpoint.remoteUpserts);
+    baseUpserts.push({
+      entry: checkpoint.baseUpserts[0],
+      action: intent.action,
+      completedAt: receipt.completedAt,
+    });
+    committedAt = Math.max(committedAt, receipt.completedAt);
+  }
+  if (baseUpserts.length === 0) return null;
+
+  const originalPathById = projectRemoteIndexV2(envelope.remoteIndex);
+  const remoteDeletes = new Set<string>();
+  const nextItemsById: Record<string, RemoteNodeV2> = {
+    ...envelope.remoteIndex.itemsById,
+  };
+  for (const entry of remoteUpserts) {
+    applyRemoteUpsert(
+      envelope.remoteIndex,
+      nextItemsById,
+      originalPathById,
+      remoteDeletes,
+      entry,
+    );
+  }
+  const nextRemoteIndex: RemoteIndexV2 = {
+    ...envelope.remoteIndex,
+    itemsById: sortRecordByKey(nextItemsById),
+  };
+  const nextPathById = projectRemoteIndexV2(nextRemoteIndex);
+  const originalAnchors = Object.values(envelope.anchors.byAnchorId);
+  const nextAnchors: Record<string, SyncAnchorV2> = {
+    ...envelope.anchors.byAnchorId,
+  };
+  for (const upsert of baseUpserts) {
+    applyBaseUpsert(
+      nextRemoteIndex,
+      nextPathById,
+      originalAnchors,
+      nextAnchors,
+      upsert.entry,
+      upsert.action,
+      upsert.completedAt,
+    );
+  }
+
+  const candidate: SyncStateEnvelopeV2 = {
+    ...envelope,
+    remoteIndex: nextRemoteIndex,
+    anchors: {
+      schemaVersion: 2,
+      byAnchorId: sortRecordByKey(nextAnchors),
+    },
+  };
+  if (sameFileState(envelope, candidate)) return envelope;
+  const next: SyncStateEnvelopeV2 = {
+    ...candidate,
+    meta: {
+      ...envelope.meta,
+      commitSeq: envelope.meta.commitSeq + 1,
+      committedAt,
+    },
+  };
+  const nextValidateStartedAt = performance.now();
+  validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
+  return next;
+}
+
+/**
  * Validate only the durable, action-specific shape of one ordinary-file
  * receipt. This deliberately does not read or mutate an envelope, so reset
  * admission can reject malformed recovery evidence before changing authority.

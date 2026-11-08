@@ -201,43 +201,6 @@ export function addEasySyncFooterButton(
 }
 
 /**
- * 弹框级错误槽（2026-10-30 第二轮两组令牌之一，参数对齐 Resojot）：底栏 /
- * 内容尾上方一条；预创建隐藏，经 `setErrorSlot` 显隐。同一条失败只留这一处，
- * 不再叠加 Notice；清除规则＝动作开始即清、输入即清。
- */
-export function createModalErrorSlot(parentEl: HTMLElement): HTMLElement {
-  return parentEl.createDiv({
-    cls: "easy-sync-modal-error is-hidden",
-    attr: { role: "alert", "aria-live": "polite" },
-  });
-}
-
-/**
- * 字段级错误槽：只挂在出错字段下方；无障碍属性与显隐同弹框级。
- */
-export function createFieldErrorSlot(parentEl: HTMLElement): HTMLElement {
-  return parentEl.createDiv({
-    cls: "easy-sync-field-error is-hidden",
-    attr: { role: "alert", "aria-live": "polite" },
-  });
-}
-
-/** 错误槽唯一写入口：message＝null 清空并隐藏，否则写文本并显形。 */
-export function setErrorSlot(
-  slot: HTMLElement | null,
-  message: string | null,
-): void {
-  if (!slot) return;
-  if (message === null) {
-    slot.addClass("is-hidden");
-    slot.setText("");
-    return;
-  }
-  slot.removeClass("is-hidden");
-  slot.setText(message);
-}
-
-/**
  * Pull focus back onto the modal body right after open (microtask, before
  * first paint): 1.13+ puts a 3px `:focus-visible` ring on the first
  * focusable control — with a select/input that reads as "already editing".

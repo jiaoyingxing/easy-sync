@@ -328,7 +328,7 @@ describe("download URL refresh lookahead (2026-10-27)", () => {
     const fallbackCalls = refreshCalls.slice(1);
     expect(fallbackCalls.length).toBeGreaterThan(0);
     for (const ids of fallbackCalls) {
-      expect(ids.length).toBeLessThanOrEqual(3);
+      expect(ids.length).toBeLessThanOrEqual(4);
       for (const id of ids) expect(publishedIds).not.toContain(id);
     }
     expect(diag.warn.mock.calls.some((call) =>
@@ -383,7 +383,7 @@ describe("download URL refresh lookahead (2026-10-27)", () => {
     expect(failingId).not.toBeNull();
     expect(failedBatchOrder).toHaveLength(1);
     expect(failedBatchIds.length).toBeGreaterThanOrEqual(1);
-    expect(failedBatchIds.length).toBeLessThanOrEqual(3);
+    expect(failedBatchIds.length).toBeLessThanOrEqual(4);
     const failedPaths = new Set(
       entries.filter((entry) => failedBatchIds.includes(entry.driveId))
         .map((entry) => entry.path),

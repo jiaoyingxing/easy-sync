@@ -1186,7 +1186,13 @@ export default class EasySyncPlugin extends Plugin {
       this.updateStatusBar();
       this.syncView?.render();
       this.settingsTab?.refreshAuthState();
-      this.requestMutationRecoveryObservation("auth-state");
+      // /me binding can turn an earlier account-changed block into stale
+      // evidence (the same account is back, or the block was written before
+      // verification finished). Release it first, then let the ordinary
+      // scheduler observe the remaining records.
+      void this.resumeRecoveryAfterAccountVerification().finally(() => {
+        this.requestMutationRecoveryObservation("auth-state");
+      });
       this.requestDescendantFileReconstructionContinuation("auth-state");
     });
 
@@ -1431,7 +1437,12 @@ export default class EasySyncPlugin extends Plugin {
           });
           this.emitColdStartSummaryIfReady();
           this.updateStatusBar();
-          this.requestMutationRecoveryObservation("state-loaded");
+          // Auth may bind /me before the state finishes loading; retry the
+          // release here so a persisted account-changed block is not left
+          // waiting for the next session.
+          void this.resumeRecoveryAfterAccountVerification().finally(() => {
+            this.requestMutationRecoveryObservation("state-loaded");
+          });
           this.requestDescendantFileReconstructionContinuation("state-loaded");
           void this.scheduleCommunityPluginLocalReconciliation("state-loaded");
           this.schedulePersistedCommunityPluginJoinSync("state-loaded");
@@ -3450,6 +3461,10 @@ export default class EasySyncPlugin extends Plugin {
     if (!this.hasUnresolvedMutationRecovery()) {
       return this.checkAccountBinding();
     }
+    // A restored session reports logged-in before Graph /me binds the
+    // account. That pending window is not evidence of a different account:
+    // refuse the round without turning it into an account-changed block.
+    if (!this.auth?.authState.accountId) return false;
     const matches = await this.checkAccountBinding({
       suppressNotice: true,
       allowInitialBind: false,
@@ -4560,6 +4575,13 @@ export default class EasySyncPlugin extends Plugin {
       });
       return;
     }
+    // A completed round may still be publishing its recovery hint off the
+    // critical path; let it finish before the reset invalidates the state it
+    // was derived from (a hint write must never land after this decision).
+    // Optional guard keeps test doubles and older runtime holders valid.
+    if (typeof this.syncExecutor?.settleBackgroundTasks === "function") {
+      await this.syncExecutor.settleBackgroundTasks().catch(() => undefined);
+    }
     const holder = this.acquireOpLock("reset");
     if (holder) {
       this.noticeCenter.show({
@@ -5143,77 +5165,25 @@ export default class EasySyncPlugin extends Plugin {
     const progress = this.progressStore.state;
     if (
       progress.startedAt <= 0
-      || this.isPlanReviewPaused(result)
       || result.message === this.i18n.t("result.alreadyRunning")
     ) {
       return;
     }
     const endedAt = Date.now();
-    const activeRecoveryEntry = this.state.syncHistory.find(
-      (entry) => entry.recovery?.state !== undefined
-        && entry.recovery.state !== "recovered",
-    );
-    const priorRecoverySettled = Math.max(
-      0,
-      recoveryContext.priorTotal - recoveryContext.priorRemaining,
-    );
-    let priorRecoveryWithoutEntry: MutationRecoveryHistory | undefined;
-    if (recoveryContext.priorTotal > 0 && activeRecoveryEntry) {
-      const previous = activeRecoveryEntry.recovery!;
-      const total = Math.max(previous.total, recoveryContext.priorTotal);
-      const priorRecovery: MutationRecoveryHistory =
-        recoveryContext.priorRemaining === 0
-          ? {
-              state: "recovered",
-              total,
-              settled: total,
-              remaining: 0,
-              updatedAt: endedAt,
-            }
-          : this.buildMutationRecoveryHistory(
-              result.mutationRecovery,
-              {
-                total,
-                settled: Math.max(
-                  previous.settled,
-                  total - recoveryContext.priorRemaining,
-                  priorRecoverySettled,
-                ),
-                remaining: recoveryContext.priorRemaining,
-              },
-              endedAt,
-            );
-      try {
-        await this.state.addSyncHistory({
-          ...activeRecoveryEntry,
-          status: priorRecovery.state === "recovered"
-            ? "success"
-            : "partial",
-          endedAt,
-          errors: priorRecovery.state === "blocked"
-            ? Math.max(1, activeRecoveryEntry.errors)
-            : priorRecovery.state === "recovered"
-              ? 0
-              : activeRecoveryEntry.errors,
-          recovery: priorRecovery,
-        });
-      } catch (error) {
-        this.diag.warn(
-          "state",
-          `sync recovery history update failed: ${describeError(error)}`,
-        );
-      }
-    } else if (recoveryContext.priorTotal > 0) {
-      priorRecoveryWithoutEntry = this.buildMutationRecoveryHistory(
-        result.mutationRecovery,
-        {
-          total: recoveryContext.priorTotal,
-          settled: priorRecoverySettled,
-          remaining: recoveryContext.priorRemaining,
-        },
-        endedAt,
-      );
-    }
+    const planReviewPaused = this.isPlanReviewPaused(result);
+    // A plan-review pause is not an ordinary history row, but the recovery
+    // evidence observed by this round must still be written. Skipping it left
+    // a settled row at blocked/account-changed, and later ledger churn
+    // resurrected the stale reason (2026-11-08 field case).
+    const priorRecoveryWithoutEntry =
+      planReviewPaused && result.mutationRecovery === undefined
+        ? undefined
+        : await this.updatePriorMutationRecoveryHistory(
+            result,
+            recoveryContext,
+            endedAt,
+          );
+    if (planReviewPaused) return;
 
     const stoppedInsidePriorRecovery =
       recoveryContext.priorTotal > 0
@@ -5303,6 +5273,87 @@ export default class EasySyncPlugin extends Plugin {
         `sync history save failed: ${describeError(error)}`,
       );
     }
+  }
+
+  /**
+   * Write the fate of the recovery evidence this round observed, keeping the
+   * recovery row consistent with the ledger even when the round ends before
+   * an ordinary history row exists. Returns the row to create later when the
+   * round started with records but no active evidence row existed.
+   */
+  private async updatePriorMutationRecoveryHistory(
+    result: SyncResult,
+    recoveryContext: MutationRecoveryRunContext,
+    endedAt: number,
+  ): Promise<MutationRecoveryHistory | undefined> {
+    const state = this.state;
+    if (!state) return undefined;
+    const activeRecoveryEntry = state.syncHistory.find(
+      (entry) => entry.recovery?.state !== undefined
+        && entry.recovery.state !== "recovered",
+    );
+    const priorRecoverySettled = Math.max(
+      0,
+      recoveryContext.priorTotal - recoveryContext.priorRemaining,
+    );
+    let priorRecoveryWithoutEntry: MutationRecoveryHistory | undefined;
+    if (recoveryContext.priorTotal > 0 && activeRecoveryEntry) {
+      const previous = activeRecoveryEntry.recovery!;
+      const total = Math.max(previous.total, recoveryContext.priorTotal);
+      const priorRecovery: MutationRecoveryHistory =
+        recoveryContext.priorRemaining === 0
+          ? {
+              state: "recovered",
+              total,
+              settled: total,
+              remaining: 0,
+              updatedAt: endedAt,
+            }
+          : this.buildMutationRecoveryHistory(
+              result.mutationRecovery,
+              {
+                total,
+                settled: Math.max(
+                  previous.settled,
+                  total - recoveryContext.priorRemaining,
+                  priorRecoverySettled,
+                ),
+                remaining: recoveryContext.priorRemaining,
+              },
+              endedAt,
+            );
+      try {
+        await state.addSyncHistory({
+          ...activeRecoveryEntry,
+          status: priorRecovery.state === "recovered"
+            ? "success"
+            : "partial",
+          endedAt,
+          errors: priorRecovery.state === "blocked"
+            ? Math.max(1, activeRecoveryEntry.errors)
+            : priorRecovery.state === "recovered"
+              ? 0
+              : activeRecoveryEntry.errors,
+          recovery: priorRecovery,
+        });
+      } catch (error) {
+        this.diag.warn(
+          "state",
+          `sync recovery history update failed: ${describeError(error)}`,
+        );
+      }
+    } else if (recoveryContext.priorTotal > 0) {
+      priorRecoveryWithoutEntry = this.buildMutationRecoveryHistory(
+        result.mutationRecovery,
+        {
+          total: recoveryContext.priorTotal,
+          settled: priorRecoverySettled,
+          remaining: recoveryContext.priorRemaining,
+        },
+        endedAt,
+      );
+    }
+    return priorRecoveryWithoutEntry;
   }
 
   private buildMutationRecoveryHistory(
@@ -5741,6 +5792,86 @@ export default class EasySyncPlugin extends Plugin {
     this.syncView?.render();
   }
 
+  /**
+   * Release an account-changed recovery block once Graph /me has bound the
+   * account again. Two cases land here:
+   *
+   * - the bound identity is back (the user switched back, as the panel copy
+   *   promises);
+   * - the block was written while the session was still verifying (the
+   *   empty-account race fixed on 2026-11-08).
+   *
+   * Only the account-changed reason is released, only while its evidence row
+   * is still the newest history row, and never across plan review (that pause
+   * has its own release rule). Remaining records go back to the ordinary
+   * scheduler; this method never settles them itself.
+   */
+  private async resumeRecoveryAfterAccountVerification(): Promise<void> {
+    const state = this.state;
+    if (!state || !this._stateLoaded) return;
+    const currentId = this.auth?.authState?.accountId;
+    if (!currentId) return;
+    if (state.boundAccountId !== currentId) return;
+    if (
+      state.hasMutationLedgerCorruption
+      || state.hasMutationRecoveryQuarantineCorruption
+      || state.hasV2StateLoadRecoveryBlock
+      || state.hasV2RemoteScopeRecovery
+    ) return;
+    const activeEntry = (state.syncHistory ?? []).find(
+      (entry) => entry.recovery?.state !== undefined
+        && entry.recovery.state !== "recovered",
+    );
+    const reason = this.mutationRecoveryBlockReason
+      ?? activeEntry?.recovery?.blockReason
+      ?? null;
+    if (reason !== "account-changed") return;
+    // A force reset intentionally terminates tracking while keeping the
+    // blocked evidence row for audit; a later /me must not rewrite it.
+    const resetAt = state.forceResetAudit?.at ?? 0;
+    if (resetAt > (activeEntry?.recovery?.updatedAt ?? 0)) return;
+    // Another cause would have written a newer row, so only the newest
+    // evidence may own the pause. The row itself is still the active recovery
+    // evidence and is updated either way.
+    const newest = state.syncHistory[0];
+    const isNewest = !activeEntry || !newest || newest.id === activeEntry.id;
+    const ownedPause = isNewest && this.pauseIsRecoveryBlockOwned();
+    const remaining = (state.mutationLedger ?? []).length;
+    this.mutationRecoveryBlockReason = null;
+    if (activeEntry) {
+      const updatedAt = Date.now();
+      await this.updateActiveMutationRecoveryHistory((previous) => (
+        remaining > 0
+          ? {
+              state: "waiting-network",
+              total: Math.max(previous.total, remaining),
+              settled: previous.settled,
+              remaining,
+              updatedAt,
+            }
+          : {
+              state: "recovered",
+              total: previous.total,
+              settled: previous.total,
+              remaining: 0,
+              updatedAt,
+            }
+      ));
+    }
+    if (ownedPause && !state.planReviewActive && this.autoSyncPaused) {
+      this.autoSyncPaused = false;
+      await this.saveSyncSettings();
+      this.startAutoSync();
+    }
+    this.diag.warn(
+      "execute",
+      "account verified; released stale account-changed recovery block",
+      { remaining, mutations: 0 },
+    );
+    this.updateStatusBar();
+    this.syncView?.render();
+  }
+
   // ---- Auto-sync ----
 
   /**
@@ -5810,6 +5941,10 @@ export default class EasySyncPlugin extends Plugin {
       || (this.autoSyncPaused && !this.pausedBlockedRecoveryLacksManualExit())
       || !this._stateLoaded
       || !this.auth?.authState.isLoggedIn
+      // Sync authorization is fail-closed until /me binds the account. An
+      // empty id is "still verifying", never "a different account"; letting it
+      // reach the account check would persist a false account-changed block.
+      || !this.auth?.authState.accountId
       || !this.state?.isV2StateActive
       || this.state.planReviewActive
     ) return false;
@@ -5945,6 +6080,9 @@ export default class EasySyncPlugin extends Plugin {
       await this.pauseForMutationRecoveryBlock("scope-changed");
       return { state: "blocked" };
     }
+    // Wait for /me instead of treating an unverified session as a mismatch.
+    // The auth-state notification that follows binding re-enters here.
+    if (!this.auth?.authState.accountId) return { state: "inactive" };
     if (!await this.checkAccountBinding({
       suppressNotice: true,
       allowInitialBind: false,
@@ -11641,15 +11779,9 @@ export default class EasySyncPlugin extends Plugin {
   private async removeSecret(key: string): Promise<void> {
     const ss = this.app.secretStorage;
     if (!ss) return;
-    // Feature-detect: deleteSecret exists at runtime (>= 1.11.4) but TS types
-    // haven't caught up. Fallback to overwriting with empty string if unavailable.
-    if (typeof (ss as unknown as Record<string, unknown>).deleteSecret === "function") {
-      await (ss as unknown as { deleteSecret: (k: string) => Promise<void> }).deleteSecret(key);
-    } else {
-      // On older versions without deleteSecret, clear the value.
-      // AuthModule treats empty string as "no token".
-      await (ss.setSecret as (id: string, secret: string) => Promise<void>)(key, "");
-    }
+    // deleteSecret 自宿主 1.11.4 起运行时必有，minAppVersion 1.13.4 下恒走
+    // 真删；官方类型仍未收录，调用经本地 cast（原空串回写兜底已退场）。
+    await (ss as unknown as { deleteSecret: (k: string) => Promise<void> }).deleteSecret(key);
   }
 }
 

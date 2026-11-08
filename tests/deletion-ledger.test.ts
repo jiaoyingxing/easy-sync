@@ -8,10 +8,14 @@ import { describe, expect, it } from "vitest";
 import {
   DELETION_LEDGER_RETENTION_MS,
   deletionLedgerCutoffV1,
+  deletionLedgerEntryLineV1,
+  deletionLedgerLogHeaderLineV1,
   emptyDeletionLedgerV1,
+  parseDeletionLedgerLogV1,
   pruneDeletionLedgerV1,
   readDeletionLedgerV1,
   sameDeletionLedgerV1,
+  serializeDeletionLedgerLogV1,
   upsertDeletionLedgerEntryV1,
 } from "../src/sync/deletion-ledger";
 import type {
@@ -149,5 +153,50 @@ describe("deletion ledger family (文件版本找回刀一之二)", () => {
       .toEqual([]);
     const empty = emptyDeletionLedgerV1();
     expect(pruneDeletionLedgerV1(empty, { now: NOW })).toBe(empty);
+  });
+});
+
+describe("append-only deletion-ledger log", () => {
+  it("round-trips a snapshot through the JSONL encoding", () => {
+    const family = container([entry(), entry({
+      remoteId: "remote-2",
+      path: "notes/folder",
+      deletedAt: 2000,
+      kind: "folder",
+    })]);
+    const parsed = parseDeletionLedgerLogV1(
+      serializeDeletionLedgerLogV1(family),
+    );
+    expect(parsed.entries).toEqual(family.entries);
+    expect(parsed.lines).toBe(3);
+    expect(parsed.malformedLines).toBe(0);
+  });
+
+  it("skips a torn last line and malformed lines without failing the family", () => {
+    const content = [
+      deletionLedgerLogHeaderLineV1(),
+      deletionLedgerEntryLineV1(entry()),
+      "not-json",
+      JSON.stringify({ remoteId: "" }),
+      `${deletionLedgerEntryLineV1(entry({ remoteId: "torn" })).slice(0, 20)}`,
+    ].join("\n");
+
+    const parsed = parseDeletionLedgerLogV1(content);
+    expect(parsed.entries.map((item) => item.remoteId)).toEqual(["remote-1"]);
+    expect(parsed.lines).toBe(5);
+    expect(parsed.malformedLines).toBe(3);
+  });
+
+  it("keeps the newer deletedAt when the same remote id appears twice", () => {
+    const content = [
+      deletionLedgerLogHeaderLineV1(),
+      deletionLedgerEntryLineV1(entry({ deletedAt: 2000, path: "new.md" })),
+      deletionLedgerEntryLineV1(entry({ deletedAt: 1000, path: "old.md" })),
+    ].join("\n");
+
+    const parsed = parseDeletionLedgerLogV1(content);
+    expect(parsed.entries).toHaveLength(1);
+    expect(parsed.entries[0].deletedAt).toBe(2000);
+    expect(parsed.entries[0].path).toBe("new.md");
   });
 });

@@ -99,50 +99,6 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
  * 0.35) stays — a plain tint with no blur, same as the pre-change look. No
  * extra darkening needed, so no overriding rule here. */
 
-/* ---- Auto-sync slider fill ---- */
-
-/* The accent fill left of the thumb is a host mechanism from Obsidian 1.13+
- * only (`input[type=range].slider` paints a gradient driven by the
- * JS-written `--slider-fill-ratio`); older hosts — several Android builds
- * included — ship no fill at all, so the track renders as one flat gray
- * line. Replicate the host rule for EasySync sliders with fallbacks for the
- * host vars those builds lack; on 1.13+ both write the same paint, so
- * nothing changes there. The ratio itself is written by paintSliderFill()
- * in auto-sync-modal.ts. */
-.easy-sync-auto-sync input[type="range"] {
-  --slider-fill-position: calc(
-    var(--slider-thumb-width, 18px) / 2 +
-      (100% - var(--slider-thumb-width, 18px)) * var(--slider-fill-ratio, 0)
-  );
-  background-image: linear-gradient(
-    to var(--inset-end, right),
-    var(--slider-fill-background, var(--interactive-accent))
-      var(--slider-fill-position),
-    transparent var(--slider-fill-position)
-  );
-}
-
-/* ---- Auto-sync slider value ---- */
-
-/* The numeric readout beside the track is a host mechanism from 1.13+ too
- * (`span.slider-value` created before the input and kept in sync by
- * SliderComponent); older hosts — several Android builds included — render
- * nothing at all, since their value tooltip was hover-only and touch
- * screens never trigger it. ensureSliderValueEl() in auto-sync-modal.ts
- * creates the same span only on hosts without one; replicate the host rule
- * with fallbacks for the vars those builds lack. On 1.13+ hosts no plugin
- * span exists, and for the host's own element this writes the same values
- * the host rule already applies. */
-.easy-sync-auto-sync .slider-value {
-  font-size: var(--slider-value-font-size, var(--font-ui-small));
-  font-weight: var(
-    --slider-value-font-weight,
-    var(--input-font-weight, var(--font-normal))
-  );
-  color: var(--text-normal);
-  font-variant-numeric: tabular-nums;
-}
-
 /* ---- Shared modal contract (2026-10-30 弹框共享件) ---- */
 
 /* 高度上限全仓只有这一处定义；内容密集弹框（配置表单、冲突详情）共用。
@@ -199,29 +155,6 @@ body.is-phone .easy-sync-modal-footer.is-fixed {
 .easy-sync-keyboard-tail {
   padding-bottom: calc(var(--easy-sync-tail-pad, 0px) + var(--keyboard-height, 0px));
   scroll-padding-bottom: calc(var(--easy-sync-tail-scroll, 0px) + var(--keyboard-height, 0px));
-}
-
-/* 错误提示两组令牌（2026-10-30 第二轮）：字号/行高/颜色只在这里定，新增
-   错误提示不要再另起类名。弹框级＝底栏/内容尾上方一条；字段级＝出错字段
-   下方（配置行的 control 是横向 flex，flex-basis 100% 让它独占一行）。 */
-.easy-sync-modal-error {
-  margin: var(--size-4-2) 0 0;
-  color: var(--text-error);
-  font-size: var(--font-ui-small);
-  line-height: 1.45;
-}
-
-.easy-sync-field-error {
-  flex-basis: 100%;
-  margin-top: var(--size-2-1);
-  color: var(--text-error);
-  font-size: var(--font-ui-smaller);
-  line-height: 1.4;
-}
-
-.easy-sync-modal-error.is-hidden,
-.easy-sync-field-error.is-hidden {
-  display: none;
 }
 
 /* 弹框宽度两档：默认档＝宿主不写 width；宽版档＝本条唯一规则。选择器必须带
@@ -1050,15 +983,24 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 }
 
 /* Recovery body secondary entry (account-changed): a text link, not a second
-   primary action; the fixed top action remains the only sync entry. */
-.easy-sync-recovery-inline-action {
+   primary action; the fixed top action remains the only sync entry.
+   The host styles every raw button (`button:not(.clickable-icon)` adds the
+   interactive background/shadow, `button` fixes the input height), and a
+   class-only reset loses on specificity. Scope the reset to the recovery
+   body so it wins without !important. */
+.easy-sync-section-body button.easy-sync-recovery-inline-action {
   align-self: flex-start;
+  height: auto;
+  min-height: 0;
   border: 0;
+  border-radius: 0;
   background: none;
+  box-shadow: none;
   padding: 1px 0;
   color: var(--text-accent);
   font-family: inherit;
   font-size: var(--font-ui-smaller);
+  font-weight: inherit;
   line-height: var(--line-height-normal);
   text-decoration: underline;
   text-underline-offset: 2px;

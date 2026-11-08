@@ -49,6 +49,9 @@ interface DeleteLocalWaveHarnessInput {
   changedLocally?: readonly string[];
   /** 这些路径的删除抛错（本机一侧失败）。 */
   failErase?: readonly string[];
+  /** Observation hooks for the one-wave absence-read lookahead. */
+  onBatchRead?: (paths: readonly string[]) => void;
+  onCheckpointStarted?: (operationIds: readonly string[]) => void;
 }
 
 async function makeDeleteLocalWaveHarness(input: DeleteLocalWaveHarnessInput) {
@@ -85,6 +88,7 @@ async function makeDeleteLocalWaveHarness(input: DeleteLocalWaveHarnessInput) {
   const batchReads: string[][] = [];
   const getFileMetadataByPaths = vi.fn(
     async (_vault: string, paths: readonly string[]) => {
+      input.onBatchRead?.(paths);
       batchReads.push([...paths]);
       if (input.failBatchRead) throw new Error("$batch unavailable");
       return new Map(
@@ -106,6 +110,11 @@ async function makeDeleteLocalWaveHarness(input: DeleteLocalWaveHarnessInput) {
     };
   });
   const state = makeActiveV2State([], baseEntries);
+  const commitCheckpoints = state.commitMutationCheckpoints.bind(state);
+  state.commitMutationCheckpoints = vi.fn(async (operationIds: readonly string[]) => {
+    input.onCheckpointStarted?.(operationIds);
+    return commitCheckpoints(operationIds);
+  });
   const diagLines: Array<{ message: string; data?: unknown }> = [];
   const diag = {
     isEnabled: vi.fn().mockReturnValue(false),
@@ -209,7 +218,9 @@ describe("DeleteLocal cleanup waves", () => {
       vi.mocked(harness.state.beginMutationIntents).mock.calls.length,
     ).toBe(waveCount);
     expect(
-      vi.mocked(harness.state.recordMutationReceipts).mock.calls.length,
+      vi.mocked(
+        harness.state.recordMutationReceiptsAndCloudDeletions,
+      ).mock.calls.length,
     ).toBe(waveCount);
     expect(
       vi.mocked(harness.state.commitMutationCheckpoints).mock.calls.length,
@@ -235,8 +246,9 @@ describe("DeleteLocal cleanup waves", () => {
     // 波内顺序：意图 → 逐条擦除 → 回执 → 共享检查点。
     const intentOrder = vi.mocked(harness.state.beginMutationIntents)
       .mock.invocationCallOrder;
-    const receiptOrder = vi.mocked(harness.state.recordMutationReceipts)
-      .mock.invocationCallOrder;
+    const receiptOrder = vi.mocked(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.invocationCallOrder;
     const checkpointOrder = vi.mocked(harness.state.commitMutationCheckpoints)
       .mock.invocationCallOrder;
     for (let wave = 0; wave < waveCount; wave++) {
@@ -378,5 +390,36 @@ describe("DeleteLocal cleanup waves", () => {
     // `completedCount` 与 `resolveCompletedActionCount` 都不因合批改变。
     expect(progressStore.state.completedCount).toBe(3);
     expect(resolveCompletedActionCount(progressStore.state)).toBe(3);
+  }, 120_000);
+
+  it("starts the next wave's absence read before the current wave's checkpoint", async () => {
+    const filePaths = Array.from(
+      { length: DESKTOP_DELETE_WAVE + 1 },
+      (_unused, index) => `lookahead/f-${String(index).padStart(3, "0")}.md`,
+    );
+    let batchReadCount = 0;
+    let firstCheckpointStarted = false;
+    let secondReadStartedBeforeFirstCheckpoint = false;
+    const harness = await makeDeleteLocalWaveHarness({
+      filePaths,
+      onCheckpointStarted: () => {
+        firstCheckpointStarted = true;
+      },
+      onBatchRead: () => {
+        batchReadCount++;
+        if (batchReadCount === 2) {
+          // The second read is the one-wave lookahead. It must begin before
+          // wave 0's checkpoint; the old read-at-wave-start shape would have
+          // waited for that checkpoint to settle first.
+          secondReadStartedBeforeFirstCheckpoint = !firstCheckpointStarted;
+        }
+      },
+    });
+
+    expect(harness.result.deleted).toBe(filePaths.length);
+    expect(harness.result.errors).toBe(0);
+    expect(harness.batchReads.map((paths) => paths.length))
+      .toEqual([DESKTOP_DELETE_WAVE, 1]);
+    expect(secondReadStartedBeforeFirstCheckpoint).toBe(true);
   }, 120_000);
 });

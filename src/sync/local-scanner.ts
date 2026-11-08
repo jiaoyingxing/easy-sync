@@ -202,6 +202,8 @@ function isEasySyncInternalPathForPaths(
     )
     || path === paths.stateV1BackupFile
     || path === paths.baseContentFile
+    || path === paths.deletionLedgerFile
+    || path === `${paths.deletionLedgerFile}.next`
     || path === paths.ancestorManifestV2File
     || path === paths.ancestorManifestV2NextFile
     || path === paths.ancestorsV2Dir

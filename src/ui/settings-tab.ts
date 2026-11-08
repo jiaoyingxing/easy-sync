@@ -1,20 +1,17 @@
 /**
  * EasySync Settings Tab
  *
- * Settings page organized by groups (aligned with Obsidian's native SettingGroup style):
- *   - Account and sync-panel entry (no heading, always visible)
- *   - Scope (范围)
- *   - Automatic (自动)
- *   - Display (显示)
- *   - About (关于)
- *   - Maintenance (维护)
+ * Declarative settings for Obsidian 1.13+（minAppVersion 1.13.4）：宿主从
+ * `getSettingDefinitions()` 渲染整页，`display()` 不会被调用。布局按
+ * 2026-10-11 拍板的根级导航结构：
+ *   - 账号组（登录、同步模式、同步面板入口；无标题）
+ *   - 五个入口页：同步范围 / 自动同步 / 显示 / 关于 / 维护
  */
 
 import {
   ButtonComponent,
   Notice,
   PluginSettingTab,
-  SettingGroup,
   setIcon,
   type Setting,
   type SettingDefinition,
@@ -30,23 +27,12 @@ import {
   handleAuthEntryAction,
   resolveAuthEntryPresentation,
 } from "./auth-entry-flow";
-import { AutomaticHandlingModal } from "./automatic-handling-modal";
-import { AutoSyncModal } from "./auto-sync-modal";
-import {
-  buildIntroTextWithInlineGear,
-  ConfigSyncModal,
-} from "./config-sync-modal";
+import { buildIntroTextWithInlineGear } from "./config-sync-modal";
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import { SyncModeDisableModal } from "./sync-mode-disable-modal";
 import { SyncModeGateModal } from "./sync-mode-gate-modal";
 import { syncModeGateInputLiteral } from "../sync/sync-mode-transition";
 import type { SyncDirection } from "../sync/sync-direction";
-import {
-  renderExcludedFolderChips,
-  SyncExclusionEditSession,
-  SyncExclusionModal,
-  updateExcludedFoldersFromUi,
-} from "./sync-exclusion-modal";
 import {
   SETTINGS_TAB_ICON,
   decorateSettingsRootRowIcons,
@@ -136,15 +122,6 @@ function renderAboutUpdateAffordance(
 
 export class EasySyncSettingTab extends PluginSettingTab {
   plugin: EasySyncPlugin;
-  private accountSectionEl: HTMLElement | null = null;
-  private rangeSectionEl: HTMLElement | null = null;
-  private automaticSectionEl: HTMLElement | null = null;
-  private displaySectionEl: HTMLElement | null = null;
-  private aboutSectionEl: HTMLElement | null = null;
-  private maintenanceSectionEl: HTMLElement | null = null;
-  /** 维护页「高级」组宿主（2026-10-20 用户拍板：同步回收站＋重置一组，
-   *  顶部诊断日志与报告单独成组、不加外侧标题）。 */
-  private maintenanceAdvancedSectionEl: HTMLElement | null = null;
   /** 1.13+ 根级导航行图标的补挂观察器（宿主重建根行后自动补）。 */
   private rootRowIconObserver: MutationObserver | null = null;
 
@@ -156,8 +133,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
   ) {
     super(plugin.app, plugin);
     this.plugin = plugin;
-    // Tab-level class must be applied at construction time: on Obsidian
-    // 1.13.0+ the host renders declaratively and never calls display().
+    // Tab-level class must be applied at construction time: the host renders
+    // declaratively and never calls display().
     this.containerEl.addClass("easy-sync-settings-tab");
     // 设置窗左栏本插件那一行的图标（宿主只在页签 icon 非空时建该元素；第三方
     // 插件整栏被宿主隐藏，由 styles.css 只放开我们自己那一行）。
@@ -165,97 +142,18 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.observeRootRowIcons();
   }
 
-  /**
-   * 当前宿主是否走声明式渲染（1.13+）。声明式时 `display()` 不会被调用、行由
-   * `getSettingDefinitions()` 承接；几处刷新路径与装饰共用这一个判别。
-   */
-  private isDeclarativeRender(): boolean {
-    const declarative = this as unknown as { settingItems?: unknown[] };
-    if (
-      declarative.settingItems === undefined
-      || declarative.settingItems.length === 0
-    ) {
-      return false;
-    }
-    return true;
-  }
-
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    this.accountSectionEl = containerEl.createDiv("easy-sync-settings-account");
-    this.rangeSectionEl = containerEl.createDiv(
-      "easy-sync-settings-group-host easy-sync-settings-range",
-    );
-    this.automaticSectionEl = containerEl.createDiv(
-      "easy-sync-settings-group-host easy-sync-settings-automatic",
-    );
-    this.displaySectionEl = containerEl.createDiv(
-      "easy-sync-settings-group-host easy-sync-settings-display",
-    );
-    this.aboutSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-about");
-    this.maintenanceSectionEl = containerEl.createDiv(
-      "easy-sync-settings-group-host easy-sync-settings-maintenance",
-    );
-    this.maintenanceAdvancedSectionEl = containerEl.createDiv(
-      "easy-sync-settings-group-host easy-sync-settings-maintenance-advanced",
-    );
-
-    // ========================================================================
-    // Account and sync action — one unheaded group
-    // ========================================================================
-    this.renderAccountSection(t);
-
-    // ========================================================================
-    // Scope group
-    // ========================================================================
-    this.renderRangeSection(t);
-
-    // ========================================================================
-    // Automatic group
-    // ========================================================================
-    this.renderAutomaticSection(t);
-
-    // ========================================================================
-    // Display group
-    // ========================================================================
-    this.renderDisplaySection(t);
-
-    // ========================================================================
-    // About group
-    // ========================================================================
-    this.renderAboutSection(t);
-
-    // ========================================================================
-    // Maintenance group
-    // ========================================================================
-    this.renderMaintenanceSection(t);
-  }
-
   refreshAuthState(): void {
-    // On Obsidian 1.13.0+ the tab is rendered declaratively from
-    // getSettingDefinitions() and accountSectionEl is never populated, so the
-    // refresh must go through update(). On older hosts fall back to the
-    // imperative display() path.
-    if (this.isDeclarativeRender()) {
-      (this as unknown as { update?: () => void }).update?.();
-      return;
-    }
-    if (!this.accountSectionEl?.isConnected) return;
-    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    this.renderAccountSection(t);
+    // 声明式页签的刷新一律走宿主 update()：重跑 getSettingDefinitions() 并
+    // 重渲染每行回调（登录态、模式行、面板入口行都由可见谓词重估）。
+    this.update();
   }
 
   /**
-   * Declarative setting index for Obsidian 1.13.0+ settings search.
+   * Declarative setting index consumed by the host settings renderer.
    *
-   * On 1.13.0+ the host renders the whole tab from these definitions and
-   * `display()` is not called (see the deprecated `display()` contract), so
-   * this list must cover the account/login/sync-action area as well as the
-   * grouped settings. Entries render through `SettingDefinitionRender`
-   * reusing the same imperative paths as `display()`, so runtime state
-   * handling stays unchanged; older hosts ignore this method entirely.
+   * The host renders the whole tab from these definitions and never calls
+   * display(), so this list must cover the account/login/sync-action area as
+   * well as the five entry pages. Rows render through `SettingDefinitionRender`.
    */
   getSettingDefinitions(): SettingDefinitionItem[] {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
@@ -278,10 +176,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
   }
 
   /**
-   * 排除项变更的计划重算时机：弹框时代＝关闭弹框时（`SyncExclusionEditSession`），
-   * 设置页没有「关闭」，改在设置窗关闭（`hide()`）时统一收口；只有改过且有在途
-   * 审阅才重算。代价如实记：桌面设置窗可长期开着，重算窗口比弹框时代长
-   * （2026-10-12 决策，方案单 §八）。
+   * 排除项变更的计划重算时机：设置页没有「关闭」，改在设置窗关闭（`hide()`）
+   * 时统一收口；只有改过且有在途审阅才重算。代价如实记：桌面设置窗可长期
+   * 开着，重算窗口较长（2026-10-12 决策，方案单 §八）。
    */
   private exclusionEditSession: SyncExclusionEditSession | null = null;
 
@@ -310,39 +207,13 @@ export class EasySyncSettingTab extends PluginSettingTab {
   }
 
   refreshSyncState(): void {
-    // Same split as refreshAuthState: declarative render on 1.13.0+,
-    // imperative display() fallback on older hosts.
-    if (this.isDeclarativeRender()) {
-      (this as unknown as { update?: () => void }).update?.();
-      return;
-    }
-    if (
-      !this.accountSectionEl?.isConnected
-      && !this.rangeSectionEl?.isConnected
-      && !this.automaticSectionEl?.isConnected
-      && !this.displaySectionEl?.isConnected
-      && !this.maintenanceSectionEl?.isConnected
-      && !this.maintenanceAdvancedSectionEl?.isConnected
-    ) return;
-    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    this.renderAccountSection(t);
-    this.renderRangeSection(t);
-    this.renderAutomaticSection(t);
-    this.renderDisplaySection(t);
-    // 件③ 反转入口的出现/退场与说明里的计数都靠这一组重渲染（单向模式下
-    // 逐条或批量忽略后立刻生效）。
-    this.renderMaintenanceSection(t);
+    // 与 refreshAuthState 同一刷新路径；件③ 反转入口的出现/退场与说明里的
+    // 计数也靠宿主重渲染重估（单向模式下逐条或批量忽略后立刻生效）。
+    this.update();
   }
 
   hide(): void {
     super.hide();
-    this.accountSectionEl = null;
-    this.rangeSectionEl = null;
-    this.automaticSectionEl = null;
-    this.displaySectionEl = null;
-    this.aboutSectionEl = null;
-    this.maintenanceSectionEl = null;
-    this.maintenanceAdvancedSectionEl = null;
     this.flushExclusionChanges();
   }
 
@@ -370,422 +241,40 @@ export class EasySyncSettingTab extends PluginSettingTab {
     });
   }
 
-  /**
-   * `<1.13` 的 `display()` 弹框形态没有根级导航行（行名与页名同名的行在那里是
-   * 普通设置行），只在声明式渲染（1.13+）才装饰。
-   */
   private decorateRootRowIcons(): void {
-    if (!this.isDeclarativeRender()) return;
     decorateSettingsRootRowIcons(
       this.containerEl,
       this.plugin.i18n.t.bind(this.plugin.i18n),
     );
   }
+}
 
-  private renderAccountSection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.accountSectionEl) return;
-    this.accountSectionEl.empty();
-    const accountGroup = new SettingGroup(this.accountSectionEl);
-    this.renderAccount(accountGroup, t);
+/**
+ * 排除项编辑会话：记录「本次设置窗开着期间有没有已落盘的排除项变更」与变更
+ * 发生时是否已有在途审阅，`close()` 时据此决定要不要重算同步计划。原来挂在
+ * 弹框关闭时机上，设置页时代随 `hide()` 统一收口。
+ */
+export class SyncExclusionEditSession {
+  private savedChange = false;
+  private closePromise: Promise<void> | null = null;
 
-    if (!this.plugin.auth?.authState.isLoggedIn) return;
+  constructor(private readonly hadPendingReview: boolean) {}
 
-    // 片⑥ 同步模式行：账号行之下、「同步面板」行之上（U1）。只承担模式选择，
-    // 不绕过门槛弹框、也不在这里执行同步。
-    accountGroup.addSetting((setting) => {
-      renderSyncModeRow(setting, t, this.plugin);
-    });
-
-    // Navigation only: progress, plan review and every run action (sync,
-    // confirm, cancel) live in the sidebar, so the settings page must not
-    // carry a second copy of the sidebar's primary button or its state
-    // machine (2026-10-09 拍板，取代 2026-08-16 的设置页「立即同步」动作行).
-    accountGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.syncPanel.name"))
-        .addButton((btn) => {
-          btn
-            .setButtonText(t("settings.syncPanel.button"))
-            .setCta()
-            .onClick(() => {
-              void this.plugin.openSyncPanelFromSettings();
-            });
-        });
-    });
+  markSavedChange(): void {
+    this.savedChange = true;
   }
 
-  private renderRangeSection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.rangeSectionEl) return;
-    this.rangeSectionEl.empty();
-    const rangeGroup = new SettingGroup(this.rangeSectionEl).setHeading(
-      t("settings.group.scope"),
-    );
-
-    rangeGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.syncScope.name"))
-        .setDesc(t("settings.syncScope.desc"))
-        .addButton((btn) => {
-          btn.setButtonText(t("settings.syncScope.button"))
-            .onClick(() => {
-              new ConfigSyncModal(this.plugin).open();
-            });
-        });
-    });
-
-    rangeGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.syncExclusion.name"))
-        .setDesc(t("settings.syncExclusion.desc"))
-        .addButton((button) => {
-          button
-            .setButtonText(t("settings.syncExclusion.button"))
-            .onClick(() => {
-              new SyncExclusionModal(this.plugin).open();
-            });
-        });
-
-      if (this.plugin.excludedFolders.length > 0) {
-        const chipsEl = setting.descEl.createDiv();
-        renderExcludedFolderChips(chipsEl, this.plugin.excludedFolders, {
-          removeLabel: (path) => t("settings.syncExclusion.removeFolder", { path }),
-          onRemove: (path) => updateExcludedFoldersFromUi(
-            this.plugin,
-            this.plugin.excludedFolders.filter((current) => current !== path),
-          ),
-        });
-      }
-    });
-  }
-
-  private renderAutomaticSection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.automaticSectionEl) return;
-    this.automaticSectionEl.empty();
-    const automaticGroup = new SettingGroup(this.automaticSectionEl).setHeading(
-      t("settings.group.automatic"),
-    );
-
-    // 片⑦（U4）：单向模式下「自动处理」组整体隐藏（只隐藏、不删除；双向照常）。
-    // 隐藏不等于开关失效：单向的删除跟随由 canonical-plan-v2 的单向改写强制恒开
-    // （autoDeleteLocalFiles 等效恒真）；两项存值保留，恢复双向后照常生效。
-    // 行定义与弹框入口原样保留，双向即恢复。`refreshSyncState()` 会重渲染本组，
-    // 所以切换模式后立即生效；声明式镜像同步同改（`buildSettingDefinitions`）。
-    if (this.plugin.syncDirection !== "one-way") {
-      automaticGroup.addSetting((setting) => {
-        setting
-          .setName(t("settings.automaticHandling.name"))
-          .setDesc(t("settings.automaticHandling.desc"))
-          .addButton((button) => {
-            button
-              .setButtonText(t("settings.automaticHandling.button"))
-              .setTooltip(t("settings.automaticHandling.open"))
-              .onClick(() => {
-                new AutomaticHandlingModal(this.plugin).open();
-              });
-            button.buttonEl.setAttribute(
-              "aria-label",
-              t("settings.automaticHandling.open"),
-            );
-          });
-      });
-    }
-
-    automaticGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.autoSync.name"))
-        .setDesc(
-          !this.plugin.isAutoSyncMasterEnabled()
-            ? t("settings.autoSync.desc.disabled")
-            : this.plugin.autoSyncPaused
-              ? t("settings.autoSync.desc.paused")
-              : t("settings.autoSync.desc.enabled"),
-        )
-        .addButton((button) => {
-          button
-            .setIcon("settings")
-            .setTooltip(t("settings.autoSync.open"))
-            .onClick(() => {
-              new AutoSyncModal(this.plugin).open();
-            });
-          button.buttonEl.addClass("clickable-icon");
-          button.buttonEl.setAttribute(
-            "aria-label",
-            t("settings.autoSync.open"),
-          );
-        })
-        .addToggle((toggle) => {
-          toggle
-            .setValue(this.plugin.isAutoSyncMasterEnabled())
-            .onChange(async (value) => {
-              await this.plugin.setAutoSyncMasterEnabled(value);
-              this.renderAutomaticSection(t);
-            });
-        });
-    });
-  }
-
-  private renderDisplaySection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.displaySectionEl) return;
-    this.displaySectionEl.empty();
-    const displayGroup = new SettingGroup(this.displaySectionEl).setHeading(
-      t("settings.group.display"),
-    );
-
-    displayGroup.addSetting((setting) => {
-      const hintEl = setting.descEl.createDiv({
-        cls: "easy-sync-notification-popups-hint",
-      });
-      const renderHint = (): void => {
-        hintEl.setText(t(`settings.notificationPopups.hint.${this.plugin.notificationPopups}`));
-      };
-      setting
-        .setName(t("settings.notificationPopups.name"))
-        .addDropdown((dropdown) => {
-          dropdown
-            .addOption("all", t("settings.notificationPopups.option.all"))
-            .addOption(
-              "important",
-              t("settings.notificationPopups.option.important"),
-            )
-            .addOption("off", t("settings.notificationPopups.option.off"))
-            .setValue(this.plugin.notificationPopups)
-            .onChange(async (value) => {
-              const previous = this.plugin.notificationPopups;
-              this.plugin.notificationPopups =
-                value === "important" || value === "off" ? value : "all";
-              try {
-                await this.plugin.saveSyncSettings();
-              } catch {
-                this.plugin.notificationPopups = previous;
-                dropdown.setValue(previous);
-                new Notice(t("notice.settingsSaveFailed"));
-                return;
-              }
-              this.plugin.applyNotificationPopups();
-              renderHint();
-            });
-        });
-      renderHint();
-    });
-    // 移动端专属开关：桌面端本行不渲染（显示隔离，桌面状态栏体系不受影响）。
-    if (this.platformFacts.isMobileApp) {
-      displayGroup.addSetting((setting) => {
-        applyMobileStatusBarRow(setting, {
-          plugin: this.plugin,
-          t,
-          refresh: () => this.refreshSyncState(),
-          noteExclusionChange: () => this.noteExclusionChange(),
-        });
-      });
-    }
-  }
-
-  private renderAboutSection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.aboutSectionEl) return;
-    this.aboutSectionEl.empty();
-    const aboutGroup = new SettingGroup(this.aboutSectionEl).setHeading(t("settings.group.about"));
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.product.name"))
-        .setDesc(t("settings.about.product.desc", { version: this.plugin.manifest.version }));
-      renderAboutUpdateAffordance(setting, t, this.plugin);
-    });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setClass("easy-sync-settings-about-contact-setting")
-        .setName(t("settings.about.author.name"))
-        .setDesc(t("settings.about.author.desc"))
-        .addButton((btn) => {
-          configureAboutContactButton(btn, {
-            label: t("settings.about.contact.github"),
-            icon: "github",
-            url: GITHUB_URL,
-          });
-        })
-        .addButton((btn) => {
-          configureAboutContactButton(btn, {
-            label: t("settings.about.contact.xiaohongshu"),
-            icon: "book-open",
-            url: XHS_URL,
-            extraClassName: "easy-sync-settings-about-contact-button--xiaohongshu",
-          });
-        });
-    });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.feedback.name"))
-        .setDesc(t("settings.about.feedback.desc"));
-    });
-  }
-
-  private renderMaintenanceSection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.maintenanceSectionEl) return;
-    this.maintenanceSectionEl.empty();
-    // 首组不加外侧标题（同各页口径，2026-10-12 拍板）：顶部只放诊断日志与报告。
-    const diagGroup = new SettingGroup(this.maintenanceSectionEl);
-
-    diagGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.diagLog.name"))
-        .setDesc(t("settings.diagLog.desc"))
-        .addToggle((toggle) => {
-          toggle
-            .setValue(this.plugin.diagLogEnabled)
-            .onChange(async (value) => {
-              const previous = this.plugin.diagLogEnabled;
-              this.plugin.diagLogEnabled = value;
-              try {
-                await this.plugin.saveSyncSettings();
-              } catch {
-                this.plugin.diagLogEnabled = previous;
-                toggle.setValue(previous);
-                new Notice(t("notice.settingsSaveFailed"));
-                return;
-              }
-              this.plugin.applyDiagnosticSetting();
-            });
-        });
-    });
-
-    diagGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.diagReport.name"))
-        .setDesc(t("settings.diagReport.desc"))
-        .addButton((btn) => {
-          btn.setButtonText(t("settings.diagReport.generate"))
-            .onClick(() => {
-              void this.plugin.generateDiagnosticReport();
-            });
-        });
-    });
-
-    if (!this.maintenanceAdvancedSectionEl) return;
-    this.maintenanceAdvancedSectionEl.empty();
-    // 「高级」组（2026-10-20 用户拍板）：同步回收站＋重置一组，回收站在上。
-    const advancedGroup = new SettingGroup(this.maintenanceAdvancedSectionEl)
-      .setHeading(t("settings.maintenanceAdvanced.heading"));
-
-    advancedGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.recoveryBin.name"))
-        .setDesc(t("settings.recoveryBin.desc"))
-        .addButton((btn) => {
-          btn.setButtonText(t("settings.recoveryBin.button")).onClick(() => {
-            this.plugin.openRecoveryEntry();
-          });
-        });
-    });
-
-    // 件③ 反转入口：单向模式且确有被忽略的条目时出现（忽略记忆在双向不生效）。
-    // 只隐藏、不删除——双向或计数归零后这一行自己退场；`refreshSyncState()`
-    // 会重渲染本组，所以面板里逐条/批量忽略后立刻出现。
-    if (
-      this.plugin.syncDirection === "one-way"
-      && this.plugin.getIgnoredLocalOnlyCount() > 0
-    ) {
-      advancedGroup.addSetting((setting) => {
-        applyLocalOnlyIgnoredRow(setting, {
-          plugin: this.plugin,
-          t,
-          refresh: () => this.refreshSyncState(),
-          noteExclusionChange: () => {},
-        });
-      });
-    }
-
-    advancedGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.reset.name"))
-        .setDesc(t("settings.reset.desc"))
-        .addButton((btn) => {
-          btn.buttonEl.classList.add("mod-warning");
-          btn.setButtonText(t("settings.reset.button")).onClick(() => {
-            void (async () => {
-              const confirmed = await new ConfirmModal(
-                this.plugin.app,
-                t("settings.reset.confirmTitle"),
-                t("settings.reset.confirm"),
-                t("confirm.cancel"),
-                t,
-                {
-                  message: t("settings.reset.confirmMessage"),
-                  warning: t("settings.reset.confirmWarning"),
-                  danger: true,
-                },
-              ).awaitConfirm();
-              if (!confirmed) return;
-              await this.plugin.resetSyncState();
-              this.refreshSyncState();
-            })();
-          });
-        });
-    });
-  }
-
-  /** Render the account login/logout row inside the unheaded top group. */
-  private renderAccount(
-    accountGroup: SettingGroup,
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    const auth = this.plugin.auth;
-    const authEntry = resolveAuthEntryPresentation({
-      isInitializing: auth?.isInitializing ?? false,
-      isPending: auth?.isPending ?? false,
-      isDevicePending: (auth?.deviceAttempt ?? null) !== null,
-    });
-    accountGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.account.name"))
-        .setDesc(
-          auth?.isSessionPending
-            ? t("settings.account.desc.connecting")
-            : auth?.authState.isLoggedIn
-              ? t("settings.account.desc.loggedIn", {
-                name: auth.authState.displayName || t("general.unknown"),
-              })
-              : t(authEntry.descriptionKey),
-        )
-        .addButton((btn) => {
-          if (auth?.authState.isLoggedIn) {
-            btn.setButtonText(t("settings.account.logout")).onClick(() => {
-              void (async () => {
-                await this.plugin.logoutUser();
-                this.refreshAuthState();
-              })();
-            });
-          } else {
-            btn.setButtonText(t(authEntry.labelKey));
-            if (authEntry.cta) btn.setCta();
-            if (authEntry.disabled) {
-              btn.setDisabled(true);
-            } else {
-              btn.onClick(() => {
-                void handleAuthEntryAction(this.plugin);
-              });
-            }
-          }
-        });
-    });
+  close(recalculate: () => Promise<void>): Promise<void> {
+    this.closePromise ??=
+      this.savedChange && this.hadPendingReview
+        ? recalculate()
+        : Promise.resolve();
+    return this.closePromise;
   }
 }
 
 /**
- * 片⑥ 同步模式行（命令式与声明式共用同一份实现）。
+ * 片⑥ 同步模式行（声明式账号组唯一实现）。
  *
  * 只承担模式选择：下拉改变即走门槛/关闭弹框，确认后才经设置事务写入；
  * 取消或忙碌（返回 false）就把下拉拨回当前模式。逐字使用文案稿
@@ -864,11 +353,9 @@ async function applySyncModeSelection(
 }
 
 /**
- * Build the unheaded account/login group plus the sync-panel entry for the
- * declarative setting index. On Obsidian 1.13.0+ the host renders the whole
- * tab from getSettingDefinitions() and never calls display(), so this group
- * must mirror renderAccountSection(): the account row is always visible and
- * the panel-entry row only appears after sign-in.
+ * Build the unheaded account/login group for the declarative setting index.
+ * The account row is always visible; the sync-mode and sync-panel rows only
+ * appear after sign-in.
  */
 export function buildAccountSettingDefinitions(
   t: I18nFn,
@@ -916,7 +403,7 @@ export function buildAccountSettingDefinitions(
       },
       {
         name: t("settings.syncMode.name"),
-        // 片⑥ 模式行：与命令式同组同位（账号行之下、面板行之上），同一份行实现。
+        // 片⑥ 模式行：账号行之下、面板行之上（U1）。
         visible: () => plugin.auth?.authState.isLoggedIn === true,
         render: (setting) => {
           renderSyncModeRow(setting, t, plugin);
@@ -924,8 +411,7 @@ export function buildAccountSettingDefinitions(
       },
       {
         name: t("settings.syncPanel.name"),
-        // The panel entry only exists after sign-in, mirroring
-        // renderAccountSection's early return for logged-out users.
+        // The panel entry only exists after sign-in.
         visible: () => plugin.auth?.authState.isLoggedIn === true,
         render: (setting) => {
           setting.addButton((btn) => {
@@ -943,10 +429,9 @@ export function buildAccountSettingDefinitions(
 }
 
 /**
- * Build the declarative setting index consumed by Obsidian 1.13.0+ settings
- * search. Pure function: rendering entries through `SettingDefinitionRender`
- * reuses the same imperative paths as `display()`, so plugin state and the
- * runtime UI stay unchanged. Exported separately for direct testing.
+ * Build the five entry pages for the declarative setting index consumed by
+ * the host settings renderer. Pure function; exported separately for direct
+ * testing.
  */
 export function buildSettingDefinitions(
   t: I18nFn,
@@ -1380,8 +865,8 @@ function buildMaintenancePage(
           render: (setting) => {
             setting.controlEl.empty();
             setting.addButton((btn) => {
-              // Mirror renderMaintenanceSection: destructive style plus a
-              // two-step confirm before any state is cleared.
+              // Destructive style plus a two-step confirm before any state is
+              // cleared.
               btn.buttonEl.classList.add("mod-warning");
               btn.setButtonText(t("settings.reset.button")).onClick(() => {
                 void (async () => {

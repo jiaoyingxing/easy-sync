@@ -216,7 +216,9 @@ describe("main sync entry guards", () => {
     const plugin = makePlugin();
     plugin.syncInterval = 3;
     plugin.autoSyncPaused = false;
-    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "account" },
+    } as never;
     plugin.state = {
       isV2StateActive: true,
       mutationLedger: [{ intent: { operationId: "pending" }, receipt: null }],
@@ -245,7 +247,9 @@ describe("main sync entry guards", () => {
     const plugin = makePlugin();
     plugin.syncInterval = 3;
     plugin.autoSyncPaused = false;
-    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "account" },
+    } as never;
     plugin._stateLoaded = true;
     plugin.state = {
       isV2StateActive: true,
@@ -322,7 +326,9 @@ describe("main sync entry guards", () => {
     const plugin = makePlugin();
     plugin.syncInterval = 3;
     plugin.autoSyncPaused = false;
-    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "account" },
+    } as never;
     plugin._stateLoaded = true;
     plugin.state = {
       isV2StateActive: true,

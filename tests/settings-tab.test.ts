@@ -1,75 +1,32 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
-import { ButtonComponent, Setting, createMockElement } from "./__mocks__/obsidian";
+import { createMockElement } from "./__mocks__/obsidian";
 import { EasySyncSettingTab } from "../src/ui/settings-tab";
-import { I18n } from "../src/i18n";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
 import type EasySyncPlugin from "../src/main";
 import { functionBody, readSourceFile } from "./helpers/source-scope";
 
 describe("settings tab", () => {
-  it("opens the sync panel from the imperative account row", async () => {
-    const openSyncPanelFromSettings = vi.fn().mockResolvedValue(undefined);
-    const tab = new EasySyncSettingTab({
-      app: {},
-      register: vi.fn(),
-      auth: {
-        authState: { isLoggedIn: true, displayName: "tester" },
-        isInitializing: false,
-        isPending: false,
-        deviceAttempt: null,
-      },
-      openSyncPanelFromSettings,
-    } as unknown as EasySyncPlugin);
-    (tab as unknown as { accountSectionEl: unknown }).accountSectionEl =
-      createMockElement();
-
-    let clickHandler: (() => void | Promise<void>) | null = null;
-    const onClickSpy = vi
-      .spyOn(ButtonComponent.prototype, "onClick")
-      .mockImplementation(function (
-        this: ButtonComponent,
-        callback: () => void | Promise<void>,
-      ) {
-        clickHandler = callback;
-        return this;
-      });
-    try {
-      (tab as unknown as {
-        renderAccountSection(t: (key: string) => string): void;
-      }).renderAccountSection((key) => key);
-      await clickHandler?.();
-    } finally {
-      onClickSpy.mockRestore();
-    }
-
-    expect(openSyncPanelFromSettings).toHaveBeenCalledTimes(1);
-  });
-
   it("keeps the settings page a navigation entry, not a second sync workbench", () => {
     const source = readSourceFile("src/ui/settings-tab.ts");
-    const accountSection = source.slice(
-      source.indexOf("  private renderAccountSection("),
-      source.indexOf("  private renderRangeSection("),
-    );
     const declarativeAccount = source.slice(
       source.indexOf("export function buildAccountSettingDefinitions("),
       source.indexOf("export function buildSettingDefinitions("),
     );
 
-    for (const block of [accountSection, declarativeAccount]) {
-      expect(block).toContain('t("settings.syncPanel.name")');
-      expect(block).toContain('.setButtonText(t("settings.syncPanel.button"))');
-      expect(block).toContain("openSyncPanelFromSettings()");
-      // 同步、计划确认与取消都归侧栏工作台；设置页不得再长出第二份动作
-      // （2026-10-09 拍板，取代 2026-08-16 的设置页「立即同步」动作行）。
-      expect(block).not.toContain("startManualSync");
-      expect(block).not.toContain("startFirstSync");
-      expect(block).not.toContain("executePlanReview");
-      expect(block).not.toContain("cancelSync");
-    }
+    expect(declarativeAccount).toContain('t("settings.syncPanel.name")');
+    expect(declarativeAccount).toContain(
+      '.setButtonText(t("settings.syncPanel.button"))',
+    );
+    expect(declarativeAccount).toContain("openSyncPanelFromSettings()");
+    // 同步、计划确认与取消都归侧栏工作台；设置页不得再长出第二份动作
+    // （2026-10-09 拍板，取代 2026-08-16 的设置页「立即同步」动作行）。
+    expect(declarativeAccount).not.toContain("startManualSync");
+    expect(declarativeAccount).not.toContain("startFirstSync");
+    expect(declarativeAccount).not.toContain("executePlanReview");
+    expect(declarativeAccount).not.toContain("cancelSync");
     expect(source).not.toContain("buildSettingsSyncButtonState");
     expect(zhCN["settings.syncPanel.name"]).toBe("同步面板");
     expect(zhCN["settings.syncPanel.button"]).toBe("打开");
@@ -77,126 +34,43 @@ describe("settings tab", () => {
     expect(en["settings.syncPanel.button"]).toBe("Open");
   });
 
-  it("keeps notification pop-ups progressive disclosure on both render paths", () => {
-    const source = readSourceFile("src/ui/settings-tab.ts");
-    const displaySectionStart = source.indexOf("  private renderDisplaySection(");
-    const aboutSectionStart = source.indexOf("  private renderAboutSection(");
-    const displaySection = source.slice(displaySectionStart, aboutSectionStart);
-
-    // Imperative path: the hint element lives in the row desc and follows the
-    // selected level without a full re-render.
-    expect(displaySection).toContain(
-      'const hintEl = setting.descEl.createDiv({',
-    );
-    expect(displaySection).toContain('cls: "easy-sync-notification-popups-hint"');
-    expect(displaySection).toContain(
-      't(`settings.notificationPopups.hint.${this.plugin.notificationPopups}`)',
-    );
-    expect(displaySection).toContain("renderHint();");
-
-    // Declarative path mirrors the same hint wiring for Obsidian 1.13+；1.13+ 起
-    // 通知行实现住在设置页行模块（2026-10-12 重构）。
+  it("keeps notification pop-ups progressive disclosure in the page rows module", () => {
+    // 1.13+ 起通知行实现住在设置页行模块（2026-10-12 重构）；<1.13 命令式
+    // 轨道已随 minAppVersion 1.13.4 退场。
     const declarative = readSourceFile("src/ui/settings-page-rows.ts");
     expect(declarative).toContain('"easy-sync-notification-popups-hint"');
     expect(declarative).toContain(
       't(`settings.notificationPopups.hint.${plugin.notificationPopups}`)',
     );
+    expect(declarative).toContain("renderHint();");
   });
 
-  it("keeps tooltip and aria-label on the automatic-handling entry of the legacy path (C10-2)", () => {
-    const source = readSourceFile("src/ui/settings-tab.ts");
-    const sectionStart = source.indexOf("  private renderAutomaticSection(");
-    const sectionEnd = source.indexOf("  private renderDisplaySection(");
-    const section = source.slice(sectionStart, sectionEnd);
-
-    // <1.13 旧路径的弹框入口按钮保留 tooltip + aria-label（C10-2 不丢）。
-    expect(section).toContain('setTooltip(t("settings.automaticHandling.open"))');
-    expect(section).toContain('"aria-label"');
-    expect(section).toContain('t("settings.automaticHandling.open"),');
-
-    // 1.13+ 声明式路径不再有弹框入口（页内直接是两条开关）：parity＝不存在，
-    // 因此本轮不再要求声明式侧镜像 tooltip/aria-label（2026-10-12 重构）。
-    const declarativeStart = source.indexOf("export function buildSettingDefinitions(");
-    const declarative = source.slice(declarativeStart);
-    expect(declarative).not.toContain("settings.automaticHandling.open");
-    expect(declarative).toContain('applyAutomaticHandlingRow(setting, host, "autoDeleteLocalFiles")');
-  });
-
-  it("keeps account actions unheaded and separates range from automatic settings", () => {
-    const source = readSourceFile("src/ui/settings-tab.ts");
-    const autoSyncModalSource = readSourceFile("src/ui/auto-sync-modal.ts");
-    const displayStart = source.indexOf("  display(): void {");
-    const refreshStart = source.indexOf("  refreshAuthState(): void {", displayStart);
-    const displaySource = source.slice(displayStart, refreshStart);
-    const accountSection = functionBody(source, "private renderAccountSection(");
-    const rangeSection = functionBody(source, "private renderRangeSection(");
-    const automaticSection = functionBody(source, "private renderAutomaticSection(");
-
-    expect(displaySource.indexOf("this.renderAccountSection(t)")).toBeLessThan(
-      displaySource.indexOf("this.renderRangeSection(t)"),
+  it("keeps the automatic-sync page sliders off-stopped at zero with master routing", () => {
+    // 两条滑条与启动开关的现役唯一实现在设置页行模块（<1.13 弹框轨道已退场）。
+    // 收窄到各自函数体：restartAutoSync 与 setter 只在该处接线，文件级断言会被
+    // 同文件别处的同名调用蒙过（同规则见《测试与检查规范》§3）。
+    const source = readSourceFile("src/ui/settings-page-rows.ts");
+    const intervalRow = functionBody(source, "export function applySyncIntervalRow(");
+    const delayRow = functionBody(
+      source,
+      "export function applyAutoSyncChangeDelayRow(",
     );
-    expect(displaySource.indexOf("this.renderRangeSection(t)")).toBeLessThan(
-      displaySource.indexOf("this.renderAutomaticSection(t)"),
+    const startupRow = functionBody(
+      source,
+      "export function applyAutoSyncOnStartupRow(",
     );
-    expect(accountSection).toContain("new SettingGroup(this.accountSectionEl)");
-    expect(accountSection).not.toContain(".setHeading(");
-    expect(accountSection).toContain('.setName(t("settings.syncPanel.name"))');
-    expect(accountSection).not.toContain('t("settings.syncPanel.desc")');
-    expect(rangeSection).toContain(".setHeading(");
-    expect(rangeSection).toContain('t("settings.group.scope")');
-    expect(rangeSection).toContain('.setName(t("settings.syncScope.name"))');
-    expect(rangeSection).toContain('.setName(t("settings.syncExclusion.name"))');
-    expect(rangeSection).not.toContain('t("settings.maxFileSize.name")');
-    expect(rangeSection).not.toContain(".setLimits(");
-    expect(rangeSection).not.toContain('t("settings.syncPanel.name")');
-    expect(rangeSection).not.toContain('t("settings.automaticHandling.name")');
-    expect(rangeSection).not.toContain('t("settings.autoSync.name")');
-    expect(rangeSection).not.toContain('t("settings.syncInterval.name")');
 
-    expect(automaticSection).toContain('t("settings.group.automatic")');
-    expect(automaticSection).toContain('setName(t("settings.automaticHandling.name"))');
-    expect(automaticSection).toContain('setName(t("settings.autoSync.name"))');
-    // Auto sync is a single row: toggle + configure (gear) button, sliders live in the modal.
-    expect(automaticSection).toContain('.setIcon("settings")');
-    expect(automaticSection).toContain('t("settings.autoSync.open")');
-    expect(automaticSection).not.toContain('setName(t("settings.syncInterval.name"))');
-    expect(automaticSection).not.toContain(
-      'setName(t("settings.autoSyncChangeDelay.name"))',
-    );
-    expect(automaticSection).not.toContain(".setLimits(");
-    expect(automaticSection).not.toContain("setAutoSyncChangeDelaySeconds");
-    expect(automaticSection).not.toContain("describeAutoSyncChangeDelay");
-    // The settings-page toggle reads the derived master state (either channel
-    // enabled) and routes through the plugin's master switch.
-    expect(automaticSection).toContain("isAutoSyncMasterEnabled()");
-    expect(automaticSection).toContain("setAutoSyncMasterEnabled(value)");
-    expect(autoSyncModalSource).toContain('setName(t("settings.syncInterval.name"))');
-    expect(autoSyncModalSource).toContain(
-      'setName(t("settings.autoSyncChangeDelay.name"))',
-    );
     // Both sliders run 0–10 with the leftmost stop = off: scheduled sync
     // stores 0 or 1–10 minutes, the change-delay slider 0–10 seconds.
-    // 收窄到弹框的 onOpen：这两个滑杆与重启都只在那里接线，文件级断言会被
-    // 同文件别处的同名调用蒙过（同规则见《测试与检查规范》§3）。
-    const autoSyncOnOpen = functionBody(autoSyncModalSource, "onOpen(): void");
-    expect(autoSyncOnOpen).toContain(".setLimits(0, 10, 1)");
-    expect(autoSyncModalSource).not.toContain("SYNC_INTERVAL_OFF_SLIDER_VALUE");
-    expect(autoSyncModalSource).toContain(
-      "this.plugin.setAutoSyncChangeDelaySeconds(value)",
-    );
-    expect(autoSyncOnOpen).toContain("restartAutoSync");
-    expect(automaticSection).not.toContain('t("settings.maxFileSize.name")');
-    expect(automaticSection).toContain(
-      'setButtonText(t("settings.automaticHandling.button"))',
-    );
-    expect(automaticSection).toContain('t("settings.automaticHandling.open")');
-    expect(automaticSection).toContain('setAttribute(\n            "aria-label"');
-    expect(automaticSection).not.toContain(".addExtraButton");
-    expect(automaticSection).not.toContain('setName(t("settings.autoMerge.name"))');
-    expect(zhCN["settings.group.scope"]).toBe("范围");
-    expect(en["settings.group.scope"]).toBe("Scope");
-    expect(zhCN["settings.group.automatic"]).toBe("自动");
-    expect(en["settings.group.automatic"]).toBe("Automatic");
+    expect(intervalRow).toContain(".setLimits(0, 10, 1)");
+    expect(delayRow).toContain(".setLimits(0, 10, 1)");
+    expect(intervalRow).toContain("restartAutoSync");
+    expect(delayRow).toContain("plugin.setAutoSyncChangeDelaySeconds(value)");
+    expect(delayRow).toContain("restartAutoSync");
+    expect(startupRow).toContain("plugin.setAutoSyncOnStartup(value)");
+    expect(startupRow).toContain("restartAutoSync");
+    expect(source).not.toContain("SYNC_INTERVAL_OFF_SLIDER_VALUE");
+
     expect(zhCN["settings.syncInterval.name"]).toBe("定时同步");
     expect(zhCN["settings.syncInterval.desc"]).toBe(
       "每 {minutes} 分钟同步一次。",
@@ -223,9 +97,9 @@ describe("settings tab", () => {
     );
   });
 
-  it("applies the tab container class at construction time for both render paths", () => {
-    // Obsidian 1.13.0+ renders the tab declaratively and never calls
-    // display(), so the class CSS scopes by must exist before any rendering.
+  it("applies the tab container class at construction time", () => {
+    // The host renders the tab declaratively and never calls display(), so
+    // the class CSS scope must exist before any rendering.
     const tab = new EasySyncSettingTab({
       app: {},
       register: vi.fn(),
@@ -255,14 +129,12 @@ describe("settings tab", () => {
     expect(subpageRule).toContain("min-width: calc(4em + var(--size-4-3) * 2)");
   });
 
-  it("uses a native folder picker and native settings for device-local exclusions", () => {
-    const source = readSourceFile("src/ui/sync-exclusion-modal.ts");
-    const settingsSource = readSourceFile("src/ui/settings-tab.ts");
-    // 收窄：这两条句子在各自目标文件里都出现多次（定义处／导入处／别的方法），
+  it("uses a native folder picker and removable chips for device-local exclusions", () => {
+    const source = readSourceFile("src/ui/settings-page-rows.ts");
+    // 收窄：这几条句子在同一文件里都出现多次（定义处／导入处／别的方法），
     // 文件级断言删掉真正那一处也照样绿。
     const pickerItems = functionBody(source, "getItems(): SyncExclusionFolderCandidate[]");
-    const nativeSettings = functionBody(source, "private render(): void");
-    const rangeSection = functionBody(settingsSource, "private renderRangeSection(");
+    const foldersRow = functionBody(source, "export function applyExcludedFoldersRow(");
 
     expect(source).toContain(
       "extends FuzzySuggestModal<SyncExclusionFolderCandidate>",
@@ -270,26 +142,17 @@ describe("settings tab", () => {
     expect(source).toContain("getAllLoadedFiles");
     expect(source).toContain("instanceof TFolder");
     expect(pickerItems).toContain("buildSyncExclusionFolderCandidates");
-    expect(source).toContain("createSyncExclusionFolderSnapshot");
-    expect(source).toContain("rebuildPlanReview");
-    expect(source).toContain("updateExcludedFolders");
-    expect(nativeSettings).toContain("new Setting(");
-    expect(source).toMatch(
-      /text: t\("settings\.syncExclusion\.intro"\),\s*cls: "setting-item-description easy-sync-modal-intro"/,
-    );
-    // 大型文件排除的自定义值输入（2026-09-16 用户拍板引入，Resojot renderModelField
-    // 同型常驻双控件）是本弹框唯一允许的文本控件，防止自由文本输入蔓延。
-    expect(source.match(/\.addText\(/g)?.length).toBe(1);
+    expect(foldersRow).toContain("createSyncExclusionFolderSnapshot");
+    expect(foldersRow).toContain("updateExcludedFoldersFromUi");
+    expect(foldersRow).toContain("noteExclusionChange");
     expect(source).not.toContain("textarea");
     expect(source).not.toContain("startManualSync");
     expect(source).toContain("new ExtraButtonComponent(chipEl)");
     expect(source).toContain('.setIcon("x")');
-    expect(rangeSection).toContain("renderExcludedFolderChips");
-    expect(rangeSection).toContain("setting.descEl.createDiv()");
-    expect(rangeSection).toContain("updateExcludedFoldersFromUi");
+    expect(foldersRow).toContain("renderExcludedFolderChips");
   });
   it("mirrors the official hotkey chip geometry without depending on internal host classes", () => {
-    const source = readSourceFile("src/ui/sync-exclusion-modal.ts");
+    const source = readSourceFile("src/ui/settings-page-rows.ts");
     const styles = readSourceFile("styles.css");
     const chipBlock = styles.match(
       /\.easy-sync-exclusion-chip\s*\{([^}]*)\}/,
@@ -326,7 +189,6 @@ describe("settings tab", () => {
 
   it("keeps long settings modals within the viewport with one scroll surface", () => {
     const configSource = readSourceFile("src/ui/config-sync-modal.ts");
-    const exclusionSource = readSourceFile("src/ui/sync-exclusion-modal.ts");
     const styles = readSourceFile("styles.css");
     const modalBlock = styles.match(/\.easy-sync-settings-modal\s*\{([^}]*)\}/)?.[1] ?? "";
     const contentBlock = styles.match(
@@ -334,7 +196,6 @@ describe("settings tab", () => {
     )?.[1] ?? "";
 
     expect(configSource).toContain('modalEl.addClass("easy-sync-settings-modal")');
-    expect(exclusionSource).toContain('modalEl.addClass("easy-sync-settings-modal")');
     // 2026-10-30 弹框共享件：上限收敛为共享变量一处定义（值仍 80vh）。
     expect(modalBlock).toContain("max-height: var(--easy-sync-modal-max-height)");
     expect(modalBlock).toContain("overflow: hidden");
@@ -1417,9 +1278,6 @@ describe("settings tab", () => {
 
   it("keeps sync exclusion copy device-local and non-destructive in both locales", () => {
     expect(zhCN["settings.syncScope.name"]).toBe("同步范围");
-    expect(zhCN["settings.syncScope.desc"]).toBe(
-      "选择要同步的 Obsidian 配置、主题和插件文件。",
-    );
     // 规则句（用户 2026-10-12 定稿）：两设备语义＋⚙ 引导；同一句也作同步视图
     // 「范围管理」弹框（scope 视图）的 intro，弹框 intro 下方同样有带 ⚙ 的行。
     expect(zhCN["settings.syncScope.intro"]).toBe(
@@ -1428,7 +1286,7 @@ describe("settings tab", () => {
     expect(en["settings.syncScope.intro"]).toBe(
       "These settings apply to this device only; sync starts only once your other devices enable them too. Click the gear below to control whether each plugin takes part in sync.",
     );
-    // 自动同步弹框顶部指引（用户 2026-09-23 定稿）：0 值语义 + 被打断后的恢复动作。
+    // 自动同步规则句（用户 2026-09-23 定稿）：0 值语义 + 被打断后的恢复动作。
     expect(zhCN["settings.autoSync.intro"]).toBe(
       "拖到最左侧（归零）即关闭；自动同步若被特殊状态打断，须手动同步一次才继续。",
     );
@@ -1444,33 +1302,19 @@ describe("settings tab", () => {
     expect(en["syncView.selfBundleReview.conflictSummary"]).toBe(
       "This plugin’s local copy and its cloud version conflict. Which do you want to keep?",
     );
-    // 弹框顶部说明在手机上会被宿主的内容列向 flex 挤成 0 高（行数最多的同步范围
-    // 弹框首当其冲）：四个弹框都用同一类保住自己的盒子，样式里有对应规则。
-    for (const modalSource of [
-      "src/ui/config-sync-modal.ts",
-      "src/ui/sync-exclusion-modal.ts",
-      "src/ui/automatic-handling-modal.ts",
-      "src/ui/auto-sync-modal.ts",
-    ]) {
-      expect(readSourceFile(modalSource)).toContain(
-        "setting-item-description easy-sync-modal-intro",
-      );
-    }
+    // 弹框顶部说明在手机上会被宿主的内容列向 flex 挤成 0 高：现役弹框用同一类
+    // 保住自己的盒子，样式里有对应规则（<1.13 三弹框轨道已退场）。
+    expect(readSourceFile("src/ui/config-sync-modal.ts")).toContain(
+      "setting-item-description easy-sync-modal-intro",
+    );
     expect(readSourceFile("styles.css")).toMatch(
       /\.easy-sync-modal-intro\s*\{[^}]*flex:\s*0 0 auto/s,
     );
     expect(en["settings.syncScope.name"]).toBe("Sync scope");
-    expect(zhCN["settings.syncExclusion.name"]).toBe("同步排除");
-    expect(zhCN["settings.syncExclusion.desc"]).toBe(
-      "选择此设备不参与同步的文件夹，也可排除超过指定大小的文件。",
-    );
     expect(zhCN["settings.syncExclusion.intro"]).toBe(
       "只影响此设备。所选文件夹及其内容不会上传或下载，现有文件不会因此被删除。",
     );
     expect(zhCN["settings.syncExclusion.folders.name"]).toBe("不同步的文件夹");
-    expect(en["settings.syncExclusion.desc"]).toBe(
-      "Choose folders this device will not sync. You can also exclude files above a size limit.",
-    );
     expect(en["settings.syncExclusion.intro"]).toContain("will not be deleted");
   });
 
@@ -1532,61 +1376,6 @@ describe("settings tab", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
-  it("hides the automatic handling row in one-way mode on the imperative path", () => {
-    const names: string[] = [];
-    const setNameSpy = vi.spyOn(Setting.prototype, "setName")
-      .mockImplementation(function (this: Setting, name: string) {
-        names.push(name);
-        return this;
-      });
-    try {
-      const renderNames = (direction: "two-way" | "one-way") => {
-        names.length = 0;
-        const tab = new EasySyncSettingTab({
-          app: {},
-          register: vi.fn(),
-          syncDirection: direction,
-          i18n: { t: (key: string) => key },
-          autoSyncPaused: false,
-          isAutoSyncMasterEnabled: () => true,
-          setAutoSyncMasterEnabled: vi.fn().mockResolvedValue(undefined),
-        } as unknown as EasySyncPlugin);
-        (tab as unknown as { automaticSectionEl: unknown })
-          .automaticSectionEl = createMockElement();
-        (tab as unknown as {
-          renderAutomaticSection(t: (key: string) => string): void;
-        }).renderAutomaticSection((key) => key);
-        return [...names];
-      };
-
-      // 双向：两行都在（「自动处理」行只隐藏、不删除）。
-      const twoWay = renderNames("two-way");
-      expect(twoWay).toContain("settings.automaticHandling.name");
-      expect(twoWay).toContain("settings.autoSync.name");
-
-      // 单向：入口行不渲染；「自动同步」行照常。
-      const oneWay = renderNames("one-way");
-      expect(oneWay).not.toContain("settings.automaticHandling.name");
-      expect(oneWay).toContain("settings.autoSync.name");
-    } finally {
-      setNameSpy.mockRestore();
-    }
-  });
-
-  it("renders both automatic handling choices as native toggles without triggering sync", () => {
-    const source = readSourceFile("src/ui/automatic-handling-modal.ts");
-    // 收窄：两个开关与它们的提交都接在 onOpen 里；文件级断言会被同文件别处
-    // （类型声明、别的分支）的同名字段蒙过。
-    const onOpen = functionBody(source, "onOpen(): void");
-
-    expect(source.match(/new Setting\(/g)).toHaveLength(2);
-    expect(onOpen).toContain("autoDeleteLocalFiles");
-    expect(onOpen).toContain("mergeNonOverlappingText");
-    expect(onOpen).toContain("updateAutomaticHandlingPolicy");
-    expect(source).not.toContain("startManualSync");
-    expect(source).not.toContain("confirmRemoteDelete");
-  });
-
   it("keeps the sync mode hints and the local-only row copy directional", () => {
     // 模式行两条说明句（2026-10-12 末轮定稿）：单向＝云端的修改与删除会同步到
     // 本机、本机不再主动上传（"不再主动向云端上传"是用户点名的核心点）；
@@ -1617,9 +1406,6 @@ describe("settings tab", () => {
   });
 
   it("keeps automatic handling copy directional and condition-accurate", () => {
-    expect(zhCN["settings.automaticHandling.desc"]).toBe(
-      "选择同步时可自动完成的操作。",
-    );
     expect(zhCN["settings.automaticHandling.intro"]).toBe(
       "选项从下一次同步起生效，不会立即改动文件。",
     );
@@ -1654,19 +1440,19 @@ describe("settings tab", () => {
 });
 
 describe("settings save call sites", () => {
-  it("wraps every settings-tab save with rollback and a failure notice (C10-5 同形)", () => {
+  it("wraps every settings save with rollback and a failure notice (C10-5 同形)", () => {
     // C10-5 同形缺口(账本 §七):saveSyncSettings 调用失败时必须回滚内存与控件并
     // 提示，而不是 unhandled rejection 且其后的 apply*/渲染被跳过。
-    // 2026-10-12 重构后拆两处承接：命令式路径与模式行留在 settings-tab.ts，
-    // 1.13+ 页面行（通知／滑条×2／启动后立即同步／自动处理×2／大文件排除／
-    // 移动端状态图标）在 settings-page-rows.ts。
+    // 现役拆两处承接：模式行／规则行／诊断开关在 settings-tab.ts，页面行
+    // （通知／滑条×2／启动后立即同步／自动处理×2／大文件排除／移动端状态图标）
+    // 在 settings-page-rows.ts。<1.13 命令式轨道已随 minAppVersion 1.13.4 退场。
     const tabSource = readSourceFile("src/ui/settings-tab.ts");
     const rowsSource = readSourceFile("src/ui/settings-page-rows.ts");
     const count = (text: string, needle: string) => text.split(needle).length - 1;
-    expect(count(tabSource, "notice.settingsSaveFailed")).toBe(5);
+    expect(count(tabSource, "notice.settingsSaveFailed")).toBe(3);
     expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(7);
     // 回滚语义：控件拨回上一值；自动处理开关按内存现值拨回（同义）。
-    expect(count(tabSource, ".setValue(previous)")).toBe(4);
+    expect(count(tabSource, ".setValue(previous)")).toBe(2);
     expect(count(rowsSource, ".setValue(previous)")).toBe(6);
     expect(rowsSource).toContain(
       "toggle.setValue(plugin.automaticHandlingPolicy[policyKey]);",
@@ -1683,96 +1469,11 @@ describe("settings save call sites", () => {
     expect(tabSource).not.toContain("buildSettingRulesRestoreRow");
   });
 
-  it("wraps the exclusion modal max-size persistence with rollback and a failure notice", () => {
-    const source = readSourceFile("src/ui/sync-exclusion-modal.ts");
-    const start = source.indexOf("private async persistMaxFileSizeMb(");
-    const next = source.indexOf("private async", start + 10);
-    const fn = source.slice(start, next === -1 ? undefined : next);
-    expect(fn).toContain("notice.settingsSaveFailed");
-    expect(fn).toContain("this.syncMaxFileSizeDropdownSelection()");
-    expect(fn).toContain("this.plugin.applyMaxFileSize()");
-  });
-});
-
-describe("imperative maintenance group · local-only reversal row (件③)", () => {
-  function renderRowNames(
-    plugin: EasySyncPlugin,
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): Array<{ name: string; desc?: string }> {
-    const tab = new EasySyncSettingTab(plugin);
-    const host = tab as unknown as Record<string, unknown>;
-    host.maintenanceSectionEl = createMockElement();
-    // 2026-10-20 起维护页拆两组：顶部诊断＋「高级」组，两组宿主都要给。
-    host.maintenanceAdvancedSectionEl = createMockElement();
-    const rows: Array<{ name: string; desc?: string }> = [];
-    let current: { name: string; desc?: string } | null = null;
-    const nameSpy = vi.spyOn(Setting.prototype, "setName").mockImplementation(
-      function (this: Setting, name: string) {
-        current = { name };
-        rows.push(current);
-        return this;
-      },
-    );
-    const descSpy = vi.spyOn(Setting.prototype, "setDesc").mockImplementation(
-      function (this: Setting, desc: string) {
-        if (current) current.desc = desc;
-        return this;
-      },
-    );
-    try {
-      (tab as unknown as {
-        renderMaintenanceSection(t: unknown): void;
-      }).renderMaintenanceSection(t);
-    } finally {
-      nameSpy.mockRestore();
-      descSpy.mockRestore();
-    }
-    return rows;
-  }
-
-  function makeMaintenancePlugin(options: {
-    direction: string;
-    ignoredCount: number;
-  }): EasySyncPlugin {
-    return {
-      app: {},
-      register: vi.fn(),
-      syncDirection: options.direction,
-      getIgnoredLocalOnlyCount: () => options.ignoredCount,
-      clearLocalOnlyIgnores: vi.fn().mockResolvedValue(undefined),
-      diagLogEnabled: false,
-      generateDiagnosticReport: vi.fn().mockResolvedValue(undefined),
-      resetSyncState: vi.fn().mockResolvedValue(undefined),
-      openRecoveryEntry: vi.fn(),
-    } as unknown as EasySyncPlugin;
-  }
-
-  const t = new I18n("zh-cn").t.bind(new I18n("zh-cn"));
-
-  it("keeps the row out of the group unless one-way mode still has ignored entries", () => {
-    const namesIn = (plugin: EasySyncPlugin) =>
-      renderRowNames(plugin, t).map((row) => row.name);
-
-    // 双向：不出现（忽略记忆在双向不生效）。
-    expect(namesIn(makeMaintenancePlugin({ direction: "two-way", ignoredCount: 4 })))
-      .not.toContain(t("settings.localOnlyIgnored.name"));
-    // 单向但没有可收回的内容：保持零动作干净态。
-    expect(namesIn(makeMaintenancePlugin({ direction: "one-way", ignoredCount: 0 })))
-      .not.toContain(t("settings.localOnlyIgnored.name"));
-    // 单向且有被忽略的条目：出现在「同步回收站」与「重置」之间（「高级」组
-    // 内，2026-10-20 用户拍板分组），说明带计数。
-    const rows = renderRowNames(
-      makeMaintenancePlugin({ direction: "one-way", ignoredCount: 4 }),
-      t,
-    );
-    expect(rows.map((row) => row.name)).toEqual([
-      t("settings.diagLog.name"),
-      t("settings.diagReport.name"),
-      // 「高级」组首行＝同步回收站（同组在重置之上）。
-      t("settings.recoveryBin.name"),
-      t("settings.localOnlyIgnored.name"),
-      t("settings.reset.name"),
-    ]);
-    expect(rows[3].desc).toBe(t("settings.localOnlyIgnored.desc", { count: 4 }));
+  it("wraps the max-file-size persistence with rollback and a failure notice", () => {
+    const source = readSourceFile("src/ui/settings-page-rows.ts");
+    const persist = functionBody(source, "const persist = async (value: number)");
+    expect(persist).toContain("notice.settingsSaveFailed");
+    expect(persist).toContain("plugin.syncMaxFileSizeMb = previous");
+    expect(persist).toContain("plugin.applyMaxFileSize()");
   });
 });

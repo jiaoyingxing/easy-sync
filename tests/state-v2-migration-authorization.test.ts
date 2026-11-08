@@ -253,6 +253,8 @@ describe("V1 to V2 controlled production activation", () => {
       undefined,
       { activateV2State: true },
     );
+    // The healthy round publishes its recovery hint off the critical path.
+    await harness.executor.settleBackgroundTasks();
 
     expect(first.success).toBe(true);
     expect(harness.state.isV2StateActive).toBe(true);
@@ -284,6 +286,44 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.cloudBootstrap.read).not.toHaveBeenCalled();
     expect(harness.cloudBootstrap.update).not.toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
+  });
+
+  it("returns a healthy round before its recovery hint publication lands without blocking the next round", async () => {
+    const harness = makeHarness({ enableCloudBootstrap: true });
+    await harness.state.load();
+    // The recovery-hint publication is a non-authoritative tail: make its
+    // create-only request hang and prove (a) the round still returns, (b) a
+    // following round starts and finishes regardless, and (c) the chained
+    // publication stays single-flight (one create, no second write).
+    let releaseCreate: (() => void) | null = null;
+    const firstCreate = harness.cloudBootstrap.create.getMockImplementation()!;
+    harness.cloudBootstrap.create.mockImplementationOnce(
+      async (vaultName: string, content: string) =>
+        new Promise((resolve) => {
+          releaseCreate = () => {
+            void firstCreate(vaultName, content).then(resolve);
+          };
+        }),
+    );
+
+    const activated = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    );
+    expect(activated.success).toBe(true);
+    expect(harness.state.isV2StateActive).toBe(true);
+    await vi.waitFor(() =>
+      expect(harness.cloudBootstrap.create).toHaveBeenCalledOnce());
+
+    const second = await harness.executor.run("manual");
+    expect(second.success).toBe(true);
+
+    releaseCreate!();
+    await harness.executor.settleBackgroundTasks();
+    expect(harness.cloudBootstrap.create).toHaveBeenCalledOnce();
   });
 
   it("keeps a cold-started active V2 community-plugin round to one delta request", async () => {
@@ -323,6 +363,9 @@ describe("V1 to V2 controlled production activation", () => {
     );
     expect(activated.success).toBe(true);
     expect(harness.state.isV2StateActive).toBe(true);
+    // Settle the activation round's off-path hint publication before the
+    // emulated restart, so the restarted executor is the only writer.
+    await harness.executor.settleBackgroundTasks();
 
     const restartedState = new StateManager(harness.plugin);
     await restartedState.load();

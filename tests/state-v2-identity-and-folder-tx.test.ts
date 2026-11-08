@@ -1258,7 +1258,7 @@ describe("V1 to V2 controlled production activation", () => {
     await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
 
     // 删除记录簿（文件版本找回刀一之二）：文件夹级删除按远端 id 记一条，
-    // 并随设备本地记录族落进 data.json。
+    // 并落进设备本地的追加式 sidecar；data.json 只留空壳键（一次性迁移后）。
     expect(harness.state.deletionLedgerEntries).toEqual([
       {
         remoteId: "folder-notes",
@@ -1267,11 +1267,11 @@ describe("V1 to V2 controlled production activation", () => {
         kind: "folder",
       },
     ]);
-    expect(harness.pluginData["easy-sync-deletion-ledger"]).toEqual({
-      schemaVersion: 1,
-      kind: "easy-sync-deletion-ledger",
-      entries: harness.state.deletionLedgerEntries,
-    });
+    const ledgerLog = harness.files.get(
+      getEasySyncPaths(".obsidian").deletionLedgerFile,
+    ) ?? "";
+    expect(ledgerLog).toContain("\"remoteId\":\"folder-notes\"");
+    expect(harness.pluginData["easy-sync-deletion-ledger"].entries).toEqual([]);
   });
 
   it("expires an empty-folder choice when local candidates or remote versions change", async () => {
@@ -3434,7 +3434,7 @@ describe("V1 to V2 controlled production activation", () => {
     remote.file = { hashes: { sha256Hash: changedHash } };
     remote.eTag = "etag-download-receipt-lost";
     remote.cTag = "ctag-download-receipt-lost";
-    const receiptWrite = vi.spyOn(harness.state, "recordMutationReceipt")
+    const receiptWrite = vi.spyOn(harness.state, "recordMutationReceipts")
       .mockRejectedValueOnce(new Error("receipt persistence failed"));
 
     const recovered = await harness.executor.run("manual");
@@ -3445,6 +3445,9 @@ describe("V1 to V2 controlled production activation", () => {
       errors: 0,
     });
     expect(harness.mutations.downloadFile).toHaveBeenCalledOnce();
+    // First attempt fails; the bounded retry writes the receipt before the
+    // checkpoint. The ledger is empty and the base is advanced below, which
+    // proves the receipt became durable.
     expect(receiptWrite).toHaveBeenCalledTimes(2);
     expect(harness.localEntryState[0]).toMatchObject({
       path: localA.path,

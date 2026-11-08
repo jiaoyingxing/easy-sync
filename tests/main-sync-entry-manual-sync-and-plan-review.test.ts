@@ -1642,7 +1642,9 @@ describe("main sync entry guards", () => {
     const runOnce = async (recoveryRow: boolean) => {
       const plugin = makePlugin();
       plugin.syncInterval = 3;
-      plugin.auth = { authState: { isLoggedIn: true } } as never;
+      plugin.auth = {
+        authState: { isLoggedIn: true, accountId: "account" },
+      } as never;
       plugin._stateLoaded = true;
       plugin.autoSyncPaused = true;
       (plugin as never as { mutationRecoveryBlockReason: string | null })
@@ -1728,7 +1730,9 @@ describe("main sync entry guards", () => {
   it("keeps the observation channel while any stuck record lacks a manual exit", () => {
     const plugin = makePlugin();
     plugin.syncInterval = 3;
-    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "account" },
+    } as never;
     plugin._stateLoaded = true;
     plugin.autoSyncPaused = true;
     plugin.state = {
@@ -1765,6 +1769,350 @@ describe("main sync entry guards", () => {
     ];
     expect(request("all-resolvable")).toBe(false);
     plugin.mutationRecoveryScheduler.cancel();
+  });
+
+  it("does not schedule mutation recovery while the account is still unverified", () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "" },
+    } as never;
+    plugin._stateLoaded = true;
+    plugin.state = {
+      isV2StateActive: true,
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+      planReviewActive: false,
+      syncHistory: [],
+    } as never;
+    const pause = vi.spyOn(plugin as never, "pauseForMutationRecoveryBlock")
+      .mockResolvedValue(undefined);
+    const request = (plugin as never as {
+      requestMutationRecoveryObservation: (trigger: string) => boolean;
+    }).requestMutationRecoveryObservation.bind(plugin);
+
+    expect(request("auth-state")).toBe(false);
+    expect(pause).not.toHaveBeenCalled();
+    expect(plugin.autoSyncPaused).toBe(false);
+  });
+
+  it("waits for /me instead of writing an account-changed block", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "" },
+    } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+      planReviewActive: false,
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+    } as never;
+    const pause = vi.spyOn(plugin as never, "pauseForMutationRecoveryBlock")
+      .mockResolvedValue(undefined);
+    const checkAccountBinding = vi.spyOn(plugin as never, "checkAccountBinding")
+      .mockResolvedValue(false);
+
+    await expect((plugin as never as {
+      runScheduledMutationRecoveryObservation: (args: {
+        continuation: {
+          settled: boolean;
+          continueAfterIsolatedRecovery: boolean;
+        };
+      }) => Promise<{ state: string }>;
+    }).runScheduledMutationRecoveryObservation({
+      continuation: { settled: false, continueAfterIsolatedRecovery: false },
+    })).resolves.toEqual({ state: "inactive" });
+
+    expect(checkAccountBinding).not.toHaveBeenCalled();
+    expect(pause).not.toHaveBeenCalled();
+    expect(plugin.autoSyncPaused).toBe(false);
+  });
+
+  it("refuses an unverified manual entry without an account-changed block, but still blocks a real mismatch", async () => {
+    const run = async (accountId: string) => {
+      const plugin = makePlugin();
+      plugin.auth = {
+        authState: { isLoggedIn: true, accountId },
+      } as never;
+      plugin.state = {
+        boundAccountId: "bound",
+        isV2StateActive: true,
+        mutationLedger: [{
+          intent: { operationId: "pending", path: "notes/a.md" },
+          receipt: null,
+        }],
+        mutationRecoveryQuarantine: [],
+        hasMutationLedgerCorruption: false,
+        hasMutationRecoveryQuarantineCorruption: false,
+        hasV2StateLoadRecoveryBlock: false,
+        hasV2RemoteScopeRecovery: false,
+        planReviewActive: false,
+      } as never;
+      const pause = vi.spyOn(plugin as never, "pauseForMutationRecoveryBlock")
+        .mockResolvedValue(undefined);
+      const checkAccountBinding = vi.spyOn(plugin as never, "checkAccountBinding")
+        .mockResolvedValue(false);
+      const result = await (plugin as never as {
+        checkAccountBindingForSync: () => Promise<boolean>;
+      }).checkAccountBindingForSync();
+      return { result, pause, checkAccountBinding };
+    };
+
+    const unverified = await run("");
+    expect(unverified.result).toBe(false);
+    expect(unverified.checkAccountBinding).not.toHaveBeenCalled();
+    expect(unverified.pause).not.toHaveBeenCalled();
+
+    const mismatch = await run("other");
+    expect(mismatch.result).toBe(false);
+    expect(mismatch.checkAccountBinding).toHaveBeenCalledOnce();
+    expect(mismatch.pause).toHaveBeenCalledWith("account-changed");
+  });
+
+  it("releases a stale account-changed block once /me binds the bound account", async () => {
+    const plugin = makePlugin();
+    const history: SyncHistoryEntry[] = [{
+      id: "mutation-recovery-1",
+      mode: "auto",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 1,
+      files: [],
+      recovery: {
+        state: "blocked",
+        total: 8,
+        settled: 0,
+        remaining: 8,
+        updatedAt: 2,
+        blockReason: "account-changed",
+      },
+    }];
+    const addSyncHistory = vi.fn().mockImplementation(async (
+      entry: SyncHistoryEntry,
+    ) => {
+      history.splice(0, history.length, entry);
+    });
+    plugin.state = {
+      boundAccountId: "bound",
+      isV2StateActive: true,
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+      mutationRecoveryQuarantine: [],
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      planReviewActive: false,
+      syncHistory: history,
+      addSyncHistory,
+    } as never;
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "bound" },
+    } as never;
+    plugin._stateLoaded = true;
+    plugin.autoSyncPaused = true;
+    (plugin as never as { mutationRecoveryBlockReason: string | null })
+      .mutationRecoveryBlockReason = "account-changed";
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync")
+      .mockImplementation(() => undefined);
+    (plugin as never as { updateStatusBar: unknown }).updateStatusBar = vi.fn();
+
+    await (plugin as never as {
+      resumeRecoveryAfterAccountVerification: () => Promise<void>;
+    }).resumeRecoveryAfterAccountVerification();
+
+    expect(
+      (plugin as never as { mutationRecoveryBlockReason: string | null })
+        .mutationRecoveryBlockReason,
+    ).toBeNull();
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).toHaveBeenCalledOnce();
+    expect(history[0].recovery).toMatchObject({
+      state: "waiting-network",
+      remaining: 1,
+    });
+    expect(history[0].recovery?.blockReason).toBeUndefined();
+  });
+
+  it("keeps the pause when the account still differs or a plan review owns it", async () => {
+    const run = async (accountId: string, planReviewActive: boolean) => {
+      const plugin = makePlugin();
+      plugin.state = {
+        boundAccountId: "bound",
+        isV2StateActive: true,
+        mutationLedger: [{
+          intent: { operationId: "pending", path: "notes/a.md" },
+          receipt: null,
+        }],
+        mutationRecoveryQuarantine: [],
+        hasMutationLedgerCorruption: false,
+        hasMutationRecoveryQuarantineCorruption: false,
+        hasV2StateLoadRecoveryBlock: false,
+        hasV2RemoteScopeRecovery: false,
+        planReviewActive,
+        syncHistory: [{
+          id: "mutation-recovery-1",
+          mode: "auto",
+          status: "partial",
+          startedAt: 1,
+          endedAt: 2,
+          recovery: {
+            state: "blocked",
+            total: 1,
+            settled: 0,
+            remaining: 1,
+            updatedAt: 2,
+            blockReason: "account-changed",
+          },
+        }],
+        addSyncHistory: vi.fn().mockResolvedValue(undefined),
+      } as never;
+      plugin.auth = {
+        authState: { isLoggedIn: true, accountId },
+      } as never;
+      plugin._stateLoaded = true;
+      plugin.autoSyncPaused = true;
+      (plugin as never as { mutationRecoveryBlockReason: string | null })
+        .mutationRecoveryBlockReason = "account-changed";
+      const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+        .mockResolvedValue(undefined);
+      const startAutoSync = vi.spyOn(plugin, "startAutoSync")
+        .mockImplementation(() => undefined);
+      (plugin as never as { updateStatusBar: unknown }).updateStatusBar = vi.fn();
+
+      await (plugin as never as {
+        resumeRecoveryAfterAccountVerification: () => Promise<void>;
+      }).resumeRecoveryAfterAccountVerification();
+      return {
+        plugin,
+        saveSyncSettings,
+        startAutoSync,
+        reason: (plugin as never as { mutationRecoveryBlockReason: string | null })
+          .mutationRecoveryBlockReason,
+      };
+    };
+
+    const different = await run("other", false);
+    expect(different.reason).toBe("account-changed");
+    expect(different.plugin.autoSyncPaused).toBe(true);
+    expect(different.saveSyncSettings).not.toHaveBeenCalled();
+
+    const reviewing = await run("bound", true);
+    expect(reviewing.reason).toBeNull();
+    expect(reviewing.plugin.autoSyncPaused).toBe(true);
+    expect(reviewing.saveSyncSettings).not.toHaveBeenCalled();
+    expect(reviewing.startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("settles a stale account-changed row even when a newer history row exists", async () => {
+    const run = async (forceResetAt: number) => {
+      const plugin = makePlugin();
+      const history: SyncHistoryEntry[] = [{
+        id: "fresh",
+        mode: "auto",
+        status: "success",
+        startedAt: 3,
+        endedAt: 4,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        skipped: 0,
+        errors: 0,
+        files: [],
+      }, {
+        id: "mutation-recovery-1",
+        mode: "auto",
+        status: "partial",
+        startedAt: 1,
+        endedAt: 2,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        skipped: 0,
+        errors: 1,
+        files: [],
+        recovery: {
+          state: "blocked",
+          total: 8,
+          settled: 0,
+          remaining: 8,
+          updatedAt: 2,
+          blockReason: "account-changed",
+        },
+      }];
+      const addSyncHistory = vi.fn().mockImplementation(async (
+        entry: SyncHistoryEntry,
+      ) => {
+        history.splice(0, history.length, entry);
+      });
+      plugin.state = {
+        boundAccountId: "bound",
+        isV2StateActive: true,
+        mutationLedger: [],
+        mutationRecoveryQuarantine: [],
+        hasMutationLedgerCorruption: false,
+        hasMutationRecoveryQuarantineCorruption: false,
+        hasV2StateLoadRecoveryBlock: false,
+        hasV2RemoteScopeRecovery: false,
+        planReviewActive: false,
+        syncHistory: history,
+        addSyncHistory,
+        forceResetAudit: forceResetAt > 0
+          ? {
+              at: forceResetAt,
+              ledgerCount: 8,
+              quarantineCount: 0,
+              corrupt: false,
+            }
+          : null,
+      } as never;
+      plugin.auth = {
+        authState: { isLoggedIn: true, accountId: "bound" },
+      } as never;
+      plugin._stateLoaded = true;
+      plugin.autoSyncPaused = false;
+      (plugin as never as { updateStatusBar: unknown }).updateStatusBar = vi.fn();
+
+      await (plugin as never as {
+        resumeRecoveryAfterAccountVerification: () => Promise<void>;
+      }).resumeRecoveryAfterAccountVerification();
+      return { addSyncHistory, history };
+    };
+
+    // The block was already settled by a later round; its row is still the
+    // active recovery evidence but no longer the newest history entry.
+    const stale = await run(0);
+    expect(stale.addSyncHistory).toHaveBeenCalledOnce();
+    expect(
+      stale.history.find((entry) => entry.id === "mutation-recovery-1")
+        ?.recovery,
+    ).toMatchObject({ state: "recovered", remaining: 0 });
+
+    // A force reset terminated tracking after the block: keep the audit row.
+    const reset = await run(3);
+    expect(reset.addSyncHistory).not.toHaveBeenCalled();
   });
 
   it("updates one continuing history event across retries and marks it recovered when evidence settles", async () => {
@@ -1860,6 +2208,81 @@ describe("main sync entry guards", () => {
       recovery: {
         state: "recovered",
         settled: 1,
+        remaining: 0,
+      },
+    });
+  });
+
+  it("settles the recovery evidence row when a plan-review pause ends the round", async () => {
+    const plugin = new EasySyncPlugin();
+    const history: SyncHistoryEntry[] = [{
+      id: "mutation-recovery-1",
+      mode: "auto",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 1,
+      files: [],
+      recovery: {
+        state: "blocked",
+        total: 8,
+        settled: 0,
+        remaining: 8,
+        updatedAt: 2,
+        blockReason: "account-changed",
+      },
+    }];
+    const addSyncHistory = vi.fn().mockImplementation(async (
+      entry: SyncHistoryEntry,
+    ) => {
+      history.splice(0, history.length, entry);
+    });
+    plugin.state = { syncHistory: history, addSyncHistory } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.progressStore.markStarted("mutationRecovery");
+
+    await (plugin as never as {
+      recordSyncHistory: (
+        result: SyncResult,
+        mode: "manual",
+        recoveryOnly: boolean,
+        context: {
+          priorTotal: number;
+          priorRemaining: number;
+          newRemaining: number;
+        },
+      ) => Promise<void>;
+    }).recordSyncHistory({
+      ...okResult(),
+      mutationRecovery: {
+        state: "settled",
+        total: 8,
+        settled: 8,
+        remaining: 0,
+        retryAfterSeconds: null,
+      },
+      runFacts: { planReviewPaused: true },
+    } as SyncResult, "manual", false, {
+      priorTotal: 8,
+      priorRemaining: 0,
+      newRemaining: 0,
+    });
+
+    // The plan review suppresses the ordinary history row, but the recovery
+    // it already settled must not stay blocked on disk.
+    expect(addSyncHistory).toHaveBeenCalledOnce();
+    expect(history[0]).toMatchObject({
+      id: "mutation-recovery-1",
+      status: "success",
+      errors: 0,
+      recovery: {
+        state: "recovered",
+        settled: 8,
         remaining: 0,
       },
     });

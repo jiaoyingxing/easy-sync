@@ -494,10 +494,10 @@ describe("buildAccountSettingDefinitions", () => {
     expect(modeItem?.visible?.()).toBe(true);
   });
 
-  it("renders the sync-mode row from one shared implementation in both paths", () => {
+  it("renders the sync-mode row from one single-track implementation", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
-    // 定义一处＋命令式与声明式各调用一处（双路同改，不补声明式则 1.13+ 搜索不到）。
-    expect(source.split("renderSyncModeRow(").length - 1).toBe(3);
+    // 定义一处＋声明式调用一处（<1.13 命令式轨道已随 minAppVersion 1.13.4 退场）。
+    expect(source.split("renderSyncModeRow(").length - 1).toBe(2);
     const row = source.slice(
       source.indexOf("export function renderSyncModeRow("),
       source.indexOf("async function applySyncModeSelection("),
@@ -688,7 +688,7 @@ describe("declarative reset button", () => {
   });
 });
 
-describe("declarative completeness vs display()", () => {
+describe("declarative completeness", () => {
   function pageItems(
     defs: ReturnType<typeof buildSettingDefinitions>,
     pageName: string,
@@ -703,53 +703,6 @@ describe("declarative completeness vs display()", () => {
       | undefined;
     return page?.items ?? [];
   }
-
-  it("registers every legacy display() row name in the definition tree", () => {
-    // 防双轨漂移（判据取行名、不取实现函数名）：<1.13 display() 渲染的每一行，
-    // 其行名必须在定义树登记；有意移除项显式登记理由，反向不报。
-    const i18n = new I18n("zh-cn");
-    const t = i18n.t.bind(i18n);
-    const plugin = createMockPlugin();
-    const defs = [
-      buildAccountSettingDefinitions(t, plugin),
-      ...buildSettingDefinitions(t, plugin),
-    ];
-    const treeNames: string[] = [];
-    const walk = (def: unknown): void => {
-      const typed = def as { name?: string; items?: unknown[] };
-      if (typed.name) treeNames.push(typed.name);
-      (typed.items ?? []).forEach((item) => walk(item));
-    };
-    defs.forEach((def) => walk(def));
-
-    const legacyRowNames = [
-      t("settings.account.name"),
-      t("settings.syncMode.name"),
-      t("settings.syncPanel.name"),
-      t("settings.syncScope.name"),
-      t("settings.syncExclusion.name"),
-      t("settings.automaticHandling.name"),
-      t("settings.autoSync.name"),
-      t("settings.notificationPopups.name"),
-      t("settings.about.product.name"),
-      t("settings.about.author.name"),
-      t("settings.about.feedback.name"),
-      t("settings.diagLog.name"),
-      t("settings.diagReport.name"),
-      t("settings.reset.name"),
-    ];
-    // 有意移除（不复现为行）：内容已迁入页面／分组（2026-10-11 拍板）。
-    const intentionalRemovals = [
-      t("settings.syncExclusion.name"), // 内容＝同步范围页顶部的两行＋chips
-      t("settings.automaticHandling.name"), // 内容＝自动同步页「自动处理」分组的两个开关
-    ];
-    const missing = legacyRowNames.filter(
-      (name) => !treeNames.includes(name) && !intentionalRemovals.includes(name),
-    );
-    expect(missing).toEqual([]);
-    // 反向不报：定义树里的新面（规则／同步内容）不要求旧路径有对应行。
-    expect(treeNames).toContain(t("settings.rules.name"));
-  });
 
   it("renders the auto sync master row with one toggle and no modal-entry button", () => {
     const i18n = new I18n("zh-cn");

@@ -88,6 +88,9 @@ export interface RecoveryIndexDepsV1 {
   state: {
     remoteIdForPath(path: string): string | undefined;
     remoteETagForPath(path: string): string | undefined;
+    /** Optional so older tests/state doubles without the sidecar hook still
+     *  type-check; the real StateManager always exposes it. */
+    ensureDeletionLedgerLoaded?(): Promise<void>;
     readonly deletionLedgerEntries: readonly DeletionLedgerEntryV1[];
     getBaseContent(path: string): Promise<string | undefined>;
     baselineFactsForPath(
@@ -177,6 +180,7 @@ export class RecoveryIndexV1 {
   }
 
   private async listGlobalEntries(now: number): Promise<RecoveryEntryV1[]> {
+    await this.deps.state.ensureDeletionLedgerLoaded?.();
     return [
       ...await this.dropIdenticalLocalArchiveV1(
         await this.localArchiveEntries(),
@@ -190,6 +194,7 @@ export class RecoveryIndexV1 {
     path: string,
     now: number,
   ): Promise<RecoveryEntryV1[]> {
+    await this.deps.state.ensureDeletionLedgerLoaded?.();
     const entries: RecoveryEntryV1[] = [];
     const localArchives = await this.dropIdenticalLocalArchiveV1(
       await this.localArchiveEntries(),

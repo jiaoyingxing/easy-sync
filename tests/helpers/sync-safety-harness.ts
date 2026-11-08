@@ -603,6 +603,27 @@ export function makeActiveV2State(
   state.recordMutationReceipts = vi.fn(async (receipts) => {
     for (const receipt of receipts) await state.recordMutationReceipt(receipt);
   });
+  // Cleanup/confirm waves write receipts and deletion clues in one durable
+  // commit. Model the single write directly (without routing through the
+  // singular per-record spied APIs), so a wave that used the old two-write
+  // path remains visible as a different call shape.
+  state.recordMutationReceiptsAndCloudDeletions = vi.fn(async (
+    receipts: MutationReceiptV1[],
+    deletions: DeletionLedgerEntryV1[],
+  ) => {
+    for (const receipt of receipts) {
+      const record = state.mutationLedger.find(
+        (candidate) => candidate.intent.operationId === receipt.operationId,
+      );
+      if (!record) {
+        throw new Error(`Mutation intent missing: ${receipt.operationId}`);
+      }
+      record.receipt = receipt;
+    }
+    for (const entry of deletions) {
+      deletionLedger = upsertDeletionLedgerEntryV1(deletionLedger, entry);
+    }
+  });
   state.rebaseReceiptedRenameSpelling = vi.fn(async (input: {
     expected: MutationLedgerEntryV1;
     path: string;

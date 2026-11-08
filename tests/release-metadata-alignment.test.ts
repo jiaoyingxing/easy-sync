@@ -40,7 +40,7 @@ const MAX_DESCRIPTION_LENGTH = 250;
  *  change must update that register and the Release Notes in the same round
  *  (the gate turns red here so the pair cannot drift apart silently). */
 const RELEASE_BASELINE = {
-  minAppVersion: "1.11.4",
+  minAppVersion: "1.13.4",
   isDesktopOnly: false,
   author: "Jiao Yingxing",
 };
@@ -176,12 +176,12 @@ describe("release metadata alignment gate", () => {
         id: "easy-sync",
         name: "EasySync",
         version: "1.6.0",
-        minAppVersion: "1.11.4",
+        minAppVersion: "1.13.4",
         isDesktopOnly: false,
         author: "Jiao Yingxing",
         description: "OneDrive sync for Obsidian.",
       },
-      versions: { "1.6.0": "1.11.4" },
+      versions: { "1.6.0": "1.13.4" },
       packageLock: { version: "1.6.0", packages: { "": { version: "1.6.0" } } },
     };
     expect(collectMetadataIssues(aligned).issues).toEqual([]);

@@ -145,6 +145,99 @@ export function pruneDeletionLedgerV1(
   return { ...base, entries: entries.map((entry) => ({ ...entry })) };
 }
 
+/**
+ * Append-only log helpers (2026-11-08).
+ *
+ * The durable ledger is one JSON object per line: a header line followed by
+ * entry lines. Appending is O(new entries), so a 50k-file bulk delete no
+ * longer rewrites a growing snapshot once per wave. Parsing is tolerant by
+ * contract: a torn last line or any malformed line is skipped (a lost clue is
+ * allowed; a read failure never corrupts the family), and the same remote id
+ * appearing more than once keeps the newer `deletedAt`.
+ */
+
+export function deletionLedgerLogHeaderLineV1(): string {
+  return JSON.stringify({
+    schemaVersion: DELETION_LEDGER_SCHEMA_VERSION,
+    kind: DELETION_LEDGER_KIND,
+  });
+}
+
+export function deletionLedgerEntryLineV1(
+  entry: DeletionLedgerEntryV1,
+): string {
+  return JSON.stringify({
+    remoteId: entry.remoteId,
+    path: entry.path,
+    deletedAt: entry.deletedAt,
+    kind: entry.kind,
+  });
+}
+
+interface DeletionLedgerLogParseV1 {
+  entries: DeletionLedgerEntryV1[];
+  /** Non-empty physical lines seen, including headers and malformed lines. */
+  lines: number;
+  malformedLines: number;
+}
+
+export function parseDeletionLedgerLogV1(
+  content: string,
+): DeletionLedgerLogParseV1 {
+  const byRemoteId = new Map<string, DeletionLedgerEntryV1>();
+  let lines = 0;
+  let malformedLines = 0;
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    lines += 1;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      malformedLines += 1;
+      continue;
+    }
+    if (isDeletionLedgerLogHeaderV1(parsed)) continue;
+    const entry = readDeletionLedgerEntryV1(parsed);
+    if (!entry) {
+      malformedLines += 1;
+      continue;
+    }
+    const existing = byRemoteId.get(entry.remoteId);
+    if (!existing || entry.deletedAt >= existing.deletedAt) {
+      byRemoteId.set(entry.remoteId, entry);
+    }
+  }
+  return {
+    entries: [...byRemoteId.values()],
+    lines,
+    malformedLines,
+  };
+}
+
+export function serializeDeletionLedgerLogV1(
+  family: DeletionLedgerV1,
+): string {
+  const lines = [deletionLedgerLogHeaderLineV1()];
+  for (const entry of family.entries) {
+    lines.push(deletionLedgerEntryLineV1(entry));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function isDeletionLedgerLogHeaderV1(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as {
+    schemaVersion?: unknown;
+    kind?: unknown;
+    remoteId?: unknown;
+  };
+  return candidate.schemaVersion === DELETION_LEDGER_SCHEMA_VERSION
+    && candidate.kind === DELETION_LEDGER_KIND
+    && candidate.remoteId === undefined;
+}
+
 function sameDeletionLedgerEntryV1(
   left: DeletionLedgerEntryV1,
   right: DeletionLedgerEntryV1,

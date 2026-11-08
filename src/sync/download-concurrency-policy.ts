@@ -1,7 +1,10 @@
 import { SIGNIFICANT_THROUGHPUT_DROP_RATIO } from "./transfer-throughput-threshold";
 
 export const ADAPTIVE_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024;
-export const ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY = 3;
+/** Desktop ceiling (2026-11-08): 3 → 4 after the group-commit work made the
+ *  per-file fixed costs non-dominant; the field link's 200 × 18 B download
+ *  round was content-transfer bound at 3. Mobile stays at 2 (memory bound). */
+export const ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY = 4;
 export const MOBILE_DOWNLOAD_MAX_CONCURRENCY = 2;
 
 const MIN_HEALTHY_BATCH_BYTES = 128 * 1024;

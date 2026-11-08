@@ -66,6 +66,7 @@ import {
   inspectReceiptedRenameAnchorCollisionV2,
   reduceFileStateEnvelopeV2,
   reduceFileStateEnvelopeV2Deletions,
+  reduceFileStateEnvelopeV2Upserts,
 } from "./file-state-reducer-v2";
 import {
   projectRemoteIndexV2,
@@ -154,10 +155,13 @@ import {
 } from "./local-only-copies";
 import {
   deletionLedgerCutoffV1,
+  deletionLedgerEntryLineV1,
+  deletionLedgerLogHeaderLineV1,
   emptyDeletionLedgerV1,
+  parseDeletionLedgerLogV1,
   pruneDeletionLedgerV1,
   readDeletionLedgerV1,
-  upsertDeletionLedgerEntryV1,
+  serializeDeletionLedgerLogV1,
   type DeletionLedgerEntryV1,
   type DeletionLedgerV1,
 } from "./deletion-ledger";
@@ -717,6 +721,10 @@ const KEY_LOCAL_DELETE_DECISIONS = "easy-sync-local-delete-decisions";
 const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
 /** 删除记录簿（设备本地记录族，不进 V2 信封、不进同步）。 */
 const KEY_DELETION_LEDGER = "easy-sync-deletion-ledger";
+/** The ledger is an append-only JSONL sidecar now; these thresholds bound the
+ *  dead-line growth without paying a rewrite on every healthy round. */
+const DELETION_LEDGER_COMPACT_EXPIRED_THRESHOLD = 1_000;
+const DELETION_LEDGER_COMPACT_DEAD_LINES_THRESHOLD = 200;
 /** 片⑤ 忽略记忆：「留在本机，不再提醒」的本机清单（只影响提醒）。 */
 const KEY_LOCAL_ONLY_IGNORE_MEMORY = "easy-sync-local-only-ignore-memory";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
@@ -1081,6 +1089,37 @@ interface V2CommitOptions {
 export class StateManager {
   private data: PluginData;
   private pluginDataCommitQueue: Promise<void> = Promise.resolve();
+  /** Device-local deletion ledger, physically an append-only JSONL sidecar.
+   *  It is deliberately outside `PluginData`: embedding it made every
+   *  plugin-data write (checkpoints, round end, uploads, downloads) serialize
+   *  the whole ledger, and a bulk delete re-wrote a growing ledger once per
+   *  wave (O(N²) bytes). The family below is the in-memory view; the log is
+   *  the durable one. */
+  private deletionLedger: DeletionLedgerV1 = emptyDeletionLedgerV1();
+  private deletionLedgerLoaded = false;
+  private deletionLedgerLoadPromise: Promise<void> | null = null;
+  /** Lines currently in the log (including dead/duplicate ones), used to
+   *  decide when a compaction is worth one rewrite. */
+  private deletionLedgerLineCount = 0;
+  /** Set when the log exists but cannot be read. Writes stay blocked for the
+   *  session so a temporary read failure cannot overwrite recoverable clues. */
+  private deletionLedgerWriteBlocked = false;
+  /** One diagnostic per load when the host adapter lacks append(): the
+   *  fallback is still correct but rewrites the log, so field evidence can
+   *  tell a slow bulk delete from a missing host primitive. */
+  private deletionLedgerAppendFallbackWarned = false;
+  /** Bumped by `load()` so an in-flight lazy-load task from the previous
+   *  session cannot publish stale entries (or a stale write-block) into the
+   *  new one (reset / self-heal reload). */
+  private deletionLedgerEpoch = 0;
+  /** Serializes append/compact/migrate. Folder deletes run concurrently
+   *  (`Promise.all`) and each may record its own clue, so two first-time
+   *  writers must never race a header write into the same file. */
+  private deletionLedgerWriteQueue: Promise<void> = Promise.resolve();
+  /** A crash can leave a torn last line without a newline; the next append
+   *  must start on a fresh line or the first new entry merges into it and is
+   *  lost by the parser. */
+  private deletionLedgerNeedsNewline = false;
   private remoteState: RemoteSyncState | null = null;
   private v2Envelope: SyncStateEnvelopeV2 | null = null;
   private v2PathView: StatePathViewV2 | null = null;
@@ -1184,6 +1223,14 @@ export class StateManager {
     this.remoteState = null;
     this.ancestorStoreV2 = null;
     this.pendingV2AncestorContent.clear();
+    this.deletionLedger = emptyDeletionLedgerV1();
+    this.deletionLedgerLoaded = false;
+    this.deletionLedgerLoadPromise = null;
+    this.deletionLedgerLineCount = 0;
+    this.deletionLedgerWriteBlocked = false;
+    this.deletionLedgerAppendFallbackWarned = false;
+    this.deletionLedgerNeedsNewline = false;
+    this.deletionLedgerEpoch += 1;
     const layoutPaths = getEasySyncPaths(
       this.plugin.app.vault,
       this.plugin.manifest.id,
@@ -1216,6 +1263,15 @@ export class StateManager {
     if (saved) {
       await this.applyLoadedPluginData(saved);
     }
+    // One-time upgrade: move the legacy data.json ledger into the append-only
+    // sidecar before any other consumer reads it. A failure keeps the legacy
+    // key in `this.data` (and therefore in every later save) and retries on
+    // the next load; clues are never dropped to gain the write reduction.
+    await this.migrateLegacyDeletionLedgerSidecar();
+    // A deferred migration (unreadable adapter, blocked write) must not hide
+    // the clues from this session's recovery list: merge the legacy family
+    // into the in-memory view. The next load retries the file write.
+    this.mergeLegacyDeletionLedgerIntoMemory();
     await this.retireCommunityPluginEnablementPluginData(saved ?? {});
     const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
     const adapter = this.plugin.app.vault.adapter;
@@ -1995,16 +2051,37 @@ export class StateManager {
 
   /**
    * 健康轮的 30 天摘除：删除记录簿条目与留档夹目录都已出（或即将出）官方回收站
-   * 的留存窗口。两步各自独立、任何失败都不上抛、无变化不写盘——housekeeping 不
-   * 得影响同步，失败只留诊断。
+   * 的留存窗口。两步各自独立、任何失败都不上抛——housekeeping 不得影响同步。
+   *
+   * 记录簿是追加式日志：本方法只更新内存并**按阈值**压实（过期 ≥1,000 条或
+   * 死行 ≥200 行），不再每轮重写整本；无阈值命中时零写盘。
    */
   private async pruneExpiredRecoveryClues(now = Date.now()): Promise<void> {
     try {
-      await this.commitPluginData((current) => {
-        const family = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
-        const next = pruneDeletionLedgerV1(family, { now });
-        if (next === family) return current;
-        return { ...current, [KEY_DELETION_LEDGER]: next };
+      await this.ensureDeletionLedgerLoaded();
+      await this.enqueueDeletionLedgerWrite(async () => {
+        const epoch = this.deletionLedgerEpoch;
+        if (this.deletionLedgerWriteBlocked) return;
+        const current = this.deletionLedger;
+        const live = pruneDeletionLedgerV1(current, { now });
+        const expired = current.entries.length - live.entries.length;
+        // `lineCount` includes the header line, so the live line count is
+        // entries + 1.
+        const deadLines = Math.max(
+          0,
+          this.deletionLedgerLineCount - (live.entries.length + 1),
+        );
+        if (
+          expired >= DELETION_LEDGER_COMPACT_EXPIRED_THRESHOLD
+          || deadLines >= DELETION_LEDGER_COMPACT_DEAD_LINES_THRESHOLD
+        ) {
+          await this.compactDeletionLedgerUnqueued(live);
+          if (epoch !== this.deletionLedgerEpoch) return;
+          this.deletionLedgerLineCount = live.entries.length + 1;
+          this.deletionLedgerNeedsNewline = false;
+        }
+        if (epoch !== this.deletionLedgerEpoch) return;
+        this.deletionLedger = live;
       });
     } catch (error) {
       this.plugin.diag?.warn(
@@ -2040,41 +2117,334 @@ export class StateManager {
   }
 
   /**
+   * Load the append-only deletion-ledger log once per state load. The recovery
+   * index and the delete path await this before reading; the sync plan never
+   * reads the ledger, so a vault that never deletes never parses it.
+   */
+  async ensureDeletionLedgerLoaded(): Promise<void> {
+    if (this.deletionLedgerLoaded) return;
+    if (this.deletionLedgerLoadPromise) return this.deletionLedgerLoadPromise;
+    const epoch = this.deletionLedgerEpoch;
+    const task = (async () => {
+      const adapter = this.plugin.app.vault.adapter;
+      const path = this.deletionLedgerPath();
+      const hasExists = typeof (adapter as { exists?: unknown }).exists
+        === "function";
+      let raw: string | null = null;
+      try {
+        if (hasExists && !await adapter.exists(path)) {
+          raw = null;
+        } else {
+          raw = await adapter.read(path);
+        }
+      } catch (error) {
+        if (epoch !== this.deletionLedgerEpoch) return;
+        if (!hasExists) {
+          // A narrow adapter without exists() cannot distinguish "missing"
+          // from "unreadable"; keep the legacy "missing" contract for tests,
+          // but never overwrite an unreadable file (the append fallback
+          // re-reads before writing and fails closed instead).
+          raw = null;
+        } else {
+          this.deletionLedger = emptyDeletionLedgerV1();
+          this.deletionLedgerLineCount = 0;
+          this.deletionLedgerLoaded = true;
+          this.deletionLedgerWriteBlocked = true;
+          this.plugin.diag?.warn(
+            "state",
+            "deletion ledger sidecar could not be read; writes are blocked for this session",
+            { error: describeError(error) },
+          );
+          return;
+        }
+      }
+      if (epoch !== this.deletionLedgerEpoch) return;
+      if (raw === null) {
+        this.deletionLedger = emptyDeletionLedgerV1();
+        this.deletionLedgerLineCount = 0;
+        this.deletionLedgerNeedsNewline = false;
+      } else {
+        const parsed = parseDeletionLedgerLogV1(raw);
+        this.deletionLedger = {
+          schemaVersion: 1,
+          kind: "easy-sync-deletion-ledger",
+          entries: parsed.entries,
+        };
+        this.deletionLedgerLineCount = parsed.lines;
+        this.deletionLedgerNeedsNewline = raw.length > 0
+          && !raw.endsWith("\n");
+        if (parsed.malformedLines > 0) {
+          this.plugin.diag?.warn(
+            "state",
+            "deletion ledger sidecar skipped malformed lines",
+            { malformedLines: parsed.malformedLines, mutations: 0 },
+          );
+        }
+      }
+      this.deletionLedgerLoaded = true;
+    })();
+    this.deletionLedgerLoadPromise = task;
+    try {
+      await task;
+    } finally {
+      if (this.deletionLedgerLoadPromise === task) {
+        this.deletionLedgerLoadPromise = null;
+      }
+    }
+  }
+
+  /**
    * 删除记录簿：本设备每执行一次「删除云端内容」记一条可恢复线索（远端 item id
    * 是官方回收站里唯一可用的入口）。身份＝远端 id，重放＝更新。
    */
   get deletionLedgerEntries(): readonly DeletionLedgerEntryV1[] {
-    return this.data[KEY_DELETION_LEDGER].entries;
+    return this.deletionLedger.entries;
   }
 
   async recordCloudDeletion(entry: DeletionLedgerEntryV1): Promise<void> {
-    await this.commitPluginData((current) => {
-      const family = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
-      const next = upsertDeletionLedgerEntryV1(family, entry);
-      if (next === family) return current;
-      return { ...current, [KEY_DELETION_LEDGER]: next };
-    });
+    await this.appendDeletionLedgerEntries([entry]);
   }
 
   /**
-   * Deletion-ledger half of a cleanup wave: one device-local write for the
-   * whole wave. Upserts keep the remote-id identity semantics of
-   * `recordCloudDeletion`; the ledger only serves the recovery clue, so a
-   * lost wave may cost one clue but never blocks the already-applied delete.
+   * Deletion-ledger half of a cleanup wave: one append for the whole wave.
+   * The ledger only serves the recovery clue, so a lost wave may cost one
+   * clue but never blocks the already-applied delete.
    */
   async recordCloudDeletions(
     entries: readonly DeletionLedgerEntryV1[],
   ): Promise<void> {
     if (entries.length === 0) return;
-    await this.commitPluginData((current) => {
-      const previous = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
-      let next = previous;
-      for (const entry of entries) {
-        next = upsertDeletionLedgerEntryV1(next, entry);
+    await this.appendDeletionLedgerEntries(entries);
+  }
+
+  /** Receipts stay fail-closed in plugin data; the ledger half is a separate
+   *  append-only line batch. SC-15 only requires the receipts before the
+   *  checkpoint, and the caller retries the receipt half alone if the ledger
+   *  append fails (a ledger-only failure stays non-fatal). */
+  async recordMutationReceiptsAndCloudDeletions(
+    receipts: readonly MutationReceiptV1[],
+    deletions: readonly DeletionLedgerEntryV1[],
+  ): Promise<void> {
+    if (receipts.length === 0 && deletions.length === 0) return;
+    if (receipts.length > 0) {
+      if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+        throw new Error("Mutation receipt requires active V2 authority");
       }
-      if (next === previous) return current;
-      return { ...current, [KEY_DELETION_LEDGER]: next };
+      if (this.mutationLedgerCorrupt) {
+        throw new Error("Mutation recovery ledger is corrupt");
+      }
+      await this.commitPluginData((current) =>
+        this.applyMutationReceipts(current, receipts));
+    }
+    if (deletions.length > 0) {
+      await this.appendDeletionLedgerEntries(deletions);
+    }
+  }
+
+  private deletionLedgerPath(): string {
+    return getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    ).deletionLedgerFile;
+  }
+
+  /** Serialize every ledger write. `then(task, task)` keeps the chain alive
+   *  after a failed write (the caller still receives its own rejection). */
+  private enqueueDeletionLedgerWrite<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.deletionLedgerWriteQueue.then(task, task);
+    this.deletionLedgerWriteQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** Append the entries as JSONL in one I/O call, then publish them to the
+   *  in-memory family. A failed append leaves memory unchanged: the caller's
+   *  existing "clue lost" contract applies, and the delete itself is already
+   *  applied. All appends are serialized: folder deletes run concurrently and
+   *  two first-time writers must not race the header. */
+  private async appendDeletionLedgerEntries(
+    entries: readonly DeletionLedgerEntryV1[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.enqueueDeletionLedgerWrite(async () => {
+      const epoch = this.deletionLedgerEpoch;
+      await this.ensureDeletionLedgerLoaded();
+      if (this.deletionLedgerWriteBlocked) {
+        throw new Error(
+          "Deletion ledger writes are blocked after an unreadable sidecar",
+        );
+      }
+      // One map pass per batch: a replayed identical entry is not a write,
+      // a stale replay never rolls back a newer record, and the array is
+      // rebuilt once (O(N + batch), not N copies per wave).
+      const byId = new Map(
+        this.deletionLedger.entries.map((entry) => [entry.remoteId, entry]),
+      );
+      const pending: DeletionLedgerEntryV1[] = [];
+      for (const entry of entries) {
+        const existing = byId.get(entry.remoteId);
+        if (
+          existing
+          && existing.deletedAt === entry.deletedAt
+          && existing.path === entry.path
+          && existing.kind === entry.kind
+        ) continue;
+        if (existing && existing.deletedAt > entry.deletedAt) continue;
+        pending.push(entry);
+        byId.set(entry.remoteId, entry);
+      }
+      if (pending.length === 0) return;
+      const adapter = this.plugin.app.vault.adapter as {
+        exists?: (path: string) => Promise<boolean>;
+        read: (path: string) => Promise<string>;
+        write: (path: string, data: string) => Promise<void>;
+        append?: (path: string, data: string) => Promise<void>;
+      };
+      const path = this.deletionLedgerPath();
+      const hasExists = typeof adapter.exists === "function";
+      const exists = hasExists ? await adapter.exists!(path) : true;
+      const lines = `${this.deletionLedgerNeedsNewline ? "\n" : ""}${
+        pending.map(deletionLedgerEntryLineV1).join("\n")
+      }\n`;
+      if (typeof adapter.append === "function") {
+        if (hasExists && !exists) {
+          // append creates the file; the header and the first batch are one
+          // write, so no two writers can race a separate header write.
+          await adapter.append(
+            path,
+            `${deletionLedgerLogHeaderLineV1()}\n${lines}`,
+          );
+        } else {
+          await adapter.append(path, lines);
+        }
+      } else {
+        if (!this.deletionLedgerAppendFallbackWarned) {
+          this.deletionLedgerAppendFallbackWarned = true;
+          this.plugin.diag?.warn(
+            "state",
+            "host adapter has no append(); deletion ledger falls back to a rewrite per wave",
+            { mutations: 0 },
+          );
+        }
+        // A failed read must fail this append: treating it as an empty file
+        // would overwrite every recoverable clue. Only a proven-absent file
+        // starts from an empty snapshot.
+        const existing = exists ? await adapter.read(path) : "";
+        const header = existing.length === 0
+          ? `${deletionLedgerLogHeaderLineV1()}\n`
+          : "";
+        const separator = existing.length > 0 && !existing.endsWith("\n")
+          ? "\n"
+          : "";
+        await adapter.write(path, `${existing}${header}${separator}${lines}`);
+      }
+      this.deletionLedgerNeedsNewline = false;
+      // A load() that ran while the write was in flight owns the new session;
+      // do not publish this write's entries (or line count) into it.
+      if (epoch !== this.deletionLedgerEpoch) return;
+      this.deletionLedger = {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [...byId.values()],
+      };
+      this.deletionLedgerLineCount += pending.length;
     });
+  }
+
+  /** Rewrite the log as one compacted snapshot. Called only from an enqueued
+   *  ledger write (prune or the one-time migration), never on every healthy
+   *  round. The temp file is removed on either a write or a rename failure. */
+  private async compactDeletionLedgerUnqueued(
+    family: DeletionLedgerV1,
+  ): Promise<void> {
+    const adapter = this.plugin.app.vault.adapter;
+    const path = this.deletionLedgerPath();
+    const nextPath = `${path}.next`;
+    try {
+      await adapter.write(nextPath, serializeDeletionLedgerLogV1(family));
+      await adapter.rename(nextPath, path);
+    } catch (error) {
+      await adapter.remove(nextPath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** One-time upgrade from the legacy `data.json` key. A failed write keeps
+   *  the key in `this.data` (and therefore every later save) and retries on
+   *  the next load; the file is only trusted after a successful rename. */
+  private async migrateLegacyDeletionLedgerSidecar(): Promise<void> {
+    const legacy = readDeletionLedgerV1(this.data[KEY_DELETION_LEDGER]);
+    if (!legacy || legacy.entries.length === 0) return;
+    try {
+      await this.ensureDeletionLedgerLoaded();
+      if (this.deletionLedgerWriteBlocked) return;
+      const epoch = this.deletionLedgerEpoch;
+      const merged = await this.enqueueDeletionLedgerWrite(
+        async (): Promise<DeletionLedgerV1 | null> => {
+          if (this.deletionLedgerWriteBlocked) return null;
+          const byId = new Map(
+            this.deletionLedger.entries.map((entry) => [entry.remoteId, entry]),
+          );
+          for (const entry of legacy.entries) {
+            const existing = byId.get(entry.remoteId);
+            if (existing && existing.deletedAt > entry.deletedAt) continue;
+            byId.set(entry.remoteId, entry);
+          }
+          const next: DeletionLedgerV1 = {
+            schemaVersion: 1,
+            kind: "easy-sync-deletion-ledger",
+            entries: [...byId.values()],
+          };
+          await this.compactDeletionLedgerUnqueued(next);
+          if (epoch !== this.deletionLedgerEpoch) return null;
+          this.deletionLedger = next;
+          this.deletionLedgerLineCount = next.entries.length + 1;
+          this.deletionLedgerNeedsNewline = false;
+          return next;
+        },
+      );
+      if (!merged || epoch !== this.deletionLedgerEpoch) return;
+      await this.save((current) =>
+        current[KEY_DELETION_LEDGER].entries.length === 0
+          ? current
+          : { ...current, [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1() });
+      this.plugin.diag?.log?.(
+        "state",
+        "deletion ledger migrated to append-only sidecar",
+        { entries: merged.entries.length },
+      );
+    } catch (error) {
+      this.plugin.diag?.warn(
+        "state",
+        "deletion ledger sidecar migration deferred; legacy key retained",
+        { error: describeError(error) },
+      );
+    }
+  }
+
+  /** Keep the current session's recovery list complete when the one-time
+   *  migration deferred (the legacy key stays in `data.json` until it
+   *  succeeds). After a successful migration the key is empty, so this is a
+   *  no-op. */
+  private mergeLegacyDeletionLedgerIntoMemory(): void {
+    const legacy = readDeletionLedgerV1(this.data[KEY_DELETION_LEDGER]);
+    if (!legacy || legacy.entries.length === 0) return;
+    const byId = new Map(
+      this.deletionLedger.entries.map((entry) => [entry.remoteId, entry]),
+    );
+    for (const entry of legacy.entries) {
+      const existing = byId.get(entry.remoteId);
+      if (existing && existing.deletedAt > entry.deletedAt) continue;
+      byId.set(entry.remoteId, entry);
+    }
+    this.deletionLedger = {
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: [...byId.values()],
+    };
+    this.deletionLedgerLoaded = true;
   }
 
   private setV2StateLoadBlock(
@@ -5828,42 +6198,48 @@ export class StateManager {
       throw new Error("Mutation receipt requires active V2 authority");
     }
     if (this.mutationLedgerCorrupt) throw new Error("Mutation recovery ledger is corrupt");
-    await this.commitPluginData((current) => {
-      let entries = current[KEY_MUTATION_LEDGER];
-      for (const receipt of receipts) {
-        const index = findUniqueMutationLedgerRecordIndex(
-          entries,
-          receipt.operationId,
-        );
-        if (index < 0) throw new Error(`Mutation intent missing: ${receipt.operationId}`);
-        const candidate = { ...entries[index], receipt };
-        const preparedCandidate = this.prepareMutationRecoveryRecord(
-          candidate,
-          this.v2Envelope!.scope,
-        );
-        if (
-          requiresOrdinaryFileRecoverySemanticGate(candidate)
-          && (
-            !preparedCandidate
-            || !isOrdinaryFileRecoveryRecord(
-              preparedCandidate,
-              this.v2Envelope!.scope,
-            )
+    await this.commitPluginData((current) =>
+      this.applyMutationReceipts(current, receipts));
+  }
+
+  private applyMutationReceipts(
+    current: PluginData,
+    receipts: readonly MutationReceiptV1[],
+  ): PluginData {
+    let entries = current[KEY_MUTATION_LEDGER];
+    for (const receipt of receipts) {
+      const index = findUniqueMutationLedgerRecordIndex(
+        entries,
+        receipt.operationId,
+      );
+      if (index < 0) throw new Error(`Mutation intent missing: ${receipt.operationId}`);
+      const candidate = { ...entries[index], receipt };
+      const preparedCandidate = this.prepareMutationRecoveryRecord(
+        candidate,
+        this.v2Envelope!.scope,
+      );
+      if (
+        requiresOrdinaryFileRecoverySemanticGate(candidate)
+        && (
+          !preparedCandidate
+          || !isOrdinaryFileRecoveryRecord(
+            preparedCandidate,
+            this.v2Envelope!.scope,
           )
-        ) {
-          const gateReason = !preparedCandidate
-            ? "scope does not match the committed envelope"
-            : "record shape is not an ordinary file recovery record";
-          throw new Error(
-            `Mutation receipt evidence is invalid (${gateReason}): ${receipt.operationId}`,
-          );
-        }
-        entries = entries.map((entry, entryIndex) =>
-          entryIndex === index ? candidate : entry,
+        )
+      ) {
+        const gateReason = !preparedCandidate
+          ? "scope does not match the committed envelope"
+          : "record shape is not an ordinary file recovery record";
+        throw new Error(
+          `Mutation receipt evidence is invalid (${gateReason}): ${receipt.operationId}`,
         );
       }
-      return { ...current, [KEY_MUTATION_LEDGER]: entries };
-    });
+      entries = entries.map((entry, entryIndex) =>
+        entryIndex === index ? candidate : entry,
+      );
+    }
+    return { ...current, [KEY_MUTATION_LEDGER]: entries };
   }
 
   /**
@@ -6276,6 +6652,35 @@ export class StateManager {
         commitOptions.candidateValidated = true;
         closeReduceRegion();
         return batchedDeletions;
+      }
+      // A small-upload batch or a download commit group is N independent
+      // ordinary-file upserts: one projection and one validation replace N
+      // full-vault reduces. Any non-upsert shape returns null and keeps the
+      // per-record path below.
+      let batchedUpserts = reduceFileStateEnvelopeV2Upserts(
+        current,
+        records,
+        reducerValidation,
+      );
+      if (batchedUpserts) {
+        if (Object.keys(ancestorHashes).length > 0) {
+          batchedUpserts = attachBaseAncestorHashesV2(
+            current,
+            batchedUpserts,
+            records.flatMap(
+              (record) => record.receipt!.checkpoint.baseUpserts,
+            ),
+            ancestorHashes,
+            undefined,
+            reducerValidation,
+          );
+        }
+        if (batchedUpserts !== current) {
+          commitOptions.contentFactsChanged = true;
+        }
+        commitOptions.candidateValidated = true;
+        closeReduceRegion();
+        return batchedUpserts;
       }
       let reduced = current;
       let changed = false;
@@ -10370,6 +10775,9 @@ export class StateManager {
     // owned here instead of by caller discipline.
     await this.v2StateCommitQueue;
     await this.pluginDataCommitQueue;
+    // An in-flight deletion-ledger append must not recreate the sidecar after
+    // the artifact cleanup below deletes it.
+    await this.deletionLedgerWriteQueue.catch(() => undefined);
     const paths = getEasySyncPaths(
       this.plugin.app.vault,
       this.plugin.manifest.id,
@@ -10540,6 +10948,9 @@ export class StateManager {
       );
     await this.v2StateCommitQueue;
     await this.pluginDataCommitQueue;
+    // Same reason as reset(): settle an in-flight ledger append before the
+    // artifact cleanup deletes the sidecar.
+    await this.deletionLedgerWriteQueue.catch(() => undefined);
 
     const capsule = this.isolatedMutationRecoveryIdentityCapsule(
       retainedEntries,
@@ -11156,6 +11567,8 @@ export class StateManager {
       paths.stateV2CorruptPublicationNextFile,
       paths.stateV1BackupFile,
       paths.baseContentFile,
+      paths.deletionLedgerFile,
+      `${paths.deletionLedgerFile}.next`,
       paths.ancestorManifestV2NextFile,
       paths.scanCacheFile,
       ...dynamicArtifacts,
@@ -11236,6 +11649,8 @@ export class StateManager {
       paths.stateV2CorruptPublicationNextFile,
       paths.stateV1BackupFile,
       paths.baseContentFile,
+      paths.deletionLedgerFile,
+      `${paths.deletionLedgerFile}.next`,
       paths.ancestorManifestV2File,
       paths.ancestorManifestV2NextFile,
       paths.scanCacheFile,

@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
+import { getEasySyncPaths } from "../src/obsidian-compat";
+import {
+  deletionLedgerLogHeaderLineV1,
+  parseDeletionLedgerLogV1,
+  serializeDeletionLedgerLogV1,
+} from "../src/sync/deletion-ledger";
 import {
   createEmptyCommunityPluginAdoptionMemory,
   reduceCommunityPluginAdoptionMemory,
@@ -54,6 +60,7 @@ function makeState() {
           read: vi.fn().mockRejectedValue(new Error("missing")),
           write: writeRemoteState,
           remove: vi.fn().mockResolvedValue(undefined),
+          rename: vi.fn().mockResolvedValue(undefined),
           list: vi.fn().mockResolvedValue({ files: [], folders: [] }),
           rmdir: vi.fn().mockResolvedValue(undefined),
           stat: vi.fn().mockResolvedValue(null),
@@ -2079,7 +2086,7 @@ describe("cloud deletion ledger (文件版本找回刀一之二)", () => {
     };
   }
 
-  it("round-trips the new record family through plugin data", async () => {
+  it("round-trips the record family through the append-only sidecar", async () => {
     const { state, plugin, saveData } = makeState();
     vi.mocked(plugin.loadData).mockResolvedValue(ledgerData([entry]));
     await state.load();
@@ -2099,12 +2106,9 @@ describe("cloud deletion ledger (文件版本找回刀一之二)", () => {
       kind: "folder",
     };
     expect(state.deletionLedgerEntries).toEqual([entry, appended]);
-    expect(saveData).toHaveBeenCalledWith(expect.objectContaining(
-      ledgerData([entry, appended]),
-    ));
+    expect(saveData).not.toHaveBeenCalled();
 
     // 同 id 重放＝更新，不重复。
-    saveData.mockClear();
     await state.recordCloudDeletion({
       remoteId: "item-2",
       path: "notes/renamed",
@@ -2115,17 +2119,17 @@ describe("cloud deletion ledger (文件版本找回刀一之二)", () => {
       entry,
       { remoteId: "item-2", path: "notes/renamed", deletedAt: 3, kind: "folder" },
     ]);
-    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).not.toHaveBeenCalled();
   });
 
   it("skips the durable write when a replayed deletion changes nothing", async () => {
-    const { state, plugin, saveData } = makeState();
+    const { state, plugin, writeRemoteState } = makeState();
     vi.mocked(plugin.loadData).mockResolvedValue(ledgerData([entry]));
     await state.load();
 
-    saveData.mockClear();
+    writeRemoteState.mockClear();
     await state.recordCloudDeletion(entry);
-    expect(saveData).not.toHaveBeenCalled();
+    expect(writeRemoteState).not.toHaveBeenCalled();
   });
 
   it("clears the record family with the rest of the local sync records on reset", async () => {
@@ -2199,8 +2203,62 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
     return adapter;
   }
 
+  /** File-backed adapter for the append-only sidecar: exists/read/write/
+   *  remove/rename operate on one map, so tests can assert what the log
+   *  actually contains and how many bytes each append costs. */
+  function ledgerState() {
+    const base = makeState();
+    const files = new Map<string, string>();
+    const exists = vi.fn(async (target: string) => files.has(target));
+    const read = vi.fn(async (target: string) => {
+      const value = files.get(target);
+      if (value === undefined) throw new Error(`missing ${target}`);
+      return value;
+    });
+    const write = vi.fn(async (target: string, data: string) => {
+      files.set(target, data);
+    });
+    const remove = vi.fn(async (target: string) => {
+      files.delete(target);
+    });
+    const rename = vi.fn(async (from: string, to: string) => {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`missing ${from}`);
+      files.delete(from);
+      files.set(to, value);
+    });
+    const list = vi.fn(async () => ({ files: [], folders: [] }));
+    const rmdir = vi.fn(async () => undefined);
+    // Mutate the live adapter the StateManager already holds (a spread copy
+    // would leave the state under test on the old mocks and make append-path
+    // assertions false-green).
+    const adapter = base.plugin.app.vault.adapter as unknown as {
+      exists: typeof exists;
+      read: typeof read;
+      write: typeof write;
+      remove: typeof remove;
+      rename: typeof rename;
+      list: typeof list;
+      rmdir: typeof rmdir;
+      append?: (target: string, data: string) => Promise<void>;
+    };
+    adapter.exists = exists;
+    adapter.read = read;
+    adapter.write = write;
+    adapter.remove = remove;
+    adapter.rename = rename;
+    adapter.list = list;
+    adapter.rmdir = rmdir;
+    return {
+      ...base,
+      files,
+      adapter,
+      ledgerPath: getEasySyncPaths(".obsidian").deletionLedgerFile,
+    };
+  }
+
   it("prunes expired records and expired archive folders, keeping the rest", async () => {
-    const { state, plugin, saveData } = makeState();
+    const { state, plugin, saveData, files, ledgerPath } = ledgerState();
     const now = Date.now();
     const expiredRecord = ledgerEntry("expired", now - 31 * DAY);
     const freshRecord = ledgerEntry("fresh", now - 29 * DAY);
@@ -2213,6 +2271,13 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
     });
     await state.load();
 
+    // One-time migration: the legacy key is emptied in plugin data and the
+    // sidecar holds every clue (the expired one included, until a compaction).
+    expect(state.deletionLedgerEntries).toEqual([expiredRecord, freshRecord]);
+    expect(files.get(ledgerPath)).toContain(expiredRecord.remoteId);
+    expect(files.get(ledgerPath)).toContain(freshRecord.remoteId);
+    expect(saveData).toHaveBeenCalledTimes(1);
+
     const expiredFolder = localArchiveStampV1(now - 31 * DAY);
     const freshFolder = localArchiveStampV1(now - 2 * DAY);
     const adapter = archiveListing(
@@ -2223,15 +2288,10 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
     saveData.mockClear();
     await state.noteHealthySync();
 
-    // 记录簿：窗口外的摘掉，窗口内的原样保留。
+    // 记录簿：窗口外的摘掉，窗口内的原样保留；低于压实阈值时不写盘。
     expect(state.deletionLedgerEntries).toEqual([freshRecord]);
-    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
-      "easy-sync-deletion-ledger": {
-        schemaVersion: 1,
-        kind: "easy-sync-deletion-ledger",
-        entries: [freshRecord],
-      },
-    }));
+    expect(saveData).not.toHaveBeenCalled();
+    expect(files.get(ledgerPath)).toContain(expiredRecord.remoteId);
     // 留档夹：旧戳目录连同内容整目录删除；新戳与认不出的名字都不动。
     expect(adapter.rmdir).toHaveBeenCalledTimes(1);
     expect(adapter.rmdir).toHaveBeenCalledWith(
@@ -2253,7 +2313,7 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
   });
 
   it("writes nothing when no record and no archive folder left the window", async () => {
-    const { state, plugin, saveData } = makeState();
+    const { state, plugin, saveData, files, ledgerPath } = ledgerState();
     const now = Date.now();
     vi.mocked(plugin.loadData).mockResolvedValue({
       "easy-sync-deletion-ledger": {
@@ -2267,16 +2327,19 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
       [localArchiveStampV1(now - 2 * DAY)],
       plugin,
     );
+    const sidecarAfterLoad = files.get(ledgerPath);
 
     saveData.mockClear();
     await state.noteHealthySync();
 
     expect(saveData).not.toHaveBeenCalled();
+    expect(files.get(ledgerPath)).toBe(sidecarAfterLoad);
     expect(adapter.rmdir).not.toHaveBeenCalled();
   });
 
   it("never lets housekeeping failures escape the healthy round", async () => {
-    const { state, plugin, saveData } = makeState();
+    const { state, plugin, saveData, files, ledgerPath, adapter } =
+      ledgerState();
     const now = Date.now();
     vi.mocked(plugin.loadData).mockResolvedValue({
       "easy-sync-deletion-ledger": {
@@ -2286,15 +2349,333 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
       },
     });
     await state.load();
-    const adapter = archiveListing(["manual-backup"], plugin);
+    saveData.mockClear();
+    const sidecarAfterLoad = files.get(ledgerPath);
     adapter.exists.mockRejectedValue(new Error("adapter broken"));
     adapter.list.mockRejectedValue(new Error("adapter broken"));
 
-    saveData.mockClear();
-    // 留档夹一步失败不上抛，也不挡住记录簿摘除。
+    // 留档夹一步失败不上抛，也不挡住记录簿在内存里的摘除。
     await expect(state.noteHealthySync()).resolves.toBeUndefined();
     expect(state.deletionLedgerEntries).toEqual([]);
-    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).not.toHaveBeenCalled();
+    // 低于压实阈值：日志保持原样，内存只在读面过滤。
+    expect(files.get(ledgerPath)).toBe(sidecarAfterLoad);
+  });
+
+  it("appends one line per delete and never rewrites plugin data", async () => {
+    const { state, saveData, files, ledgerPath } = ledgerState();
+    const now = Date.now();
+
+    await state.recordCloudDeletion(ledgerEntry("one", now));
+    await state.recordCloudDeletion(ledgerEntry("two", now));
+
+    expect(state.deletionLedgerEntries.map((entry) => entry.remoteId)).toEqual([
+      "one",
+      "two",
+    ]);
+    const log = files.get(ledgerPath) ?? "";
+    expect(log.trim().split("\n")).toHaveLength(3);
+    expect(log.startsWith("{\"schemaVersion\":1")).toBe(true);
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
+  it("compacts the log when dead lines cross the threshold", async () => {
+    const { state, plugin, saveData, files, ledgerPath } = ledgerState();
+    const now = Date.now();
+    const expired = Array.from({ length: 1_000 }, (_, index) =>
+      ledgerEntry(`expired-${index}`, now - 31 * DAY));
+    const fresh = ledgerEntry("fresh", now - DAY);
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [...expired, fresh],
+      },
+    });
+    await state.load();
+    expect(files.get(ledgerPath)!.trim().split("\n")).toHaveLength(1_002);
+    saveData.mockClear();
+
+    await state.noteHealthySync();
+
+    expect(state.deletionLedgerEntries).toEqual([fresh]);
+    const lines = files.get(ledgerPath)!.trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain("fresh");
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
+  it("merges the legacy key into an existing sidecar without losing the newer record", async () => {
+    const { state, plugin, files, ledgerPath, saveData } = ledgerState();
+    const now = Date.now();
+    files.set(ledgerPath, serializeDeletionLedgerLogV1({
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: [ledgerEntry("shared", now - DAY)],
+    }));
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [
+          ledgerEntry("shared", now - 2 * DAY),
+          ledgerEntry("legacy-only", now - DAY),
+        ],
+      },
+    });
+
+    await state.load();
+
+    const parsed = parseDeletionLedgerLogV1(files.get(ledgerPath)!);
+    expect(parsed.entries.map((entry) => entry.remoteId).sort()).toEqual([
+      "legacy-only",
+      "shared",
+    ]);
+    // 同 id 保留 sidecar 较新的 deletedAt；迁移后旧键清空。
+    expect(parsed.entries.find((entry) => entry.remoteId === "shared")!.deletedAt)
+      .toBe(now - DAY);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "easy-sync-deletion-ledger": expect.objectContaining({ entries: [] }),
+    }));
+  });
+
+  it("keeps bulk-delete append cost linear in new entries", async () => {
+    const { state, files, ledgerPath, adapter } = ledgerState();
+    let appendedBytes = 0;
+    const append = vi.fn(async (target: string, data: string) => {
+      appendedBytes += data.length;
+      files.set(target, `${files.get(target) ?? ""}${data}`);
+    });
+    (adapter as unknown as { append: typeof append }).append = append;
+    const now = Date.now();
+
+    const waves = 157;
+    const perWave = 64;
+    for (let wave = 0; wave < waves; wave += 1) {
+      const entries = Array.from({ length: perWave }, (_, index) =>
+        ledgerEntry(`bulk-${wave}-${index}`, now));
+      await state.recordCloudDeletions(entries);
+    }
+
+    const entries = waves * perWave;
+    expect(state.deletionLedgerEntries).toHaveLength(entries);
+    // Every wave is one append carrying only its new lines (the first one also
+    // creates the header); no growing snapshot rewrite and no separate header
+    // write that a concurrent writer could truncate.
+    expect(append).toHaveBeenCalledTimes(waves);
+    expect(adapter.write).not.toHaveBeenCalled();
+    expect(appendedBytes).toBeLessThan(entries * 140);
+    expect(appendedBytes).toBeGreaterThan(entries * 80);
+    expect(files.get(ledgerPath)!.trim().split("\n")).toHaveLength(entries + 1);
+  });
+
+  it("blocks writes for the session when the sidecar exists but cannot be read", async () => {
+    const { state, plugin, adapter } = ledgerState();
+    const warn = vi.fn();
+    plugin.diag = { warn, log: vi.fn() };
+    adapter.exists.mockResolvedValue(true);
+    adapter.read.mockRejectedValue(new Error("permission denied"));
+
+    await expect(
+      state.recordCloudDeletion(ledgerEntry("blocked", Date.now())),
+    ).rejects.toThrow("blocked");
+    expect(state.deletionLedgerEntries).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(
+      "state",
+      expect.stringContaining("writes are blocked"),
+      expect.anything(),
+    );
+  });
+
+  it("serializes two first-time appends and keeps both clues", async () => {
+    const { state, files, ledgerPath, adapter } = ledgerState();
+    const append = vi.fn(async (target: string, data: string) => {
+      files.set(target, `${files.get(target) ?? ""}${data}`);
+    });
+    (adapter as unknown as { append: typeof append }).append = append;
+    const now = Date.now();
+
+    await Promise.all([
+      state.recordCloudDeletion(ledgerEntry("a", now)),
+      state.recordCloudDeletion(ledgerEntry("b", now)),
+    ]);
+
+    const lines = files.get(ledgerPath)!.trim().split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain("\"schemaVersion\":1");
+    expect(state.deletionLedgerEntries.map((entry) => entry.remoteId).sort())
+      .toEqual(["a", "b"]);
+  });
+
+  it("starts a new line after a torn tail instead of merging the next entry", async () => {
+    const { state, files, ledgerPath } = ledgerState();
+    files.set(
+      ledgerPath,
+      `${deletionLedgerLogHeaderLineV1()}\n{"remoteId":"torn"`,
+    );
+
+    await state.recordCloudDeletion(ledgerEntry("fresh", Date.now()));
+
+    const parsed = parseDeletionLedgerLogV1(files.get(ledgerPath)!);
+    expect(parsed.entries.map((entry) => entry.remoteId)).toEqual(["fresh"]);
+    expect(files.get(ledgerPath)!.endsWith("\n")).toBe(true);
+  });
+
+  it("keeps memory unchanged when the append fails", async () => {
+    const { state, adapter } = ledgerState();
+    adapter.append = vi.fn(async () => {
+      throw new Error("disk full");
+    }) as never;
+
+    await expect(
+      state.recordCloudDeletion(ledgerEntry("lost", Date.now())),
+    ).rejects.toThrow("disk full");
+    expect(state.deletionLedgerEntries).toEqual([]);
+  });
+
+  it("fails the fallback append instead of overwriting an unreadable log", async () => {
+    const { state, files, ledgerPath, adapter } = ledgerState();
+    const family = {
+      schemaVersion: 1 as const,
+      kind: "easy-sync-deletion-ledger" as const,
+      entries: [ledgerEntry("kept", Date.now())],
+    };
+    files.set(ledgerPath, serializeDeletionLedgerLogV1(family));
+    await state.ensureDeletionLedgerLoaded();
+    const before = files.get(ledgerPath);
+    adapter.read.mockRejectedValue(new Error("locked"));
+
+    await expect(
+      state.recordCloudDeletion(ledgerEntry("new", Date.now())),
+    ).rejects.toThrow("locked");
+    expect(files.get(ledgerPath)).toBe(before);
+  });
+
+  it("does not publish a lazy-load result that finished after a newer load()", async () => {
+    const { state, plugin, files, ledgerPath, adapter } = ledgerState();
+    files.set(ledgerPath, serializeDeletionLedgerLogV1({
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: [ledgerEntry("stale", Date.now())],
+    }));
+    let release: (() => void) | undefined;
+    const originalRead = adapter.read.getMockImplementation()!;
+    adapter.read.mockImplementation(async (target: string) => {
+      if (target !== ledgerPath) return originalRead(target);
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return files.get(ledgerPath)!;
+    });
+    vi.mocked(plugin.loadData).mockResolvedValue({});
+
+    const pending = state.ensureDeletionLedgerLoaded();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await state.load();
+    release!();
+    await pending;
+
+    expect(state.deletionLedgerEntries).toEqual([]);
+  });
+
+  it("deletes the sidecar on reset", async () => {
+    const { state, files, ledgerPath } = ledgerState();
+    files.set(ledgerPath, serializeDeletionLedgerLogV1({
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: [ledgerEntry("reset-me", Date.now())],
+    }));
+    await state.load();
+    expect(files.has(ledgerPath)).toBe(true);
+
+    await state.reset();
+
+    expect(files.has(ledgerPath)).toBe(false);
+    expect(state.deletionLedgerEntries).toEqual([]);
+  });
+
+  it("removes the .next checkpoint when compaction fails", async () => {
+    const { state, plugin, files, ledgerPath, adapter } = ledgerState();
+    const now = Date.now();
+    const expired = Array.from({ length: 1_001 }, (_, index) =>
+      ledgerEntry(`dead-${index}`, now - 31 * DAY));
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: expired,
+      },
+    });
+    await state.load();
+    const before = files.get(ledgerPath);
+    adapter.write.mockImplementation(async (target: string, data: string) => {
+      if (target.endsWith(".next")) throw new Error("disk full");
+      files.set(target, data);
+    });
+
+    await state.noteHealthySync();
+
+    expect(files.has(`${ledgerPath}.next`)).toBe(false);
+    expect(files.get(ledgerPath)).toBe(before);
+  });
+
+  it("compacts on dead lines even when the expired count is below its threshold", async () => {
+    const { state, files, ledgerPath } = ledgerState();
+    const now = Date.now();
+    const dead = Array.from({ length: 201 }, (_, index) =>
+      ledgerEntry(`dead-only-${index}`, now - 31 * DAY));
+    files.set(ledgerPath, serializeDeletionLedgerLogV1({
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: dead,
+    }));
+
+    await state.noteHealthySync();
+
+    expect(state.deletionLedgerEntries).toEqual([]);
+    expect(files.get(ledgerPath)!.trim().split("\n")).toHaveLength(1);
+  });
+
+  it("shares one lazy load between concurrent readers", async () => {
+    const { state, files, ledgerPath, adapter } = ledgerState();
+    files.set(ledgerPath, serializeDeletionLedgerLogV1({
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: [ledgerEntry("shared-load", Date.now())],
+    }));
+
+    await Promise.all([
+      state.ensureDeletionLedgerLoaded(),
+      state.ensureDeletionLedgerLoaded(),
+    ]);
+
+    expect(adapter.read.mock.calls.filter(([target]) => target === ledgerPath))
+      .toHaveLength(1);
+    expect(state.deletionLedgerEntries).toHaveLength(1);
+  });
+
+  it("retains the legacy key when migration fails and retries on the next load", async () => {
+    const { state, plugin, files, ledgerPath, adapter } = ledgerState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [ledgerEntry("legacy-retry", Date.now())],
+      },
+    });
+    adapter.rename.mockRejectedValueOnce(new Error("rename failed"));
+
+    await state.load();
+    expect(files.has(ledgerPath)).toBe(false);
+    expect(files.has(`${ledgerPath}.next`)).toBe(false);
+    // The recovery list still sees the legacy clue for this session.
+    expect(state.deletionLedgerEntries.map((entry) => entry.remoteId))
+      .toEqual(["legacy-retry"]);
+
+    await state.load();
+    expect(files.has(ledgerPath)).toBe(true);
+    expect(parseDeletionLedgerLogV1(files.get(ledgerPath)!).entries)
+      .toHaveLength(1);
   });
 });
 

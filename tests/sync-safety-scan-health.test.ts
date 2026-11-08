@@ -606,7 +606,9 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       deleteItem?: ReturnType<typeof vi.fn>;
       adapterOverrides?: Record<string, unknown>;
       recordMutationReceipt?: ReturnType<typeof vi.fn>;
+      recordMutationReceipts?: ReturnType<typeof vi.fn>;
       recordCloudDeletion?: ReturnType<typeof vi.fn>;
+      recordMutationReceiptsAndCloudDeletions?: ReturnType<typeof vi.fn>;
       diag?: DiagnosticLogger;
     } = {},
   ) {
@@ -740,6 +742,13 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     if (options.recordMutationReceipt) {
       mutationState.recordMutationReceipt = options.recordMutationReceipt;
     }
+    if (options.recordMutationReceipts) {
+      mutationState.recordMutationReceipts = options.recordMutationReceipts;
+    }
+    if (options.recordMutationReceiptsAndCloudDeletions) {
+      mutationState.recordMutationReceiptsAndCloudDeletions =
+        options.recordMutationReceiptsAndCloudDeletions;
+    }
 
     const executor = new SyncExecutor(
       mockOneDrive,
@@ -861,18 +870,23 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     expect(mutationState.beginMutationIntents).toHaveBeenCalledTimes(1);
     expect(vi.mocked(mutationState.beginMutationIntents).mock.calls[0][0])
       .toHaveLength(entries.length);
-    expect(mutationState.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mutationState.recordMutationReceipts).mock.calls[0][0])
-      .toHaveLength(entries.length);
-    expect(mutationState.recordCloudDeletions).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mutationState.recordCloudDeletions).mock.calls[0][0])
-      .toHaveLength(entries.length);
+    expect(mutationState.recordMutationReceipts).not.toHaveBeenCalled();
+    expect(mutationState.recordCloudDeletions).not.toHaveBeenCalled();
+    expect(mutationState.recordMutationReceiptsAndCloudDeletions)
+      .toHaveBeenCalledTimes(1);
+    const combinedWrite = vi.mocked(
+      mutationState.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0];
+    expect(combinedWrite[0]).toHaveLength(entries.length);
+    expect(combinedWrite[1]).toHaveLength(entries.length);
     expect(mutationState.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
     expect(vi.mocked(mutationState.commitMutationCheckpoints).mock.calls[0][0])
       .toHaveLength(entries.length);
     expect(mutationState.commitMutationCheckpoint).not.toHaveBeenCalled();
     expect(mutationState.beginMutationIntent).toHaveBeenCalledTimes(entries.length);
-    expect(mutationState.recordMutationReceipt).toHaveBeenCalledTimes(entries.length);
+    // The wave's receipts ride the one combined write; the per-record API
+    // stays unused.
+    expect(mutationState.recordMutationReceipt).not.toHaveBeenCalled();
   });
 
   it("keeps 64 file deletes in one cleanup wave — one write per phase", async () => {
@@ -901,12 +915,15 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     expect(mutationState.beginMutationIntents).toHaveBeenCalledTimes(1);
     expect(vi.mocked(mutationState.beginMutationIntents).mock.calls[0][0])
       .toHaveLength(64);
-    expect(mutationState.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mutationState.recordMutationReceipts).mock.calls[0][0])
-      .toHaveLength(64);
-    expect(mutationState.recordCloudDeletions).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mutationState.recordCloudDeletions).mock.calls[0][0])
-      .toHaveLength(64);
+    expect(mutationState.recordMutationReceipts).not.toHaveBeenCalled();
+    expect(mutationState.recordCloudDeletions).not.toHaveBeenCalled();
+    expect(mutationState.recordMutationReceiptsAndCloudDeletions)
+      .toHaveBeenCalledTimes(1);
+    const combinedWrite = vi.mocked(
+      mutationState.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0];
+    expect(combinedWrite[0]).toHaveLength(64);
+    expect(combinedWrite[1]).toHaveLength(64);
     expect(mutationState.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
     expect(vi.mocked(mutationState.commitMutationCheckpoints).mock.calls[0][0])
       .toHaveLength(64);
@@ -1034,12 +1051,15 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     expect(result.deleted).toBe(entries.length - 1);
     expect(result.errors).toBe(1);
     // 4 个成功项仍合批落盘并提交同一次共享检查点；失败项不产生回执。
-    expect(mutationState.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mutationState.recordMutationReceipts).mock.calls[0][0])
-      .toHaveLength(entries.length - 1);
-    expect(mutationState.recordCloudDeletions).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mutationState.recordCloudDeletions).mock.calls[0][0])
-      .toHaveLength(entries.length - 1);
+    expect(mutationState.recordMutationReceipts).not.toHaveBeenCalled();
+    expect(mutationState.recordCloudDeletions).not.toHaveBeenCalled();
+    expect(mutationState.recordMutationReceiptsAndCloudDeletions)
+      .toHaveBeenCalledTimes(1);
+    const combinedWrite = vi.mocked(
+      mutationState.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0];
+    expect(combinedWrite[0]).toHaveLength(entries.length - 1);
+    expect(combinedWrite[1]).toHaveLength(entries.length - 1);
     expect(mutationState.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
     expect(vi.mocked(mutationState.commitMutationCheckpoints).mock.calls[0][0])
       .toHaveLength(entries.length - 1);
@@ -1094,24 +1114,24 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
 
   it("records a successful cloud file delete in the device-local deletion ledger", async () => {
     const deletedLocally = base("safe.md");
-    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
-    const { mockDeleteItem } = await runWithV2Facts({
+    const { mockDeleteItem, mutationState } = await runWithV2Facts({
       baseEntries: [deletedLocally],
       remoteEntries: [remote(deletedLocally)],
-    }, { recordCloudDeletion });
+    });
 
     expect(mockDeleteItem).toHaveBeenCalledTimes(1);
-    expect(recordCloudDeletion).toHaveBeenCalledWith({
-      remoteId: `id-${deletedLocally.path}`,
-      path: deletedLocally.path,
-      deletedAt: expect.any(Number),
-      kind: "file",
-    });
+    expect(mutationState.deletionLedgerEntries).toContainEqual(
+      expect.objectContaining({
+        remoteId: `id-${deletedLocally.path}`,
+        path: deletedLocally.path,
+        deletedAt: expect.any(Number),
+        kind: "file",
+      }),
+    );
   });
 
   it("records nothing when the Graph delete itself fails", async () => {
     const deletedLocally = base("safe.md");
-    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
     const deleteItem = vi.fn().mockRejectedValue(new Error("graph 500"));
     // 回读证明对象仍在云端 ⇒ 这次删除没有发生，不得留下任何恢复线索。
     const getFileMetadata = vi.fn().mockResolvedValue({
@@ -1122,19 +1142,19 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       downloadUrl: `https://download.example/${deletedLocally.path}`,
       sha256Hash: deletedLocally.hash,
     });
-    const { result, mockDeleteItem } = await runWithV2Facts({
+    const { result, mockDeleteItem, mutationState } = await runWithV2Facts({
       baseEntries: [deletedLocally],
       remoteEntries: [remote(deletedLocally)],
-    }, { recordCloudDeletion, deleteItem, getFileMetadata });
+    }, { deleteItem, getFileMetadata });
 
     expect(mockDeleteItem).toHaveBeenCalledTimes(1);
     expect(result.deleted).toBe(0);
-    expect(recordCloudDeletion).not.toHaveBeenCalled();
+    expect(mutationState.deletionLedgerEntries).toEqual([]);
   });
 
   it("keeps a delete successful when the ledger write fails", async () => {
     const deletedLocally = base("safe.md");
-    const recordCloudDeletion = vi
+    const combinedWrite = vi
       .fn()
       .mockRejectedValue(new Error("plugin data write failed"));
     // 回读仍能看见对象（本轮删除已由 Graph 确认落地）：记账失败若上抛，这一轮
@@ -1150,10 +1170,14 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     const { result } = await runWithV2Facts({
       baseEntries: [deletedLocally],
       remoteEntries: [remote(deletedLocally)],
-    }, { recordCloudDeletion, getFileMetadata });
+    }, {
+      recordMutationReceiptsAndCloudDeletions: combinedWrite,
+      getFileMetadata,
+    });
 
-    // 记账失败只留诊断：删除照常落地、本轮不因此多一个错误。
-    expect(recordCloudDeletion).toHaveBeenCalledTimes(1);
+    // The combined write fails; the executor retries the receipt half alone,
+    // logs the lost ledger clue, and the delete still settles successfully.
+    expect(combinedWrite).toHaveBeenCalledTimes(1);
     expect(result.deleted).toBe(1);
     expect(result.errors).toBe(0);
   });
@@ -1248,6 +1272,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     // 跟随删除侧（文件版本找回刀一之三）：这个现场取不到远端 id（committed 锚点
     // 里没有身份）——不记、不抛，删除照常落地。
     expect(recordCloudDeletion).not.toHaveBeenCalled();
+    expect(mutationState.deletionLedgerEntries).toEqual([]);
     expect(result.metrics?.automaticHandling.deleteLocal).toEqual({
       candidates: 1,
       completed: 1,
@@ -1266,12 +1291,16 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       },
       expectedRemote: { exists: false },
     }));
-    expect(mutationState.recordMutationReceipt).toHaveBeenCalledWith(expect.objectContaining({
+    const combinedWrite = vi.mocked(
+      mutationState.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0];
+    expect(combinedWrite[0][0]).toMatchObject({
       checkpoint: expect.objectContaining({
         baseRemovals: [deletedRemotely.path],
         pendingDeleteRemovals: [deletedRemotely.path],
       }),
-    }));
+    });
+    expect(combinedWrite[1]).toEqual([]);
     expect(mutationState.commitMutationCheckpoint).toHaveBeenCalledTimes(1);
   });
 
@@ -1344,7 +1373,10 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     const deletedRemotely = base("receipt-failure.md");
     const localEntry = local(deletedRemotely);
     const remove = vi.fn().mockResolvedValue(undefined);
-    const recordMutationReceipt = vi.fn().mockRejectedValue(new Error("receipt unavailable"));
+    const receiptFailure = () =>
+      Promise.reject(new Error("receipt unavailable"));
+    const recordMutationReceiptsAndCloudDeletions = vi.fn(receiptFailure);
+    const recordMutationReceipts = vi.fn(receiptFailure);
     const { result, mutationState } = await runWithV2Facts({
       baseEntries: [deletedRemotely],
       localEntries: [localEntry],
@@ -1355,10 +1387,15 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
         entry: localEntry,
       }),
       adapterOverrides: { remove },
-      recordMutationReceipt,
+      recordMutationReceiptsAndCloudDeletions,
+      recordMutationReceipts,
     });
 
     expect(remove).toHaveBeenCalledWith(deletedRemotely.path);
+    // The combined write fails, the receipt-only fallback fails too, so the
+    // wave stays fail-closed and no checkpoint is published.
+    expect(recordMutationReceiptsAndCloudDeletions).toHaveBeenCalledTimes(1);
+    expect(recordMutationReceipts).toHaveBeenCalledTimes(1);
     expect(result.errors).toBe(1);
     expect(mutationState.commitMutationCheckpoint).not.toHaveBeenCalled();
   });

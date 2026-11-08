@@ -278,7 +278,9 @@ describe("Cancellation checkpoint semantics", () => {
 
     expect(writeBinary).toHaveBeenCalledWith(remote.path, content);
     expect(recordMutationReceipt).toHaveBeenCalledTimes(1);
-    expect(commitMutationCheckpoint).toHaveBeenCalledTimes(1);
+    // The deferred batch checkpoint retries a generic failure once before it
+    // flips the row and rethrows fail-closed.
+    expect(commitMutationCheckpoint).toHaveBeenCalledTimes(2);
     expect(state.upsertBaseEntries).not.toHaveBeenCalled();
     expect(result.errors).toBe(1);
   });

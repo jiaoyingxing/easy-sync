@@ -28,7 +28,7 @@ describe("DownloadConcurrencyPolicy", () => {
     policy.observeBatch(healthyBatch(2));
     expect(policy.limit).toBe(2);
     policy.observeBatch(healthyBatch(2));
-    expect(policy.limit).toBe(3);
+    expect(policy.limit).toBe(4);
   });
 
   it("caps a mobile-bound policy at two (A2) while desktop still reaches three", () => {
@@ -117,13 +117,13 @@ describe("DownloadConcurrencyPolicy — 小文件档 (2026-10-27)", () => {
     policy.observeBatch(noteBatch());
     expect(policy.limit).toBe(2);
     policy.observeBatch(noteBatch());
-    expect(policy.limit).toBe(3);
+    expect(policy.limit).toBe(4);
   });
 
   it("a failed small-file batch still drops straight back to serial", () => {
     const policy = new DownloadConcurrencyPolicy();
     for (let index = 0; index < 4; index++) policy.observeBatch(noteBatch());
-    expect(policy.limit).toBe(3);
+    expect(policy.limit).toBe(4);
 
     policy.observeBatch(noteBatch({ files: 2, bytes: 36, failed: true }));
     expect(policy.limit).toBe(1);
@@ -173,16 +173,16 @@ describe("DownloadConcurrencyPolicy — 小文件档 (2026-10-27)", () => {
       // the 512 KiB/s gate, but a real transfer window at the tier's ceiling.
       policy.observeBatch(noteBatch({ bytes: 200 * 1024, transferMs: 1_320 }));
     }
-    expect(policy.limit).toBe(3);
+    expect(policy.limit).toBe(4);
   });
 
   it("never lowers a ceiling already earned on bandwidth evidence", () => {
     const policy = new DownloadConcurrencyPolicy();
     for (let index = 0; index < 4; index++) policy.observeBatch(healthyBatch(2));
-    expect(policy.limit).toBe(3);
+    expect(policy.limit).toBe(4);
 
     for (let index = 0; index < 2; index++) policy.observeBatch(noteBatch());
-    expect(policy.limit).toBe(3);
+    expect(policy.limit).toBe(4);
   });
 
   it("does not apply the small-file path above the small-file tier", () => {
@@ -216,6 +216,11 @@ describe("DownloadConcurrencyPolicy — 降级后爬回 (2026-10-27)", () => {
     policy.observeBatch(healthyBatch(2));
     policy.observeBatch(healthyBatch(2));
     expect(policy.limit).toBe(2);
+    policy.observeBatch(healthyBatch(2));
+    expect(policy.limit).toBe(3);
+    // The desktop ceiling is four: one more recovery window reaches it.
+    policy.observeBatch(healthyBatch(2));
+    policy.observeBatch(healthyBatch(2));
     policy.observeBatch(healthyBatch(2));
     expect(policy.limit).toBe(ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY);
   });

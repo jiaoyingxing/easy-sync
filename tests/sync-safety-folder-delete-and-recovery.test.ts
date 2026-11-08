@@ -422,6 +422,21 @@ describe("confirm delete waves", () => {
       recordCloudDeletions: vi.fn(async (entries: Array<{ path: string }>) => {
         ledgerSinkWrites.push(entries.map((entry) => entry.path));
       }),
+      recordMutationReceiptsAndCloudDeletions: vi.fn(async (
+        receipts: MutationReceiptV1[],
+        entries: Array<{ path: string }>,
+      ) => {
+        for (const receipt of receipts) {
+          const record = ledger.find(
+            (entry) => entry.intent.operationId === receipt.operationId,
+          );
+          if (!record) {
+            throw new Error(`Mutation intent missing: ${receipt.operationId}`);
+          }
+          record.receipt = receipt;
+        }
+        ledgerSinkWrites.push(entries.map((entry) => entry.path));
+      }),
       commitMutationCheckpoints: vi.fn(async (operationIds: readonly string[]) => {
         events.push(`checkpoint:${operationIds.length}`);
         for (const operationId of operationIds) {
@@ -548,12 +563,15 @@ describe("confirm delete waves", () => {
     expect(harness.state.beginMutationIntents).toHaveBeenCalledTimes(1);
     expect(vi.mocked(harness.state.beginMutationIntents).mock.calls[0][0])
       .toHaveLength(WAVE);
-    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(harness.state.recordMutationReceipts).mock.calls[0][0])
-      .toHaveLength(WAVE);
-    expect(harness.state.recordCloudDeletions).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(harness.state.recordCloudDeletions).mock.calls[0][0])
-      .toHaveLength(WAVE);
+    expect(harness.state.recordMutationReceipts).not.toHaveBeenCalled();
+    expect(harness.state.recordCloudDeletions).not.toHaveBeenCalled();
+    expect(harness.state.recordMutationReceiptsAndCloudDeletions)
+      .toHaveBeenCalledTimes(1);
+    const combinedWrite = vi.mocked(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0];
+    expect(combinedWrite[0]).toHaveLength(WAVE);
+    expect(combinedWrite[1]).toHaveLength(WAVE);
     expect(harness.state.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
     expect(vi.mocked(harness.state.commitMutationCheckpoints).mock.calls[0][0])
       .toHaveLength(WAVE);
@@ -619,9 +637,8 @@ describe("confirm delete waves", () => {
       ),
     ).toEqual([16, 1]);
     expect(
-      vi.mocked(harness.state.recordMutationReceipts).mock.calls.map(
-        (call) => call[0].length,
-      ),
+      vi.mocked(harness.state.recordMutationReceiptsAndCloudDeletions)
+        .mock.calls.map((call) => call[0].length),
     ).toEqual([16, 1]);
     expect(harness.state.commitMutationCheckpoints).toHaveBeenCalledTimes(2);
     // Waves stay serial: the first wave's checkpoint lands before the second
@@ -654,9 +671,12 @@ describe("confirm delete waves", () => {
       paths.filter((path) => path !== failedPath),
     );
     // The failed member never enters the shared checkpoint …
-    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    const receipted = vi.mocked(harness.state.recordMutationReceipts)
-      .mock.calls[0][0] as Array<{ operationId: string }>;
+    expect(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).toHaveBeenCalledTimes(1);
+    const receipted = vi.mocked(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0][0] as Array<{ operationId: string }>;
     expect(receipted).toHaveLength(WAVE - 1);
     expect(vi.mocked(harness.state.commitMutationCheckpoints).mock.calls[0][0])
       .toEqual(receipted.map((receipt) => receipt.operationId));
@@ -713,9 +733,12 @@ describe("confirm delete waves", () => {
     expect(harness.state.abandonMutationIntent).toHaveBeenCalledWith(
       skippedIntent!.operationId,
     );
-    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    const receipts = vi.mocked(harness.state.recordMutationReceipts)
-      .mock.calls[0][0];
+    expect(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).toHaveBeenCalledTimes(1);
+    const receipts = vi.mocked(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0][0];
     expect(receipts).toHaveLength(WAVE - 1);
     expect(receipts.map((receipt) => receipt.operationId))
       .not.toContain(skippedIntent!.operationId);
@@ -745,9 +768,14 @@ describe("confirm delete waves", () => {
       .toHaveLength(WAVE);
     // The two erased members keep their receipt; the rest stay intent-only for
     // the next round's mutation recovery, and the shared checkpoint is skipped.
-    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(harness.state.recordMutationReceipts).mock.calls[0][0])
-      .toHaveLength(2);
+    expect(harness.state.recordMutationReceipts).not.toHaveBeenCalled();
+    expect(harness.state.recordMutationReceiptsAndCloudDeletions)
+      .toHaveBeenCalledTimes(1);
+    const combinedWrite = vi.mocked(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0];
+    expect(combinedWrite[0]).toHaveLength(2);
+    expect(combinedWrite[1]).toHaveLength(2);
     expect(harness.state.commitMutationCheckpoints).not.toHaveBeenCalled();
     const intentOnly = harness.ledger.filter(
       (record) => record.receipt === null,

@@ -105,6 +105,7 @@ const EASY_SYNC_STORAGE_LAYOUT = {
     stateV2CorruptPublicationNextFile: "state/v2/state-v2.corrupt-publication.next.json",
     stateV1BackupFile: "state/legacy/state-v1.backup.json",
     baseContentFile: "state/legacy/base-content.json",
+    deletionLedgerFile: "state/legacy/deletion-ledger.jsonl",
     ancestorsV2Dir: "objects/ancestors-v2",
     ancestorManifestV2File: "objects/ancestor-manifest-v2.json",
     ancestorManifestV2NextFile: "objects/ancestor-manifest-v2.next.json",
@@ -143,6 +144,7 @@ const EASY_SYNC_LEGACY_STORAGE_LAYOUT = {
     stateV2CorruptPublicationNextFile: "state-v2.corrupt-publication.next.json",
     stateV1BackupFile: "state-v1.backup.json",
     baseContentFile: "base-content.json",
+    deletionLedgerFile: "state/legacy/deletion-ledger.jsonl",
     ancestorsV2Dir: "ancestors-v2",
     ancestorManifestV2File: "ancestor-manifest-v2.json",
     ancestorManifestV2NextFile: "ancestor-manifest-v2.next.json",
@@ -222,6 +224,7 @@ export interface EasySyncPathSet {
   stateV2CorruptPublicationNextFile: string;
   stateV1BackupFile: string;
   baseContentFile: string;
+  deletionLedgerFile: string;
   ancestorsV2Dir: string;
   ancestorManifestV2File: string;
   ancestorManifestV2NextFile: string;
@@ -282,6 +285,7 @@ function buildEasySyncPaths(
     tmpDir: path(sidecars.tmpDir),
     scanCacheFile: path(sidecars.scanCacheFile),
     remoteEnumCheckpointFile: path(sidecars.remoteEnumCheckpointFile),
+    deletionLedgerFile: path(sidecars.deletionLedgerFile),
     manifestFile: path(layout.root.manifestFile),
   };
 }

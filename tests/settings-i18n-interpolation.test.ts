@@ -1,34 +1,26 @@
 /**
- * 设置面双轨对账门（2026-10-13 用户拍板＝「选项①机械对账门」，tests-only）。
+ * 设置面 i18n 与挂点契约门（tests-only；原「双轨对账门」2026-11-07 单轨化）。
  *
- * 背景：1.13+ 页面行（`src/ui/settings-page-rows.ts` 等）与 <1.13 弹框
- * （`src/ui/config-sync-modal.ts` 等）对同一个设置项各有一份实现。2026-10-12
- * 一天内三处漂移实害都由用户真机反馈才发现：行类没挂（chip 紧贴行名）、chip
- * 挂点排到 `setName` 之前（节点被重写冲掉）、计数插值参数名与模板占位符不一致
- * （真机直显「同步：{enabled}/30」）。既有钉子只钉单个函数的源码形状，钉不住
- * 「两侧同形」；宿主 1.14.4 起设置面走独立窗口、AI 侧无法目视，故补这道门。
- *
- * 本门只读源码、不改生产行为，只判三条可机械判定的规则：
+ * 前身是 2026-10-13 拍板的双轨对账门：1.13+ 页面行与 <1.13 弹框对同一个设置项
+ * 各有一份实现，2026-10-12 一天内三处漂移实害都由用户真机反馈才发现：行类没挂
+ * （chip 紧贴行名）、chip 挂点排到 `setName` 之前（节点被重写冲掉）、计数插值
+ * 参数名与模板占位符不一致（真机直显「同步：{enabled}/30」）。<1.13 弹框轨道
+ * 已随 minAppVersion 1.13.4 退场，双轨专属的两侧钩子规则一并退役；仍然成立的
+ * 单轨契约保留在本门：
  *   R1 i18n 插值参数名＝模板占位符（设置面全部 `t(key, {...})` 调用）；
- *   R2 双轨类钩子＝同一行的关键钩子类必须在两侧实现里都存在（表见下）；
+ *   R2 页面行 ↔ 社区插件管理弹框的同源钩子类（同一设置项的两个载体）；
  *   R3 nameEl 挂点顺序＝同一函数内挂到 `nameEl` 的节点必须排在最后一次
  *      `setName()` 之后（`setName` 会重写 nameEl 内容）。
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
-/** 设置面双轨涉及的文件（页面侧＋弹框侧）。 */
-const PAGE_ROW_FILES = [
+/** 设置面契约涉及的文件（页面侧＋社区插件管理弹框）。 */
+const SETTINGS_FILES = [
   "src/ui/settings-page-rows.ts",
   "src/ui/settings-tab.ts",
-];
-const MODAL_FILES = [
   "src/ui/config-sync-modal.ts",
-  "src/ui/sync-exclusion-modal.ts",
-  "src/ui/auto-sync-modal.ts",
-  "src/ui/automatic-handling-modal.ts",
 ];
-const SETTINGS_FILES = [...PAGE_ROW_FILES, ...MODAL_FILES];
 
 const read = (file: string) => readFileSync(file, "utf8");
 
@@ -103,7 +95,7 @@ function firstTopLevelComma(source: string, fromIndex: number): number {
   return -1;
 }
 
-describe("settings dual-track parity gate", () => {
+describe("settings i18n and mount contract gate", () => {
   it("R1: passes exactly the placeholders each template requires", () => {
     const zh = placeholdersByKey("src/i18n/zh-cn.ts");
     const en = placeholdersByKey("src/i18n/en.ts");
@@ -221,16 +213,16 @@ describe("settings dual-track parity gate", () => {
       }
     }
 
-    // 门自检：解析必须真的走到调用点，不能因为正则失效而空转（当前 ≈ 24 处）
-    expect(checked).toBeGreaterThanOrEqual(15);
-    // 包装入口自检：当前 2 处调用表达式（含 3 个字面键）
+    // 门自检：解析必须真的走到调用点，不能因为正则失效而空转。
+    expect(checked).toBeGreaterThanOrEqual(10);
+    // 包装入口自检：当前调用表达式里的字面键数。
     expect(wrapperChecked).toBeGreaterThanOrEqual(2);
     expect(problems).toEqual([]);
   });
 
-  it("R2: dual-track rows carry the same hook classes on both sides", () => {
-    // 同一行的关键钩子必须在两侧实现里都存在。chip 内件不在表内：它们由共享
-    // `renderExcludedFolderChips`／同款构造器渲染，属单实现，不构成双轨。
+  it("R2: page rows and the community manager modal share the same hook classes", () => {
+    // 同一设置项（社区插件参与）的两个载体：页面行与弹框行共用行类与 chip 类
+    //（styles.css 的 nameEl flex+gap 布局依赖它们）。
     const hooks: Array<{ hook: string; files: string[] }> = [
       {
         hook: "easy-sync-community-plugin-scope-setting",
@@ -240,19 +232,6 @@ describe("settings dual-track parity gate", () => {
         hook: "easy-sync-plugin-selection-chip",
         files: ["src/ui/settings-page-rows.ts", "src/ui/config-sync-modal.ts"],
       },
-      // 2026-10-30：「实验性」chip 已停止渲染（样式与 i18n key 保留），
-      // 不再作为双轨钩子。
-      {
-        hook: "easy-sync-exclusion-chips",
-        files: [
-          "src/ui/settings-page-rows.ts",
-          "src/ui/sync-exclusion-modal.ts",
-        ],
-      },
-      {
-        hook: "easy-sync-notification-popups-hint",
-        files: ["src/ui/settings-tab.ts", "src/ui/settings-page-rows.ts"],
-      },
     ];
 
     const problems: string[] = [];
@@ -260,7 +239,7 @@ describe("settings dual-track parity gate", () => {
       for (const file of files) {
         const quoted = [`"${hook}"`, `'${hook}'`];
         if (!quoted.some((q) => read(file).includes(q))) {
-          problems.push(`${file}: 缺少双轨钩子类 ${hook}`);
+          problems.push(`${file}: 缺少同源钩子类 ${hook}`);
         }
       }
     }

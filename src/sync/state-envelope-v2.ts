@@ -897,7 +897,32 @@ export class StateEnvelopeV2Store {
   }
 }
 
+/** Successful validations, keyed by the envelope object itself.
+ *
+ *  The V2 envelope is an immutable committed snapshot: every reducer and
+ *  controller returns a new object, and the authority hands the same object to
+ *  planners, reducers and persistence without in-place edits (a mutation would
+ *  already break the sealing `sameEnvelopeScope`/`sameSealingEnvelope` checks).
+ *  Re-validating that snapshot is therefore a pure repeat of a full
+ *  2,300-anchor walk: one healthy round measured 85 validation calls
+ *  (~340 ms at 288 files) over only a handful of distinct objects, and the
+ *  cost grows linearly with vault size. The memo keeps the check real
+ *  (every new object is still fully validated) and only skips exact repeats.
+ *  A draft that is later mutated must be published as a new object — the same
+ *  contract every envelope-producing path already follows. */
+const validatedEnvelopes = new WeakSet<object>();
 export function validateEnvelope(value: unknown): asserts value is SyncStateEnvelopeV2 {
+  if (typeof value === "object" && value !== null
+    && validatedEnvelopes.has(value)) {
+    return;
+  }
+  validateEnvelopeImpl(value);
+  if (typeof value === "object" && value !== null) {
+    validatedEnvelopes.add(value);
+  }
+}
+
+function validateEnvelopeImpl(value: unknown): asserts value is SyncStateEnvelopeV2 {
   if (!isRecord(value) || !isMeta(value.meta) || !isSyncScope(value.scope)) {
     throw new Error("V2 state envelope metadata is invalid");
   }

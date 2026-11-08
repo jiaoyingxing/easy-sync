@@ -1,13 +1,13 @@
-// 下载流水线 (2026-10-27)：核对与本地提交不得再挡住下一批下载。
+// 下载组级复核/提交 (2026-11-08)：下载不再逐文件写 intent/receipt/checkpoint。
 //
 // 目标行为（而非实现细节）：
-// 1. 批次 N 的 `$batch` 复核在批次 N+1 的内容传输进行中完成——两批时间线交错，
-//    而不是「下载一批 → 核对完 → 再下载下一批」；
-// 2. 逐文件完成反馈仍在该文件所属批次核对通过后立刻发出，不等下一批的核对；
-// 3. SC-15 顺序不变：每项 intent → receipt → checkpoint，且两批的检查点严格
-//    按批序提交、不交错；
-// 4. 核对失败仍按原路失败关闭（eTag 漂移 → 该项延后、不写本机），且在飞/后续
-//    批次不受污染。
+// 1. 传输批仍按 `downloadPolicy.limit` 形成；准备好的 payload 先进入提交组，
+//    组满 8（桌面）/ 4（手机）或字节上限才交给组车道；
+// 2. 组 N 的 `$batch` 复核与本地提交在组 N+1 的内容传输进行中完成——两组时间线
+//    交错，而不是「下载一组 → 核对完 → 再下载下一组」；
+// 3. 逐文件完成反馈仍在本地写入 + 回执 sink 落地后立刻发出，不等组检查点；
+// 4. SC-15 顺序不变：整组 intent 先于本组第一次本地写，整组回执先于组检查点，
+//    组检查点严格按组序提交、不交错；eTag 漂移仍按原路失败关闭。
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Platform } from "obsidian";
 import { SyncExecutor } from "../src/sync/sync-executor";
@@ -26,6 +26,8 @@ import {
 } from "./helpers/sync-safety-harness";
 
 const CONTENT = new Uint8Array(18).fill(7).buffer;
+const GROUP = 8;
+const VERIFY_GROUP = 8;
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -40,7 +42,7 @@ function deferred<T = void>() {
 async function within<T>(
   promise: Promise<T>,
   label: string,
-  ms = 3_000,
+  ms = 5_000,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -80,7 +82,7 @@ function metadataReader(entries: RemoteFileEntry[]) {
         id,
         name: remote.path,
         size: remote.size,
-        eTag: eTagFor ? eTagFor(id) : remote.eTag,
+        eTag: (eTagFor ? eTagFor(id) : undefined) ?? remote.eTag,
         cTag: remote.cTag,
         file: {},
         parentReference: { id: remote.parentId },
@@ -95,7 +97,7 @@ interface PipelineFixture {
   localStore: ReturnType<typeof makeDownloadLocalStore>;
   /** Shared event log: download / verify / completion / state-write marks. */
   log: string[];
-  /** State writes only, one path-keyed line per write, in execution order. */
+  /** State writes only, one line per group phase. */
   stateLog: string[];
   executor: SyncExecutor;
 }
@@ -113,25 +115,35 @@ function makeFixture(options: {
   const log: string[] = options.log ?? [];
   const stateLog: string[] = [];
   const pathByOperationId = new Map<string, string>();
-  const beginIntent = state.beginMutationIntent.bind(state);
-  state.beginMutationIntent = vi.fn(async (intent: MutationIntentV1) => {
-    pathByOperationId.set(intent.operationId, intent.path);
-    stateLog.push(`intent:${intent.path}`);
-    log.push(`intent:${intent.path}`);
-    await beginIntent(intent);
+  const beginIntents = state.beginMutationIntents.bind(state);
+  state.beginMutationIntents = vi.fn(async (intents: MutationIntentV1[]) => {
+    for (const intent of intents) {
+      pathByOperationId.set(intent.operationId, intent.path);
+      log.push(`intent:${intent.path}`);
+    }
+    stateLog.push(`intents:${intents.length}`);
+    await beginIntents(intents);
   });
-  const recordReceipt = state.recordMutationReceipt.bind(state);
-  state.recordMutationReceipt = vi.fn(async (receipt: MutationReceiptV1) => {
-    const path = pathByOperationId.get(receipt.operationId) ?? "unknown";
-    stateLog.push(`receipt:${path}`);
-    log.push(`receipt:${path}`);
-    await recordReceipt(receipt);
+  const recordReceipts = state.recordMutationReceipts.bind(state);
+  state.recordMutationReceipts = vi.fn(async (receipts: MutationReceiptV1[]) => {
+    for (const receipt of receipts) {
+      log.push(`receipt:${pathByOperationId.get(receipt.operationId) ?? "unknown"}`);
+    }
+    stateLog.push(`receipts:${receipts.length}`);
+    await recordReceipts(receipts);
+  });
+  const commitCheckpoints = state.commitMutationCheckpoints.bind(state);
+  state.commitMutationCheckpoints = vi.fn(async (operationIds: readonly string[]) => {
+    for (const operationId of operationIds) {
+      log.push(`checkpoint:${pathByOperationId.get(operationId) ?? "unknown"}`);
+    }
+    stateLog.push(`checkpoints:${operationIds.length}`);
+    return commitCheckpoints(operationIds);
   });
   const commitCheckpoint = state.commitMutationCheckpoint.bind(state);
   state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
-    const path = pathByOperationId.get(operationId) ?? "unknown";
-    stateLog.push(`checkpoint:${path}`);
-    log.push(`checkpoint:${path}`);
+    log.push(`checkpoint:${pathByOperationId.get(operationId) ?? "unknown"}`);
+    stateLog.push("checkpoints:1");
     return commitCheckpoint(operationId);
   });
   const executor = new SyncExecutor(
@@ -166,25 +178,22 @@ function makeFixture(options: {
   return { entries: options.entries, state, localStore, log, stateLog, executor };
 }
 
-describe("download verify/commit pipeline (2026-10-27)", () => {
+describe("download group verify/commit pipeline (2026-11-08)", () => {
   const previousMobile = Platform.isMobile;
   afterEach(() => {
     Platform.isMobile = previousMobile;
   });
 
-  it("checks batch N while batch N+1 transfers, and completes files without waiting for N+1", async () => {
+  it("verifies and commits each group while the next group transfers", async () => {
     Platform.isMobile = false;
-    const entries = makeEntries(6);
+    const entries = makeEntries(VERIFY_GROUP * 2);
     const log: string[] = [];
     const firstCheckStarted = deferred();
     const releaseFirstCheck = deferred();
-    const secondTransferFinished = deferred();
-    const firstBatchCompletion = deferred();
-    let firstCheckEnded = false;
-    let firstBatchPath: string | null = null;
     let verifyCalls = 0;
+    let verifyEnded = false;
     let downloadCalls = 0;
-
+    let overlapProven = false;
     const metadata = metadataReader(entries);
     const getDriveItemMetadataByIds = vi.fn(async (
       ids: readonly string[],
@@ -194,36 +203,28 @@ describe("download verify/commit pipeline (2026-10-27)", () => {
       verifyCalls++;
       log.push(`verify-start:${verifyCalls}:${ids.length}`);
       if (verifyCalls === 1) {
-        firstBatchPath = entries.find((entry) => entry.driveId === ids[0])!.path;
         firstCheckStarted.resolve();
         await releaseFirstCheck.promise;
-        firstCheckEnded = true;
-      } else if (verifyCalls === 2) {
-        // The row for batch N must not wait for this check to finish: this
-        // check waits for that row (bounded), so a commit stage queued behind
-        // the next verification turns into a clear timeout failure.
-        await within(
-          firstBatchCompletion.promise,
-          "first batch's per-file completion before the second batch's check returns",
-        );
+        verifyEnded = true;
       }
       log.push(`verify-end:${verifyCalls}`);
       return metadata(ids);
     });
-
     const downloadFile = vi.fn(async (_vault: string, path: string) => {
       downloadCalls++;
       const call = downloadCalls;
       log.push(`download-start:${call}:${path}`);
-      if (call === 2) {
-        // Only finish this transfer once the first batch's check is actually
-        // in flight; the release below then closes that check afterwards.
-        await within(firstCheckStarted.promise, "first batch check starts");
-        log.push(`download-2-overlaps-check-1`);
+      if (call === VERIFY_GROUP + 1) {
+        // The first verify group's check is still blocked, so this transfer
+        // proves group N+1's content moves beside group N's verify/commit
+        // lane.
+        await within(firstCheckStarted.promise, "first group check starts");
+        expect(verifyEnded).toBe(false);
+        overlapProven = true;
+        log.push(`download-${call}-overlaps-check-1`);
       }
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 2));
       log.push(`download-end:${call}:${path}`);
-      if (call === 2) secondTransferFinished.resolve();
       return CONTENT.slice(0);
     });
 
@@ -232,18 +233,18 @@ describe("download verify/commit pipeline (2026-10-27)", () => {
     const runPromise = executor.run("manual", {
       onFileComplete: (path, _actionType, success) => {
         log.push(`complete:${path}:${success}`);
-        if (firstBatchPath !== null && path === firstBatchPath) {
-          firstBatchCompletion.resolve();
-        }
       },
     });
 
-    await within(firstCheckStarted.promise, "first version check starts");
-    await within(secondTransferFinished.promise, "second transfer while first check is in flight");
-    expect(firstCheckEnded).toBe(false);
+    await within(firstCheckStarted.promise, "first group check starts");
+    await within(
+      (async () => {
+        while (!overlapProven) await new Promise((resolve) => setTimeout(resolve, 2));
+      })(),
+      "the next group transfers while the first group's check blocks",
+    );
     releaseFirstCheck.resolve();
-    await within(firstBatchCompletion.promise, "first batch's completion row");
-    const result = await within(runPromise, "pipeline round finishes");
+    const result = await within(runPromise, "group pipeline round finishes");
 
     expect(result.errors).toBe(0);
     expect(result.deferred).toBe(0);
@@ -252,51 +253,59 @@ describe("download verify/commit pipeline (2026-10-27)", () => {
     expect(state.baseSnapshot).toHaveLength(entries.length);
     expect(state.mutationLedger).toEqual([]);
 
-    // Timeline: check #1 began before transfer #2 ended, and transfer #2 began
-    // before check #1 ended — the two stages really interleave.
-    const indexOf = (needle: string) => {
-      const index = log.indexOf(needle);
-      expect(index, `event missing: ${needle}`).toBeGreaterThanOrEqual(0);
-      return index;
-    };
-    expect(indexOf("download-start:2:pipeline-1.txt"))
-      .toBeGreaterThan(indexOf("verify-start:1:1"));
-    expect(indexOf("download-end:2:pipeline-1.txt"))
-      .toBeLessThan(indexOf("verify-end:1"));
-    expect(log).toContain("download-2-overlaps-check-1");
+    // Verify groups and persistence groups both stay at the approved 8/4:
+    // two groups of eight, each one `$batch` and one
+    // intent/receipt/checkpoint write.
+    const verifySizes = getDriveItemMetadataByIds.mock.calls
+      .filter((call) => call[1] === "downloadVersionVerify")
+      .map((call) => call[0].length);
+    expect(verifySizes).toEqual([VERIFY_GROUP, VERIFY_GROUP]);
+    expect(fixture.stateLog.filter((line) => line.startsWith("intents:")))
+      .toEqual([`intents:${GROUP}`, `intents:${GROUP}`]);
+    expect(fixture.stateLog.filter((line) => line.startsWith("receipts:")))
+      .toEqual([`receipts:${GROUP}`, `receipts:${GROUP}`]);
+    expect(fixture.stateLog.filter((line) => line.startsWith("checkpoints:")))
+      .toEqual([`checkpoints:${GROUP}`, `checkpoints:${GROUP}`]);
 
-    // Per-file completion: the first batch's row lands from its own commit,
-    // while check #2 still waits for it (see the gate above).
-    expect(log.some((line) => line.startsWith("complete:"))).toBe(true);
-
-    // SC-15: intent → receipt → checkpoint per item, all items in plan order,
-    // and the second batch's first write only after the first batch's
-    // checkpoint. Two batches' checkpoints therefore cannot interleave.
-    expect(fixture.stateLog).toHaveLength(entries.length * 3);
-    fixture.stateLog.forEach((line, index) => {
-      const expectedPhase = ["intent", "receipt", "checkpoint"][index % 3];
-      const expectedPath = entries[Math.floor(index / 3)].path;
-      expect(line).toBe(`${expectedPhase}:${expectedPath}`);
-    });
-    expect(indexOf("checkpoint:pipeline-0.txt")).toBeLessThan(
-      indexOf("intent:pipeline-1.txt"),
+    // SC-15 across groups: group N's checkpoint precedes group N+1's intents,
+    // so checkpoints cannot interleave; a per-file row lands after its own
+    // group's check and before the next group's check.
+    const firstIntentOfSecondGroup = fixture.stateLog.indexOf(
+      `intents:${GROUP}`,
+      1,
     );
+    const firstCheckpoint = fixture.stateLog.indexOf(`checkpoints:${GROUP}`);
+    expect(firstCheckpoint).toBeLessThan(firstIntentOfSecondGroup);
+    const firstComplete = log.findIndex((line) => line.startsWith("complete:"));
+    expect(firstComplete).toBeGreaterThanOrEqual(0);
+    // The verify lane is ordered and the commit lane starts only after its own
+    // group verified. Verify 2 may overlap commit 1 (separate lanes), so it
+    // only has to follow verify 1; the first row follows its own check.
+    const firstVerifyEnd = log.indexOf("verify-end:1");
+    expect(log.findIndex((line) => line.startsWith("verify-start:2:")))
+      .toBeGreaterThan(firstVerifyEnd);
+    expect(firstComplete).toBeGreaterThan(firstVerifyEnd);
+
+    // Every intent for a group precedes that group's first local write.
+    // Transfers are read-only; the group's intents are written after its
+    // payloads are prepared and before the first local write / row. The old
+    // per-file path had the same relative order (transfer → intent → write).
+    const firstIntent = log.findIndex((line) => line.startsWith("intent:"));
+    const firstDownload = log.findIndex((line) => line.startsWith("download-start:"));
+    const firstWriteRow = log.findIndex((line) => line.startsWith("complete:"));
+    expect(firstDownload).toBeGreaterThanOrEqual(0);
+    expect(firstIntent).toBeGreaterThan(firstDownload);
+    expect(firstWriteRow).toBeGreaterThan(firstIntent);
   });
 
-  it("fails a drifted eTag closed without touching the overlapping next batch", async () => {
+  it("fails a drifted eTag closed without touching the neighbouring group", async () => {
     Platform.isMobile = false;
-    const entries = makeEntries(6);
+    const entries = makeEntries(10);
     const failedId = entries[1].driveId;
     const failedPath = entries[1].path;
-    const thirdTransferStarted = deferred();
-    const secondTransferFinished = deferred();
-    const releaseFirstCheck = deferred();
-    const firstCheckStarted = deferred();
-    let verifyCalls = 0;
-    let downloadCalls = 0;
     const pendingIssueSink: PendingIssue[] = [];
-
     const metadata = metadataReader(entries);
+    let verifyCalls = 0;
     const getDriveItemMetadataByIds = vi.fn(async (
       ids: readonly string[],
       reason?: string,
@@ -304,25 +313,16 @@ describe("download verify/commit pipeline (2026-10-27)", () => {
       if (reason !== "downloadVersionVerify") return metadata(ids);
       verifyCalls++;
       if (verifyCalls === 1) {
-        firstCheckStarted.resolve();
-        await releaseFirstCheck.promise;
-      } else if (verifyCalls === 2) {
-        // The failing check is in flight while the following batch already
-        // transfers: one batch's failure neither stops nor pollutes the next.
-        await within(thirdTransferStarted.promise, "third transfer starts");
         expect(ids).toContain(failedId);
-        return metadata(ids, () => "etag-moved-during-download");
+        return metadata(
+          ids,
+          (id) => id === failedId ? "etag-moved-during-download" : undefined,
+        );
       }
       return metadata(ids);
     });
-
-    const downloadFile = vi.fn(async (_vault: string, path: string) => {
-      downloadCalls++;
-      const call = downloadCalls;
-      if (call === 2) await within(firstCheckStarted.promise, "first check starts");
-      if (call === 3) thirdTransferStarted.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      if (call === 2) secondTransferFinished.resolve();
+    const downloadFile = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2));
       return CONTENT.slice(0);
     });
 
@@ -333,11 +333,7 @@ describe("download verify/commit pipeline (2026-10-27)", () => {
     });
     state.reconcilePendingIssues = reconcileIssues;
 
-    const runPromise = executor.run("manual", {});
-    await within(firstCheckStarted.promise, "first check starts");
-    await within(secondTransferFinished.promise, "second transfer while the first check runs");
-    releaseFirstCheck.resolve();
-    const result = await within(runPromise, "pipeline round finishes");
+    const result = await executor.run("manual", {});
 
     // The drifted item fails closed as the existing transient version race:
     // deferred, no local bytes, no mutation intent.
@@ -360,10 +356,80 @@ describe("download verify/commit pipeline (2026-10-27)", () => {
         actionType: "download",
       });
 
-    // The batch that was already transferring during the failed check settled
-    // normally, and every other batch still committed its own checkpoint.
-    expect(fixture.stateLog.filter((line) => line.startsWith("checkpoint:")))
-      .toHaveLength(entries.length - 1);
-    expect(verifyCalls).toBeGreaterThanOrEqual(3);
+    // Group 1 = 8 files, one of which failed verification; group 2 = 2 files.
+    // The failed member is excluded from the intent/receipt/checkpoint writes
+    // but the group's other members still commit.
+    expect(fixture.stateLog.filter((line) => line.startsWith("intents:")))
+      .toEqual(["intents:7", "intents:2"]);
+    expect(fixture.stateLog.filter((line) => line.startsWith("checkpoints:")))
+      .toEqual(["checkpoints:7", "checkpoints:2"]);
+  });
+
+  it("flips every shown row when the shared checkpoint fails", async () => {
+    Platform.isMobile = false;
+    const entries = makeEntries(GROUP);
+    const downloadFile = vi.fn(async () => CONTENT.slice(0));
+    const fixture = makeFixture({
+      entries,
+      downloadFile,
+      getDriveItemMetadataByIds: vi.fn(async (ids: readonly string[]) =>
+        metadataReader(entries)(ids)),
+    });
+    const { executor, state } = fixture;
+    const completed: string[] = [];
+    const reverted: Array<{ path: string; reason: string }> = [];
+    state.commitMutationCheckpoints = vi.fn(async () => {
+      throw new Error("checkpoint save failed");
+    });
+
+    const result = await executor.run("manual", {
+      onFileComplete: (path, _actionType, success) => {
+        if (success) completed.push(path);
+      },
+      onFileReverted: (path, reason) => {
+        reverted.push({ path, reason });
+      },
+    });
+
+    expect(completed).toHaveLength(GROUP);
+    expect(reverted).toHaveLength(GROUP);
+    expect(reverted.map((row) => row.path).sort()).toEqual(
+      entries.map((entry) => entry.path).sort(),
+    );
+    expect(reverted.every((row) => row.reason.includes("checkpoint"))).toBe(true);
+    expect(result.errors).toBeGreaterThanOrEqual(1);
+    expect(state.baseSnapshot).toEqual([]);
+    // Receipts were durable before the failed checkpoint: the ledger keeps
+    // them for the next round's recovery instead of losing the evidence.
+    expect(state.mutationLedger).toHaveLength(GROUP);
+    expect(state.mutationLedger.every((record) => record.receipt !== null)).toBe(true);
+  });
+
+  it("leaves at most one group of intent-only downloads when the round cancels inside it", async () => {
+    Platform.isMobile = false;
+    const entries = makeEntries(GROUP + 4);
+    const fixture = makeFixture({
+      entries,
+      downloadFile: vi.fn(async () => CONTENT.slice(0)),
+      getDriveItemMetadataByIds: vi.fn(async (ids: readonly string[]) =>
+        metadataReader(entries)(ids)),
+    });
+    const { executor, state, localStore } = fixture;
+    const beginIntents = state.beginMutationIntents.bind(state);
+    state.beginMutationIntents = vi.fn(async (intents: MutationIntentV1[]) => {
+      await beginIntents(intents);
+      // Cancellation after the group's intent write but before its first
+      // local write: the durable window a crash in the same spot leaves.
+      executor.cancel();
+    });
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(false);
+    expect(result.downloaded).toBe(0);
+    expect(localStore.files.size).toBe(0);
+    expect(state.mutationLedger).toHaveLength(GROUP);
+    expect(state.mutationLedger.every((record) => record.receipt === null)).toBe(true);
+    expect(state.baseSnapshot).toEqual([]);
   });
 });

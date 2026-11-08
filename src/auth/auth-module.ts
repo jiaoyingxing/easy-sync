@@ -151,6 +151,17 @@ export class AuthModule {
     promise: Promise<string>;
   } | null = null;
 
+  /** One Graph /me verification per generation + access token. initialize(),
+   *  a connectivity refresh and the sync path can all ask in the same tick;
+   *  each fetch clears accountId before the request, so sharing the in-flight
+   *  promise keeps the fail-closed window at one request instead of two or
+   *  three (2026-11-08 field trace). */
+  private profileFetchInFlight: {
+    generation: number;
+    accessToken: string;
+    promise: Promise<void>;
+  } | null = null;
+
   /** Transient refresh-failure backoff (login-persistence contract): a
    *  network flake right after sleep/wake or an offline period must NOT log
    *  the user out or delete the stored credential, but we also must not
@@ -1316,7 +1327,29 @@ export class AuthModule {
   /** Fetch user profile from Microsoft Graph to populate displayName and accountId.
    *  Cached profile data is display-only: account authorization must always be
    *  anchored to /me for the current access token. */
-  private async fetchUserProfile(
+  private fetchUserProfile(
+    generation: number,
+    accessToken: string,
+  ): Promise<void> {
+    const inFlight = this.profileFetchInFlight;
+    if (
+      inFlight
+      && inFlight.generation === generation
+      && inFlight.accessToken === accessToken
+    ) {
+      return inFlight.promise;
+    }
+    const promise = this.fetchUserProfileOnce(generation, accessToken)
+      .finally(() => {
+        if (this.profileFetchInFlight?.promise === promise) {
+          this.profileFetchInFlight = null;
+        }
+      });
+    this.profileFetchInFlight = { generation, accessToken, promise };
+    return promise;
+  }
+
+  private async fetchUserProfileOnce(
     generation: number,
     accessToken: string,
   ): Promise<void> {

@@ -37,7 +37,6 @@ export interface LocaleStrings {
   "ribbon.ready": string;
 
   // ---- Settings Groups ----
-  "settings.group.scope": string;
   "settings.rules.name": string;
   "settings.rules.acknowledge": string;
   "settings.syncContent.heading": string;
@@ -49,7 +48,6 @@ export interface LocaleStrings {
   "settings.rootNav.value.autoSyncOn": string;
   "settings.rootNav.value.autoSyncOff": string;
   "settings.rootNav.value.excluded": string;
-  "settings.group.automatic": string;
   "settings.group.display": string;
   "settings.group.maintenance": string;
   "settings.group.about": string;
@@ -122,31 +120,19 @@ export interface LocaleStrings {
   "settings.syncMode.disable.confirm": string;
   "settings.syncPanel.button": string;
   "settings.autoSync.name": string;
-  "settings.autoSync.open": string;
-  "settings.autoSync.title": string;
   "settings.autoSync.intro": string;
   "settings.autoSync.desc.disabled": string;
   "settings.autoSync.desc.enabled": string;
   "settings.autoSync.desc.paused": string;
-  "settings.automaticHandling.button": string;
-  "settings.automaticHandling.open": string;
   "settings.automaticHandling.name": string;
-  "settings.automaticHandling.desc": string;
-  "settings.automaticHandling.title": string;
   "settings.automaticHandling.intro": string;
   "settings.automaticHandling.autoDeleteLocalFiles.name": string;
   "settings.automaticHandling.autoDeleteLocalFiles.desc": string;
   "settings.automaticHandling.mergeNonOverlappingText.name": string;
   "settings.automaticHandling.mergeNonOverlappingText.desc": string;
   "settings.syncScope.name": string;
-  "settings.syncScope.desc": string;
-  "settings.syncScope.button": string;
   "settings.syncScope.title": string;
   "settings.syncScope.intro": string;
-  "settings.syncExclusion.name": string;
-  "settings.syncExclusion.desc": string;
-  "settings.syncExclusion.button": string;
-  "settings.syncExclusion.title": string;
   "settings.syncExclusion.intro": string;
   "settings.syncExclusion.folders.name": string;
   "settings.syncExclusion.add": string;

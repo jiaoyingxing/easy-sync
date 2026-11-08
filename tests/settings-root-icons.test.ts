@@ -92,8 +92,6 @@ describe("settings root icons", () => {
     expect(source).toContain("new MutationObserver(");
     expect(source).toContain(".observe(this.containerEl");
     expect(source).toContain("decorateSettingsRootRowIcons(");
-    // <1.13 的 display() 弹框形态没有根级导航行：只在声明式渲染时装饰。
-    expect(source).toContain("settingItems === undefined");
   });
 
   it("行图标间距对齐 Resojot 写法：基础 8px ＋ body.is-phone 前缀 4px（前缀承重）", () => {

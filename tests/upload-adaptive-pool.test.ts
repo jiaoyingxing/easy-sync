@@ -28,8 +28,8 @@ import {
 
 const CONTENT = new ArrayBuffer(8);
 /** Desktop persistence batch (`UPLOAD_CHECKPOINT_BATCH`); the test env runs
- *  the desktop build, where a full batch is eight files. */
-const BATCH = 8;
+ *  the desktop build, where a full batch is sixteen files (2026-11-08: 8→16). */
+const BATCH = 16;
 
 interface DiagLine {
   level: "log" | "warn";
@@ -213,16 +213,19 @@ describe("adaptive upload pool", () => {
       active--;
       return okUpload(path);
     });
+    // Whole batches: the last batch must have BATCH members so the pool can
+    // still reach the ceiling there instead of ending on a short tail.
+    const fileCount = BATCH * 3;
     const sizes = Array.from(
-      { length: 36 },
+      { length: fileCount },
       (_, index) => 8 * 2 ** Math.floor(index / 4),
     );
-    const scenario = await makePoolScenario({ fileCount: 36, sizes, uploadFile });
+    const scenario = await makePoolScenario({ fileCount, sizes, uploadFile });
 
     const result = await scenario.executor.run("manual", {});
 
     expect(result.success).toBe(true);
-    expect(result.uploaded).toBe(36);
+    expect(result.uploaded).toBe(fileCount);
     expect(result.errors).toBe(0);
 
     // Six AIMD windows of four successes: 2 → 3 → … → 8. Under load a window

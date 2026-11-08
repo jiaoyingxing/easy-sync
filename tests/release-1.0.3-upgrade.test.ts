@@ -119,7 +119,8 @@ describe("release 1.0.3 in-place upgrade", () => {
 
     expect(manifest).toMatchObject({
       id: "easy-sync",
-      minAppVersion: "1.11.4",
+      // 2026-11-07: the floor was raised to 1.13.4 (declarative settings only).
+      minAppVersion: "1.13.4",
       isDesktopOnly: false,
     });
     expect(SS_REFRESH_TOKEN).toBe("easy-sync-onedrive-refresh-token");

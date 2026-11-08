@@ -38,10 +38,7 @@ const CSS_FILE = "styles.css";
 const STRUCTURAL_HOOKS = new Set([
   "easy-sync-ribbon",
   "easy-sync-auth-device-code-modal",
-  "easy-sync-automatic-handling",
-  "easy-sync-auto-sync",
   "easy-sync-detail-format-difference",
-  "easy-sync-settings-about",
   "easy-sync-path-layout",
   "easy-sync-path-layout-item",
   "easy-sync-adaptive-path",
@@ -49,13 +46,9 @@ const STRUCTURAL_HOOKS = new Set([
   "easy-sync-notice",
   "easy-sync-notice-action",
   "easy-sync-notice-result",
-  "easy-sync-settings-range",
-  "easy-sync-settings-automatic",
-  "easy-sync-settings-display",
-  "easy-sync-settings-maintenance",
-  // 2026-10-20 同上家族：「高级」组宿主＝纯刷新容器（间距由通用
-  // group-host 相邻规则承接），无专属样式。
-  "easy-sync-settings-maintenance-advanced",
+  // easy-sync-automatic-handling / easy-sync-auto-sync 与 easy-sync-settings-*
+  // 组宿主（range/automatic/display/maintenance/maintenance-advanced）是 <1.13
+  // 弹框与 display() 六块的纯结构钩子，随 minAppVersion 1.13.4 退场（2026-11-07）。
 ]);
 
 /**

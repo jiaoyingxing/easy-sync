@@ -196,8 +196,8 @@ describe("Bounded small-file upload concurrency", () => {
       receiptWrites: 9,
       checkpointOperations: 9,
       // One shared checkpoint per persistence batch: the eight small uploads
-      // are one batch (desktop 8) and the large upload keeps its own per-file
-      // checkpoint. The old concurrency-derived wave paid five.
+      // fit in one batch (desktop 16) and the large upload keeps its own
+      // per-file checkpoint. The old concurrency-derived wave paid five.
       checkpointCommits: 2,
       checkpointFailures: 0,
     });
@@ -509,7 +509,7 @@ describe("Conservative desktop small-file download concurrency", () => {
       // download-concurrency-policy.test.ts; this integration contract only
       // requires actual overlap, the hard cap, and serial local commits.
       expect(peakDownloads).toBeGreaterThanOrEqual(2);
-      expect(peakDownloads).toBeLessThanOrEqual(3);
+      expect(peakDownloads).toBeLessThanOrEqual(4);
       expect(peakWrites).toBe(1);
       expect(result.metrics?.fileTransfers.download).toMatchObject({
         started: remoteEntries.length,

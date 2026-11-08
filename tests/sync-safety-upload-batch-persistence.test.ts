@@ -22,8 +22,8 @@ import {
 
 const CONTENT = new ArrayBuffer(8);
 /** Desktop persistence batch (`UPLOAD_CHECKPOINT_BATCH`); the test env runs
- *  the desktop build, where a full batch is eight files. */
-const BATCH = 8;
+ *  the desktop build, where a full batch is sixteen files (2026-11-08: 8→16). */
+const BATCH = 16;
 
 interface UploadScenario {
   executor: SyncExecutor;
@@ -104,7 +104,7 @@ function intentForPath(
 }
 
 describe("small-upload persistence batches", () => {
-  it("pays one intent write, one receipt write and one checkpoint per eight-file batch", async () => {
+  it("pays one intent write, one receipt write and one checkpoint per sixteen-file batch", async () => {
     const { executor, state, uploadFile } = await makeUploadScenario({
       fileCount: BATCH,
     });
@@ -144,7 +144,7 @@ describe("small-upload persistence batches", () => {
     expect(state.baseSnapshot).toHaveLength(BATCH);
   });
 
-  it("keeps a failed member on its own exit while the other seven settle in the batch", async () => {
+  it("keeps a failed member on its own exit while the other fifteen settle in the batch", async () => {
     const failingPath = "batch-2.md";
     const uploadFile = vi.fn(async (_vault: string, path: string) => {
       if (path === failingPath) throw new Error("upload failed");
@@ -170,7 +170,7 @@ describe("small-upload persistence batches", () => {
     expect(intents).toHaveLength(BATCH);
     const failedIntent = intentForPath(intents, failingPath);
 
-    // The seven successes still share one receipt write and one checkpoint.
+    // The fifteen successes still share one receipt write and one checkpoint.
     const receipts = vi.mocked(state.recordMutationReceipts)
       .mock.calls[0][0] as MutationReceiptV1[];
     expect(receipts).toHaveLength(BATCH - 1);
