@@ -54,7 +54,7 @@ EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
 
 **设置 → 第三方插件 → 浏览 → 搜索 EasySync → 安装并启用**
 
-需要 Obsidian `1.11.4` 或更高版本。
+需要 Obsidian `1.13.4` 或更高版本。
 
 也可以从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 手动安装：下载 `main.js`、`manifest.json` 和 `styles.css`，放入：
 

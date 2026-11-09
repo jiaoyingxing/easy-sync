@@ -54,7 +54,7 @@ In Obsidian, open:
 
 **Settings → Community plugins → Browse → Search for EasySync → Install and enable**
 
-EasySync requires Obsidian `1.11.4` or later.
+EasySync requires Obsidian `1.13.4` or later.
 
 For manual installation, download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) and place them in:
 
