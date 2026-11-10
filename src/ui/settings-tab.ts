@@ -54,7 +54,7 @@ import {
 } from "./settings-page-rows";
 
 const GITHUB_URL = "https://github.com/jiaoyingxing/easy-sync";
-const XHS_URL = "https://xhslink.com/m/57v8xzlVMKp";
+const XHS_URL = "https://www.xiaohongshu.com/user/profile/605dfc23000000000101cfdb";
 
 /**
  * Contact button for the About card: rebuilds the default text-only button
