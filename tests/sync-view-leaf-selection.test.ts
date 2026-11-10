@@ -34,7 +34,12 @@ function pluginWith(
 ): EasySyncPlugin {
   const plugin = new EasySyncPlugin();
   (plugin as never as { app: unknown }).app = {
-    workspace: { getLeavesOfType: () => leaves, ...extra },
+    workspace: {
+      getLeavesOfType: () => leaves,
+      setActiveLeaf: vi.fn(),
+      containerEl: { ownerDocument: { defaultView: { focus: vi.fn() } } },
+      ...extra,
+    },
   };
   return plugin;
 }
@@ -111,6 +116,21 @@ describe("activateSyncView leaf handling", () => {
 
     expect(revealLeaf).not.toHaveBeenCalled();
   });
+
+  it("strongly focuses the revealed panel (OpenPlug pairing)", async () => {
+    // 2026-11-10 用户反馈：桌面设置面是独立窗口，只 reveal 时侧栏变化被挡住，
+    // 像点了没反应。合同＝revealLeaf ＋ setActiveLeaf({focus:true}) 成对（照 OpenPlug）。
+    const shown = fakeLeaf(true);
+    const setActiveLeaf = vi.fn();
+    const plugin = pluginWith([shown], {
+      revealLeaf: vi.fn().mockResolvedValue(undefined),
+      setActiveLeaf,
+    });
+
+    await plugin.activateSyncView();
+
+    expect(setActiveLeaf).toHaveBeenCalledWith(shown, { focus: true });
+  });
 });
 
 describe("openSyncPanelFromSettings", () => {
@@ -123,6 +143,8 @@ describe("openSyncPanelFromSettings", () => {
     (plugin as never as { app: unknown }).app = {
       workspace: {
         getLeavesOfType: () => [leaf],
+        setActiveLeaf: vi.fn(),
+        containerEl: { ownerDocument: { defaultView: { focus: vi.fn() } } },
         revealLeaf: vi.fn(async () => {
           order.push("reveal");
         }),
@@ -137,7 +159,22 @@ describe("openSyncPanelFromSettings", () => {
     return plugin;
   }
 
-  it("dismisses the settings surface on mobile so the revealed panel is visible", async () => {
+  it("dismisses the settings surface before revealing the panel on desktop", async () => {
+    // 照 OpenPlug：桌面 1.13+ 设置面是独立窗口、挡在主窗前；不收走设置时
+    // reveal／setActiveLeaf 的激活被遮挡，用户感知「点了没反应」（2026-11-10）。
+    const close = vi.fn();
+    const order: string[] = [];
+    const plugin = pluginWithSettings(close, order);
+
+    await plugin.openSyncPanelFromSettings();
+
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["close", "reveal"]);
+  });
+
+  it("reveals the panel before dismissing the settings surface on mobile", async () => {
+    // 手机设置是全屏模态：抽屉可在设置面后先展开；先收设置会闪一帧空工作区
+    // （2026-10-09 真机反馈），与桌面顺序相反。2026-11-10 审查恢复该分支。
     const close = vi.fn();
     const order: string[] = [];
     const plugin = pluginWithSettings(close, order);
@@ -148,22 +185,7 @@ describe("openSyncPanelFromSettings", () => {
       Platform.isMobile = false;
     }
 
-    // 移动端设置面是全屏模态：只展开侧栏、不退设置面时，用户看到的还是设置页
-    // （2026-10-09 真机反馈「以为点了没反应」）。顺序＝先展开后退出，避免先退
-    // 出时闪一帧空工作区。
     expect(close).toHaveBeenCalledTimes(1);
     expect(order).toEqual(["reveal", "close"]);
-  });
-
-  it("keeps the settings surface open on desktop", async () => {
-    const close = vi.fn();
-    const order: string[] = [];
-    const plugin = pluginWithSettings(close, order);
-
-    await plugin.openSyncPanelFromSettings();
-
-    // 桌面设置面在独立窗口，不挡侧栏；关掉它只会打断还在改设置的人。
-    expect(close).not.toHaveBeenCalled();
-    expect(order).toEqual(["reveal"]);
   });
 });

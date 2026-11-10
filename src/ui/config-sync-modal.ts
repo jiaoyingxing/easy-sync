@@ -242,14 +242,8 @@ export class ConfigSyncModal extends EasySyncModal {
     if (typeof intro === "string") scopeIntro.setText(intro);
     else scopeIntro.appendChild(intro);
 
-    // Core plugins leads the list; the remaining scope switches follow the
-    // community-plugin pair (see trailingToggles).
-    this.renderScopeToggle({
-      key: "settings.syncCorePlugins",
-      get: () => this.plugin.syncCorePlugins,
-      patch: (value) => ({ syncCorePlugins: value }),
-    });
-
+    // The community-plugin pair leads the list; the remaining scope switches
+    // (core plugins first) follow it (see trailingToggles).
     this.renderCommunityPluginScopeSetting(
       "files",
       "settings.syncCommunityPlugins",
@@ -260,6 +254,11 @@ export class ConfigSyncModal extends EasySyncModal {
     );
 
     const trailingToggles: ScopeToggleConfig[] = [
+      {
+        key: "settings.syncCorePlugins",
+        get: () => this.plugin.syncCorePlugins,
+        patch: (value) => ({ syncCorePlugins: value }),
+      },
       {
         key: "settings.syncEditor",
         get: () => this.plugin.syncEditorSettings,
@@ -445,7 +444,6 @@ export class ConfigSyncModal extends EasySyncModal {
           steps: [
             this.plugin.i18n.t(
               "settings.communityPlugins.data.experimentalBulkStep.shared",
-              { count: knownPluginIds.length },
             ),
             this.plugin.i18n.t(
               "settings.communityPlugins.data.experimentalBulkStep.replace",

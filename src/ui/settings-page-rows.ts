@@ -439,7 +439,6 @@ export function applyCommunityPluginScopeRow(
                   steps: [
                     t(
                       "settings.communityPlugins.data.experimentalBulkStep.shared",
-                      { count: knownPluginIds.length },
                     ),
                     t("settings.communityPlugins.data.experimentalBulkStep.replace"),
                     t("settings.communityPlugins.data.experimentalBulkStep.conflict"),

@@ -10,7 +10,10 @@
  *  link. The slow-connection gate evaluates the achieved rate over
  *  non-overlapping windows at each body chunk; aborts the attempt (retryable
  *  via the stalled marker) while the reconnect budget lasts, then accepts
- *  the current connection for the rest of the download. */
+ *  the current connection for the rest of the download. A judged-slow window
+ *  is still kept when the file can finish inside the download's remaining
+ *  budget (2026-11-10) — the gate abandons only connections that cannot
+ *  deliver the file before the deadline. */
 
 import {
   compatClearTimeout,
@@ -84,13 +87,21 @@ export function createSlowLinkEvidence(): SlowLinkEvidence {
 
 interface SlowConnectionGateOptions {
   /** Shared per-round link evidence; without it the gate falls back to the
-   *  legacy absolute-threshold rule (first window of every round pays the
-   *  cold-start tuition against the absolute line, later windows judge
-   *  relatively). */
+   *  legacy absolute-threshold rule (every window is judged against the
+   *  absolute line instead of the link's own baseline). */
   evidence?: SlowLinkEvidence;
   /** Expected total transfer size; enables the completion-imminence
    *  exemption when known. Multi-stream windows pass their window size. */
   totalSize?: number;
+  /** Remaining time of the download's own waterfall deadline. A connection
+   *  whose measured rate still finishes the file inside that window is never
+   *  abandoned: a reconnect discards the received prefix, pays a fresh
+   *  metadata round trip, and the fallback tiers are usually slower than the
+   *  CDN (2026-11-10 iOS 3.6 MiB replay: 80 KiB/s steady, aborted at ~1.2 MiB
+   *  by the cold absolute rule, then 15–21 KiB/s on /content until the
+   *  deadline — the file could never finish). Omitted by callers with no
+   *  per-file budget (multi-stream windows), which keep the old judgment. */
+  budgetLeftMs?: () => number;
 }
 
 export interface DownloadStallWatchdog {
@@ -133,14 +144,28 @@ export function createSlowConnectionGate(
       windowStart = now;
       windowBytes = totalBytes;
       // Judge against prior evidence only: the judging window must not be
-      // compared with itself. Cold start (no sample yet) keeps the legacy
-      // absolute rule byte-for-byte.
+      // compared with itself. Cold start (no sample yet) is an absolute-only
+      // judgment, which is exactly what the budget exemption may rescue.
       const baseline = options.evidence?.baseline() ?? null;
       options.evidence?.record(rateBytesPerSecond);
+      // A collapse against the link's own evidence is a real signal (the
+      // 2026-09-14/15 samples: 148→44→5 KiB/s must abort even mid-budget);
+      // only an absolute-only judgment can be rescued by the budget exemption
+      // below. Comparable windows were already accepted by `isSlow`.
+      const relativeCollapse = baseline !== null
+        && rateBytesPerSecond < DOWNLOAD_SLOW_RELATIVE_FACTOR * baseline;
       const isSlow = rateBytesPerSecond < DOWNLOAD_SLOW_RATE_BYTES_PER_SECOND
-        && (baseline === null
-          || rateBytesPerSecond < DOWNLOAD_SLOW_RELATIVE_FACTOR * baseline);
+        && (baseline === null || relativeCollapse);
       if (!isSlow) return;
+      if (
+        !relativeCollapse
+        && finishesWithinBudget(
+          options.totalSize,
+          totalBytes,
+          rateBytesPerSecond,
+          options.budgetLeftMs?.(),
+        )
+      ) return;
       if (isCompletionImminent(options.totalSize, totalBytes, rateBytesPerSecond)) return;
       if (aborts >= DOWNLOAD_SLOW_ABORT_LIMIT) {
         accepted = true;
@@ -184,6 +209,27 @@ function isCompletionImminent(
   const reconnectCostMs = DOWNLOAD_SLOW_RECONNECT_COST_MS
     + (receivedBytes / rateBytesPerSecond) * 1000;
   return remainingMs <= reconnectCostMs;
+}
+
+/** Budget exemption (2026-11-10): the broader form of completion-imminence.
+ *  Whatever the rate looks like against the absolute ceiling, a connection
+ *  that can still deliver the whole file inside this download's remaining
+ *  budget is the round's best bet — aborting it trades a certain (if slow)
+ *  success for a restart that discards every landed byte and a fallback
+ *  channel measured slower than the one being abandoned. It deliberately does
+ *  NOT rescue a window that collapsed relative to the link's own evidence
+ *  (`relativeCollapse` in the caller): a decaying connection is what the
+ *  reconnect budget exists for. Disabled while size or budget is unknown. */
+function finishesWithinBudget(
+  totalSize: number | undefined,
+  receivedBytes: number,
+  rateBytesPerSecond: number,
+  budgetLeftMs: number | undefined,
+): boolean {
+  if (!totalSize || totalSize <= 0 || rateBytesPerSecond <= 0) return false;
+  if (budgetLeftMs === undefined || !Number.isFinite(budgetLeftMs)) return false;
+  const remainingMs = ((totalSize - receivedBytes) / rateBytesPerSecond) * 1000;
+  return remainingMs <= Math.max(0, budgetLeftMs);
 }
 
 export function createDownloadStallWatchdog(

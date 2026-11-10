@@ -19,8 +19,11 @@ describe("OneDriveClient slow-link evidence wiring (2026-09-15 乙路)", () => {
     expect(clientSource).toContain("private slowLinkEvidence = createSlowLinkEvidence();");
     expect(clientSource).toContain("this.slowLinkEvidence = createSlowLinkEvidence();");
     // Both gate construction sites share the evidence; the single-stream gate
-    // also receives the file size for the completion-imminence exemption.
-    expect(clientSource).toContain("{ evidence: this.slowLinkEvidence, totalSize: input.fileSize }");
+    // also receives the file size for the completion-imminence exemption and
+    // the download's remaining budget for the 2026-11-10 budget exemption.
+    expect(clientSource).toContain("evidence: this.slowLinkEvidence,");
+    expect(clientSource).toContain("totalSize: input.fileSize,");
+    expect(clientSource).toContain("budgetLeftMs: () => deadlineMs - Date.now(),");
     expect(clientSource).toContain("slowLinkEvidence: this.slowLinkEvidence,");
     expect(rangeSource).toContain("evidence: input.slowLinkEvidence");
     // Telemetry surfaces through the shared error-data helper.

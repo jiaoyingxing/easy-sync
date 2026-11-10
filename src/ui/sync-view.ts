@@ -5505,7 +5505,17 @@ export class EasySyncSyncView extends ItemView {
     planReviewRefreshed: boolean,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const panel = this.createSection(container, t("syncPlan.sectionTitle"));
+    // The visible heading is intentionally gone: the fixed top status row is
+    // the only visible label for this body (plan review active is exactly the
+    // state that renders it), and the summary is the first readable line. The
+    // section keeps a programmatic group name so screen readers do not lose
+    // the region — same shape as the recovery section.
+    const section = container.createDiv("easy-sync-section");
+    section.setAttribute("role", "group");
+    section.setAttribute("aria-label", t("syncPlan.sectionTitle"));
+    const panel = section.createDiv(
+      "easy-sync-section-body easy-sync-section-content",
+    );
     const activationReviewKind =
       this.plugin.state?.planReviewAuthorization?.reviewKind;
     const hasDecisionRows = items.some((item) =>

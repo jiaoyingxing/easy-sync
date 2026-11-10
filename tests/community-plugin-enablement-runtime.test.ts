@@ -2778,6 +2778,460 @@ describe("community plugin enablement runtime", () => {
     }
   });
 
+  it("skips a desktop-only remote update when a complete local bundle already exists", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
+    Platform.isMobile = true;
+    Platform.isMobileApp = true;
+    try {
+      const rootPath = ".obsidian/plugins/calendar";
+      const manifestPath = `${rootPath}/manifest.json`;
+      const mainPath = `${rootPath}/main.js`;
+      const stylesPath = `${rootPath}/styles.css`;
+      const localManifestBytes = bytes(JSON.stringify({
+        id: "calendar",
+        version: "1.0.0",
+        minAppVersion: "1.5.0",
+      }));
+      const desktopOnlyManifestBytes = bytes(JSON.stringify({
+        id: "calendar",
+        version: "2.0.0",
+        minAppVersion: "1.5.0",
+        isDesktopOnly: true,
+      }));
+      const localMain = bytes("main-local");
+      const remoteMain = bytes("main-remote");
+      const localStyles = bytes("styles-local");
+      const remoteStyles = bytes("styles-remote");
+      const remoteManifest = await remoteEntry(
+        manifestPath,
+        desktopOnlyManifestBytes,
+      );
+      const remoteMainEntry = await remoteEntry(mainPath, remoteMain);
+      const remoteStylesEntry = await remoteEntry(stylesPath, remoteStyles);
+      const localManifest = await localEntry(manifestPath, localManifestBytes);
+      const localMainEntry = await localEntry(mainPath, localMain);
+      const localStylesEntry = await localEntry(stylesPath, localStyles);
+      const base = [
+        { ...sharedBaseEntry(localManifest, remoteManifest), eTag: "etag:base" },
+        {
+          ...sharedBaseEntry(localMainEntry, remoteMainEntry),
+          eTag: "etag:base",
+        },
+        {
+          ...sharedBaseEntry(localStylesEntry, remoteStylesEntry),
+          eTag: "etag:base",
+        },
+      ];
+      const memory = makeMemoryAdapter({
+        [manifestPath]: new TextDecoder().decode(localManifestBytes),
+        [mainPath]: localMain,
+        [stylesPath]: localStyles,
+      });
+      const downloadFile = vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        if (path === manifestPath) return desktopOnlyManifestBytes;
+        if (path === mainPath) return remoteMain;
+        if (path === stylesPath) return remoteStyles;
+        return new ArrayBuffer(0);
+      });
+      const state = makeState(
+        [remoteManifest, remoteMainEntry, remoteStylesEntry],
+        base,
+        {
+          // The exact stuck shape: three failed download rows from a previous
+          // round, each without a row-level exit.
+          pendingIssues: [mainPath, manifestPath, stylesPath].map((path) => ({
+            path,
+            actionType: SyncActionType.Download,
+            reason: "error.present.plugin.incompatibleDesktopOnly",
+            updatedAt: 1,
+            consecutiveFailures: 1,
+          })),
+        },
+      );
+      const { executor } = makeExecutor({
+        localEntries: [localManifest, localMainEntry, localStylesEntry],
+        localFolders: REMOTE_FOLDERS.map((folder) => ({
+          path: folder.path,
+          mtime: 1,
+        })),
+        remoteEntries: [remoteManifest, remoteMainEntry, remoteStylesEntry],
+        remoteContent: null,
+        adapter: memory.adapter,
+        state,
+        oneDrive: makeOneDrive(null, {
+          downloadFile,
+          getDelta: vi.fn().mockResolvedValue({
+            value: completeRemoteItems([
+              remoteManifest,
+              remoteMainEntry,
+              remoteStylesEntry,
+            ]),
+            "@odata.deltaLink": "delta-token-next",
+          }),
+        }),
+        policy: {
+          version: 1,
+          files: { mode: "selected", pluginIds: ["calendar"] },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const first = await executor.run("manual");
+
+      expect(first).toMatchObject({
+        success: true,
+        errors: 0,
+        downloaded: 0,
+        deferred: 0,
+        foldersCreated: 0,
+      });
+      expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
+      expect(executor.getMobileDesktopOnlyCommunityPluginIds()).toEqual([
+        "calendar",
+      ]);
+      expect(state.reconcilePendingIssues).toHaveBeenLastCalledWith(
+        [],
+        expect.any(Set),
+      );
+      const pruned = (state.prunePendingIssues as unknown as {
+        mock: { calls: unknown[][] };
+      }).mock.calls.at(-1)?.[0] as string[];
+      expect(pruned).not.toContain(mainPath);
+      expect(pruned).not.toContain(manifestPath);
+      expect(pruned).not.toContain(stylesPath);
+
+      // A stable second round must reuse the source-bound observation: the
+      // desktop-only fact stays, and no manifest is read again.
+      downloadFile.mockClear();
+      const second = await executor.run("manual");
+      expect(second).toMatchObject({
+        success: true,
+        errors: 0,
+        downloaded: 0,
+        deferred: 0,
+      });
+      expect(downloadFile).not.toHaveBeenCalled();
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
+    }
+  });
+
+  it("skips a desktop-only bundle member update when only a non-manifest member changed", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
+    Platform.isMobile = true;
+    Platform.isMobileApp = true;
+    try {
+      const rootPath = ".obsidian/plugins/calendar";
+      const manifestPath = `${rootPath}/manifest.json`;
+      const mainPath = `${rootPath}/main.js`;
+      const stylesPath = `${rootPath}/styles.css`;
+      const desktopOnlyManifestBytes = bytes(JSON.stringify({
+        id: "calendar",
+        version: "2.0.0",
+        minAppVersion: "1.5.0",
+        isDesktopOnly: true,
+      }));
+      const localMain = bytes("main-local");
+      const remoteMain = bytes("main-remote");
+      const localStyles = bytes("styles-local");
+      const remoteStyles = bytes("styles-remote");
+      const remoteManifest = await remoteEntry(
+        manifestPath,
+        desktopOnlyManifestBytes,
+      );
+      const remoteMainEntry = await remoteEntry(mainPath, remoteMain);
+      const remoteStylesEntry = await remoteEntry(stylesPath, remoteStyles);
+      const localManifest = await localEntry(
+        manifestPath,
+        desktopOnlyManifestBytes,
+      );
+      const localMainEntry = await localEntry(mainPath, localMain);
+      const localStylesEntry = await localEntry(stylesPath, localStyles);
+      const base = [
+        { ...sharedBaseEntry(localManifest, remoteManifest), eTag: "etag:base" },
+        {
+          ...sharedBaseEntry(localMainEntry, remoteMainEntry),
+          eTag: "etag:base",
+        },
+        {
+          ...sharedBaseEntry(localStylesEntry, remoteStylesEntry),
+          eTag: "etag:base",
+        },
+      ];
+      const memory = makeMemoryAdapter({
+        [manifestPath]: new TextDecoder().decode(desktopOnlyManifestBytes),
+        [mainPath]: localMain,
+        [stylesPath]: localStyles,
+      });
+      const downloadFile = vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        if (path === manifestPath) return desktopOnlyManifestBytes;
+        if (path === mainPath) return remoteMain;
+        if (path === stylesPath) return remoteStyles;
+        return new ArrayBuffer(0);
+      });
+      const state = makeState(
+        [remoteManifest, remoteMainEntry, remoteStylesEntry],
+        base,
+      );
+      const { executor } = makeExecutor({
+        localEntries: [localManifest, localMainEntry, localStylesEntry],
+        localFolders: REMOTE_FOLDERS.map((folder) => ({
+          path: folder.path,
+          mtime: 1,
+        })),
+        remoteEntries: [remoteManifest, remoteMainEntry, remoteStylesEntry],
+        remoteContent: null,
+        adapter: memory.adapter,
+        state,
+        oneDrive: makeOneDrive(null, {
+          downloadFile,
+          getDelta: vi.fn().mockResolvedValue({
+            value: completeRemoteItems([
+              remoteManifest,
+              remoteMainEntry,
+              remoteStylesEntry,
+            ]),
+            "@odata.deltaLink": "delta-token-next",
+          }),
+        }),
+        policy: {
+          version: 1,
+          files: { mode: "selected", pluginIds: ["calendar"] },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const result = await executor.run("manual");
+
+      expect(result).toMatchObject({
+        success: true,
+        errors: 0,
+        downloaded: 0,
+        deferred: 0,
+      });
+      expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
+      expect(executor.getMobileDesktopOnlyCommunityPluginIds()).toEqual([
+        "calendar",
+      ]);
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
+    }
+  });
+
+  it("resumes a complete local bundle update when the remote manifest becomes mobile-compatible", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
+    Platform.isMobile = true;
+    Platform.isMobileApp = true;
+    try {
+      const rootPath = ".obsidian/plugins/calendar";
+      const manifestPath = `${rootPath}/manifest.json`;
+      const mainPath = `${rootPath}/main.js`;
+      const stylesPath = `${rootPath}/styles.css`;
+      const localManifestBytes = bytes(JSON.stringify({
+        id: "calendar",
+        version: "1.0.0",
+        minAppVersion: "1.5.0",
+      }));
+      const desktopOnlyManifestBytes = bytes(JSON.stringify({
+        id: "calendar",
+        version: "2.0.0",
+        minAppVersion: "1.5.0",
+        isDesktopOnly: true,
+      }));
+      const compatibleManifestBytes = bytes(JSON.stringify({
+        id: "calendar",
+        version: "2.1.0",
+        minAppVersion: "1.5.0",
+      }));
+      const localMain = bytes("main-local");
+      const desktopOnlyMain = bytes("main-desktop-only");
+      const compatibleMain = bytes("main-compatible");
+      const localStyles = bytes("styles-local");
+      const desktopOnlyStyles = bytes("styles-desktop-only");
+      const compatibleStyles = bytes("styles-compatible");
+      const remoteManifest = await remoteEntry(
+        manifestPath,
+        desktopOnlyManifestBytes,
+      );
+      const remoteMainEntry = await remoteEntry(mainPath, desktopOnlyMain);
+      const remoteStylesEntry = await remoteEntry(
+        stylesPath,
+        desktopOnlyStyles,
+      );
+      const localManifest = await localEntry(manifestPath, localManifestBytes);
+      const localMainEntry = await localEntry(mainPath, localMain);
+      const localStylesEntry = await localEntry(stylesPath, localStyles);
+      const base = [
+        { ...sharedBaseEntry(localManifest, remoteManifest), eTag: "etag:base" },
+        {
+          ...sharedBaseEntry(localMainEntry, remoteMainEntry),
+          eTag: "etag:base",
+        },
+        {
+          ...sharedBaseEntry(localStylesEntry, remoteStylesEntry),
+          eTag: "etag:base",
+        },
+      ];
+      const memory = makeMemoryAdapter({
+        [manifestPath]: localManifestBytes,
+        [mainPath]: localMain,
+        [stylesPath]: localStyles,
+      });
+      // The real vault adapter reads the same bytes as text and binary; the
+      // test helper keeps them apart, so keep the manifest text view in sync
+      // with its binary writes for this round (the bundle writes replace it).
+      const readText = memory.adapter.read;
+      memory.adapter.read = vi.fn(async (path: string) => {
+        if (path === manifestPath) {
+          return new TextDecoder().decode(
+            await memory.adapter.readBinary(path),
+          );
+        }
+        return readText(path);
+      });
+      const firstDownloadFile = vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        if (path === manifestPath) return desktopOnlyManifestBytes;
+        if (path === mainPath) return desktopOnlyMain;
+        if (path === stylesPath) return desktopOnlyStyles;
+        return new ArrayBuffer(0);
+      });
+      const state = makeState(
+        [remoteManifest, remoteMainEntry, remoteStylesEntry],
+        base,
+      );
+      const first = makeExecutor({
+        localEntries: [localManifest, localMainEntry, localStylesEntry],
+        localFolders: REMOTE_FOLDERS.map((folder) => ({
+          path: folder.path,
+          mtime: 1,
+        })),
+        remoteEntries: [remoteManifest, remoteMainEntry, remoteStylesEntry],
+        remoteContent: null,
+        adapter: memory.adapter,
+        state,
+        oneDrive: makeOneDrive(null, {
+          downloadFile: firstDownloadFile,
+          getDelta: vi.fn().mockResolvedValue({
+            value: completeRemoteItems([
+              remoteManifest,
+              remoteMainEntry,
+              remoteStylesEntry,
+            ]),
+            "@odata.deltaLink": "delta-token-next",
+          }),
+        }),
+        policy: {
+          version: 1,
+          files: { mode: "selected", pluginIds: ["calendar"] },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const skipped = await first.executor.run("manual");
+      expect(skipped).toMatchObject({
+        success: true,
+        errors: 0,
+        downloaded: 0,
+        deferred: 0,
+      });
+
+      const compatibleManifest = await remoteEntry(
+        manifestPath,
+        compatibleManifestBytes,
+        {
+          eTag: "etag:manifest:compatible",
+          cTag: "ctag:manifest:compatible",
+        },
+      );
+      const compatibleMainEntry = await remoteEntry(mainPath, compatibleMain, {
+        eTag: "etag:main:compatible",
+        cTag: "ctag:main:compatible",
+      });
+      const compatibleStylesEntry = await remoteEntry(
+        stylesPath,
+        compatibleStyles,
+        {
+          eTag: "etag:styles:compatible",
+          cTag: "ctag:styles:compatible",
+        },
+      );
+      await state.setRemoteState(
+        [compatibleManifest, compatibleMainEntry, compatibleStylesEntry],
+        "delta-token-updated",
+        SCOPE,
+        REMOTE_FOLDERS,
+      );
+      const compatibleDownloadFile = vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        if (path === manifestPath) return compatibleManifestBytes;
+        if (path === mainPath) return compatibleMain;
+        if (path === stylesPath) return compatibleStyles;
+        return new ArrayBuffer(0);
+      });
+      const compatible = makeExecutor({
+        localEntries: [localManifest, localMainEntry, localStylesEntry],
+        localFolders: REMOTE_FOLDERS.map((folder) => ({
+          path: folder.path,
+          mtime: 1,
+        })),
+        remoteEntries: [
+          compatibleManifest,
+          compatibleMainEntry,
+          compatibleStylesEntry,
+        ],
+        remoteContent: null,
+        adapter: memory.adapter,
+        state,
+        oneDrive: makeOneDrive(null, {
+          downloadFile: compatibleDownloadFile,
+          getDelta: vi.fn().mockResolvedValue({
+            value: completeRemoteItems([
+              compatibleManifest,
+              compatibleMainEntry,
+              compatibleStylesEntry,
+            ]),
+            "@odata.deltaLink": "delta-token-compatible",
+          }),
+        }),
+        policy: {
+          version: 1,
+          files: { mode: "selected", pluginIds: ["calendar"] },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const restored = await compatible.executor.run("manual");
+
+      expect(restored).toMatchObject({
+        success: true,
+        errors: 0,
+        downloaded: 3,
+        deferred: 0,
+      });
+      expect(compatible.executor.getMobileDesktopOnlyCommunityPluginIds())
+        .toEqual([]);
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
+    }
+  });
+
   it("A0-P bounds new-device mobile manifest reads and reuses compatible bytes in bundle staging", async () => {
     const previousMobile = Platform.isMobile;
     const previousMobileApp = Platform.isMobileApp;

@@ -10,15 +10,17 @@ const migrationKeys = [
 ] as const;
 
 describe("migration presentation", () => {
-  it("explains an existing-cloud join without presenting it as an upgrade", () => {
+  it("keeps the existing-cloud join summary a short gate without upgrade terms", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
 
+    // 2026-11-09 用户拍板：加入场景只保留短句（点按钮才会同步），不再解释
+    // 加入流程或本机登记；这句也不得出现协议版本词。
     expect(zh.t("syncPlan.cloudJoinSummary")).toBe(
-      "本设备正在加入已有同步。确认后先登记本机，再按下方计划同步。",
+      "点击上方「确认执行」后，才会按计划同步。",
     );
     expect(en.t("syncPlan.cloudJoinSummary")).toBe(
-      "This device is joining an existing sync. After you confirm, EasySync will first set up the local record, then sync according to the plan below.",
+      "EasySync will sync according to the plan only after you click “Confirm and execute” above.",
     );
     expect(zh.t("syncPlan.cloudJoinSummary")).not.toMatch(/\bV2\b|V1/i);
     expect(en.t("syncPlan.cloudJoinSummary")).not.toMatch(/\bV2\b|V1/i);

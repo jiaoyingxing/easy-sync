@@ -40,11 +40,10 @@ export interface LocaleStrings {
   "settings.rules.name": string;
   "settings.rules.acknowledge": string;
   "settings.syncContent.heading": string;
-  "settings.rootNav.scope.desc": string;
-  "settings.rootNav.autoSync.desc": string;
-  "settings.rootNav.display.desc": string;
-  "settings.rootNav.about.desc": string;
-  "settings.rootNav.maintenance.desc": string;
+  "settings.syncContent.intro": string;
+  "settings.loginPage.name": string;
+  "settings.loginPage.value.loggedOut": string;
+  "settings.communityPluginsSyncPage.name": string;
   "settings.rootNav.value.autoSyncOn": string;
   "settings.rootNav.value.autoSyncOff": string;
   "settings.rootNav.value.excluded": string;
@@ -88,7 +87,6 @@ export interface LocaleStrings {
   "settings.account.device.codeCopied": string;
   "settings.account.device.copyUnavailable": string;
   "settings.account.device.waiting": string;
-  "settings.account.device.expiresIn": string;
   "settings.account.device.security": string;
   "settings.account.device.declined": string;
   "settings.account.device.expired": string;
@@ -97,7 +95,7 @@ export interface LocaleStrings {
   "settings.account.device.regenerate": string;
   "settings.account.device.cancel": string;
   "settings.account.device.busy": string;
-  "settings.syncPanel.name": string;
+  "settings.syncPanel.openRow": string;
   "settings.syncMode.name": string;
   "settings.syncMode.option.twoway": string;
   "settings.syncMode.option.oneway": string;
@@ -118,7 +116,6 @@ export interface LocaleStrings {
   "settings.syncMode.disable.count": string;
   "settings.syncMode.disable.dismissedCount": string;
   "settings.syncMode.disable.confirm": string;
-  "settings.syncPanel.button": string;
   "settings.autoSync.name": string;
   "settings.autoSync.intro": string;
   "settings.autoSync.desc.disabled": string;
@@ -265,6 +262,31 @@ export interface LocaleStrings {
   "settings.about.feedback.desc": string;
   "settings.about.contact.github": string;
   "settings.about.contact.xiaohongshu": string;
+
+  // ---- 设置页页脚（2026-11-10 用户拍板：根页底部四入口＋版权/许可） ----
+  "settings.footer.navLabel": string;
+  "settings.footer.docs": string;
+  "settings.footer.changelog": string;
+  "settings.footer.feedback": string;
+  "settings.footer.contact": string;
+  "settings.footer.copyright": string;
+  "settings.footer.license": string;
+
+  // ---- 支持 EasySync 页（2026-11-10 用户拍板：独立开发者／免费开源／联系与作者精选） ----
+  "settings.supportPage.name": string;
+  "settings.supportPage.about.name": string;
+  "settings.supportPage.about.desc": string;
+  "settings.supportPage.picksHeading": string;
+  "settings.supportPage.note": string;
+  "settings.supportPage.resojot.name": string;
+  "settings.supportPage.resojot.desc": string;
+  "settings.supportPage.openplug.name": string;
+  "settings.supportPage.openplug.desc": string;
+
+  // ---- 旧宿主升级指引（<1.13 手动强装） ----
+  "settings.hostRequirement.title": string;
+  "settings.hostRequirement.desc": string;
+  "settings.hostRequirement.download": string;
 
   // ---- Sync View ----
   "syncView.title": string;

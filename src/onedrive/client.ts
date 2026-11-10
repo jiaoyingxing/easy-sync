@@ -2148,9 +2148,24 @@ export class OneDriveClient {
     afterHintDownload?: (value: T) => void;
   }): Promise<T> {
     throwIfAborted(this.abortSignal);
+    // The one place a download's financials are decided (2026-10-27 ladder):
+    // the log line below and every deadline in this waterfall read this value.
+    // Priced before the gate so the slow-connection gate can judge a window
+    // against the time the file actually has left (2026-11-10).
+    const budget = downloadBudget(input.fileSize);
+    const deadlineMs = Date.now() + budget.totalMs;
+    const remainingMs = () =>
+      ensureDownloadBudget(deadlineMs, input.filePath);
     const slowGate = createSlowConnectionGate(
       `${input.operationName} "${input.filePath}"`,
-      { evidence: this.slowLinkEvidence, totalSize: input.fileSize },
+      {
+        evidence: this.slowLinkEvidence,
+        totalSize: input.fileSize,
+        // Raw remaining deadline (never throws): the gate keeps a judged-slow
+        // window when it can still finish the file inside this budget, and an
+        // exhausted budget therefore keeps the pre-existing abandonment rule.
+        budgetLeftMs: () => deadlineMs - Date.now(),
+      },
     );
     const {
       maxBytes: maxResponseBytes,
@@ -2161,17 +2176,11 @@ export class OneDriveClient {
     // status — only that blacklists content for the round when the caller has
     // no driveItemId and the fallthrough below is reached.
     let sawEndpointLevelContentFailure = false;
-    // The one place a download's financials are decided (2026-10-27 ladder):
-    // the log line below and every deadline in this waterfall read this value.
-    const budget = downloadBudget(input.fileSize);
     // 阶梯只在有空网接着的时候提前收杆: once this round knows /content cannot
     // serve these files (a real HTTP rejection was recorded), cutting the CDN
     // early would trade a slow success for a certain failure — such files keep
     // the whole waterfall deadline on the CDN.
     const channelCapMs = this.contentFailedThisRound ? null : budget.channelCapMs;
-    const deadlineMs = Date.now() + budget.totalMs;
-    const remainingMs = () =>
-      ensureDownloadBudget(deadlineMs, input.filePath);
     /** Deadline of the CDN path only. Started lazily at the first CDN attempt so
      *  a preceding /content shortcut cannot eat it, and never longer than the
      *  waterfall's own deadline. `null` cap keeps the pre-ladder rule that the

@@ -52,13 +52,12 @@ describe("confirm modal numbered steps (2026-10-31)", () => {
 
   it("pins the bulk data-sync rules as three lines", () => {
     const zh = new I18n("zh-cn");
-    expect(zh.t("settings.communityPlugins.data.experimentalBulkStep.shared", {
-      count: 3,
-    })).toBe("当前 3 个插件及以后加入的插件：共用一份设置。");
+    expect(zh.t("settings.communityPlugins.data.experimentalBulkStep.shared"))
+      .toBe("各设备共用一份插件设置。");
     expect(zh.t("settings.communityPlugins.data.experimentalBulkStep.replace"))
-      .toBe("任一设备修改设置：替换其他设备上的设置。");
+      .toBe("任何设备修改，都会覆盖其他设备的设置。");
     expect(zh.t("settings.communityPlugins.data.experimentalBulkStep.conflict"))
-      .toBe("两侧同时修改：转为冲突，需整份选择保留本机或云端；未保留的一侧修改会丢失。");
+      .toBe("两台设备同时修改会冲突，只能整份二选一；另一边的修改会丢失。");
   });
 
   it("keeps the single-action delete as one tightened sentence", () => {

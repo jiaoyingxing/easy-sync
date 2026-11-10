@@ -1,5 +1,5 @@
 /**
- * 设置页图标钉子（左栏插件行 ＋ 1.13+ 根级导航五行）。
+ * 设置页图标钉子（左栏插件行 ＋ 1.13+ 根级导航九行）。
  *
  * 本仓无 jsdom，装饰器的 DOM 行为不能在这里证明（真宿主读数与用户目测＝方案单
  * §九②③）；这里钉住可机械判定的部分：
@@ -19,7 +19,7 @@ import {
 } from "../src/ui/settings-root-icons";
 import {
   EasySyncSettingTab,
-  buildSettingDefinitions,
+  buildRootSettingDefinitions,
 } from "../src/ui/settings-tab";
 import { I18n } from "../src/i18n";
 import type EasySyncPlugin from "../src/main";
@@ -41,24 +41,35 @@ function createMockPlugin(): EasySyncPlugin {
 
 describe("settings root icons", () => {
   it.each(["zh-cn", "en"] as const)(
-    "图标映射与根级页一一对应（%s；新增页面漏配即红）",
+    "图标映射与根级行一一对应（%s；新增根级行漏配即红）",
     (language) => {
       const t = new I18n(language).t.bind(new I18n(language));
-      const pages = buildSettingDefinitions(t, createMockPlugin());
-      const pageNames = pages.map((page) => page.name);
-      // 装饰按「行名＝页名」匹配：页名必须兄弟唯一，否则映射无意义。
-      expect(new Set(pageNames).size).toBe(pageNames.length);
+      const root = buildRootSettingDefinitions(t, createMockPlugin());
+      const rowNames = root
+        // 页脚组不是导航行（2026-11-10）：不参与图标映射对账。
+        .filter(
+          (group) =>
+            (group as { cls?: string }).cls !==
+            "easy-sync-settings-footer-group",
+        )
+        .flatMap((group) =>
+          ((group as { items?: Array<{ name?: string }> }).items ?? []).map(
+            (item) => item.name,
+          ),
+        ) as string[];
+      // 装饰按「行名」匹配：根级行名必须兄弟唯一，否则映射无意义。
+      expect(new Set(rowNames).size).toBe(rowNames.length);
       const iconNames = Object.keys(SETTINGS_ROOT_ICON_BY_NAME_KEY).map((key) =>
         t(key),
       );
-      expect([...iconNames].sort()).toEqual([...pageNames].sort());
+      expect([...iconNames].sort()).toEqual([...rowNames].sort());
     },
   );
 
   it("图标值互不重复", () => {
     const values = Object.values(SETTINGS_ROOT_ICON_BY_NAME_KEY);
     expect(new Set(values).size).toBe(values.length);
-    // 左栏插件行图标与五位根级行图标也只是同表内互异（跨载体可同）。
+    // 左栏插件行图标与九位根级行图标也只是同表内互异（跨载体可同）。
     expect(typeof SETTINGS_TAB_ICON).toBe("string");
     expect(SETTINGS_TAB_ICON.length).toBeGreaterThan(0);
   });

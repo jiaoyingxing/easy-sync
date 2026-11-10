@@ -41,7 +41,7 @@ describe("auth browser launcher", () => {
 
     expect(zh.t("settings.account.pendingTitle")).toBe("登录还没有完成");
     expect(zh.t("settings.account.pendingMessage")).toBe(
-      "请在浏览器中完成 Microsoft 登录。没有看到登录页面？复制登录链接，然后粘贴到这台设备的浏览器中打开。",
+      "请在浏览器中完成 Microsoft 登录。\n\n没有看到登录页面？复制登录链接，然后粘贴到这台设备的浏览器中打开。",
     );
     expect(zh.t("settings.account.copyAuthLink")).toBe("复制登录链接");
     expect(zh.t("settings.account.authLinkCopied")).toBe(
@@ -55,7 +55,7 @@ describe("auth browser launcher", () => {
     expect(zh.t("settings.account.pendingMessage")).not.toContain("obsidian://");
     expect(en.t("settings.account.pendingTitle")).toBe("Sign-in not complete");
     expect(en.t("settings.account.pendingMessage")).toBe(
-      "Complete Microsoft sign-in in your browser. If the page did not open, copy the sign-in link and paste it into a browser on this device.",
+      "Complete Microsoft sign-in in your browser.\n\nIf the page did not open, copy the sign-in link and paste it into a browser on this device.",
     );
     expect(en.t("settings.account.copyAuthLink")).toBe("Copy sign-in link");
     expect(en.t("settings.account.authLinkCopied")).toBe(

@@ -64,6 +64,7 @@ export class FileSystemAdapter {
   }
 }
 
+export const apiVersion = "1.13.4";
 export const requireApiVersion = vi.fn((_version: string) => true);
 
 // Notice — constructor shows a notification
@@ -140,7 +141,16 @@ export function createMockElement(): HTMLElement {
     else classTokens.delete(token);
     return element;
   };
-    element.setAttribute = (_name: string, _value: string) => element;
+    const attributes = new Map<string, string>();
+    element.setAttribute = (name: string, value: string) => {
+      attributes.set(name, String(value));
+      return element;
+    };
+    element.getAttribute = (name: string) => attributes.get(name) ?? null;
+    element.removeAttribute = (name: string) => {
+      attributes.delete(name);
+      return element;
+    };
     // Real setText writes through to the text, mirroring the DOM so tests
     // can assert readout text.
     element.setText = (value: string | DocumentFragment) => {

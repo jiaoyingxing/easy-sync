@@ -928,7 +928,15 @@ const DOWNLOAD_PIPELINE_IN_FLIGHT_GROUPS = 1;
  *  16/4 on 2026-11-08; the two directions do not have to match), while SC-15
  *  is unchanged: the group's intents are durable before its first local
  *  write, its receipts before its checkpoint, and a file that failed
- *  transfer/verify never gets an intent. */
+ *  transfer/verify never gets an intent.
+ *
+ *  This is also the verify-group size: one `$batch` identity re-read per
+ *  group (8 ids ≈ 2.7 s, 20 ids 5–12 s on the field link — do not grow it).
+ *  The 2026-11-08 commit shipped the verify threshold as a flat 8 instead,
+ *  contradicting the documented 8/4 (20261108-060140): a mobile verify group
+ *  spanned two persistence slices while the transfer-batch cap still
+ *  targeted 4, so a group's files 5–8 silently transferred at width 1. Back
+ *  on the platform batch (fixed 2026-11-11). */
 function downloadCommitBatch(platform: HostPlatformFacts): number {
   return platform.isMobileApp ? 4 : 8;
 }
@@ -939,12 +947,6 @@ function downloadCommitBatch(platform: HostPlatformFacts): number {
 function downloadCommitGroupBytes(platform: HostPlatformFacts): number {
   return platform.isMobileApp ? 8 * 1024 * 1024 : 16 * 1024 * 1024;
 }
-/** Verification is read-only and batched separately from persistence. The
- *  measured `$batch` latency grew with the ID count (8 ids ≈ 2.7 s, 20 ids
- *  5–12 s on the field link), so the verify batch stays at the approved 8/4
- *  persistence batch: one `$batch` per group, with the next group's verify
- *  overlapping the previous group's commits. */
-const DOWNLOAD_VERIFY_BATCH_SIZE = 8;
 /** One transfer batch still formed by `downloadPolicy.limit`; its observation
  *  inputs are kept so the adaptive policy sees the same per-batch signal it
  *  saw before commit groups existed. */
@@ -7048,6 +7050,13 @@ export class SyncExecutor {
    * can enter the canonical plan. The verified manifest bytes are reused by
    * bundle staging and retained as disposable, source-bound name evidence.
    * Never download a manifest solely to improve inventory presentation.
+   *
+   * Mobile candidates include a complete local bundle only when a managed
+   * member differs from the remote one (the update case). A desktop-only
+   * remote update then projects the plugin as this round's device
+   * non-participant instead of letting the plan download files the execution
+   * preflight will reject. Stable local-complete bundles stay out of the
+   * candidate set, so a healthy mobile round keeps its delta-only budget.
    */
   private async prepareCommunityPluginManifestEvidence(input: {
     policy: Readonly<CommunityPluginSyncPolicyV1>;
@@ -7074,11 +7083,14 @@ export class SyncExecutor {
     }
 
     const startedAt = Date.now();
-    const localPaths = new Set(input.localEntries.map((entry) => entry.path));
+    const localByPath = new Map(
+      input.localEntries.map((entry) => [entry.path, entry]),
+    );
     const joiningPluginIds = new Set(input.joiningPluginIds ?? []);
     const remoteBundles = new Map<string, {
       main?: RemoteFileEntry;
       manifest?: RemoteFileEntry;
+      styles?: RemoteFileEntry;
     }>();
     for (const remote of input.remoteEntries) {
       const parsed = parseCommunityPluginBundlePath(
@@ -7095,24 +7107,55 @@ export class SyncExecutor {
       const bundle = remoteBundles.get(parsed.pluginId) ?? {};
       if (parsed.fileName === "main.js") bundle.main = remote;
       else if (parsed.fileName === "manifest.json") bundle.manifest = remote;
+      else if (parsed.fileName === "styles.css") bundle.styles = remote;
       remoteBundles.set(parsed.pluginId, bundle);
     }
 
     const candidates: Array<{
       pluginId: string;
       manifest: RemoteFileEntry;
+      /** A complete local bundle already exists; the remote bundle is only a
+       *  candidate because at least one managed member differs. */
+      localComplete: boolean;
     }> = [];
     for (const [pluginId, bundle] of remoteBundles) {
       if (!bundle.main || !bundle.manifest) continue;
       if (!this.platform.isMobileApp && !joiningPluginIds.has(pluginId)) continue;
       const root = `${input.configDir.replace(/\/+$/, "")}/plugins/${pluginId}`;
-      if (
-        localPaths.has(`${root}/manifest.json`)
-        && localPaths.has(`${root}/main.js`)
-      ) continue;
+      const localManifest = localByPath.get(`${root}/manifest.json`);
+      const localMain = localByPath.get(`${root}/main.js`);
+      const localComplete = localManifest !== undefined && localMain !== undefined;
+      if (this.platform.isMobileApp && localComplete) {
+        // A device that already holds a complete bundle normally needs no
+        // manifest read: the bundle is stable, so nothing is planned. When a
+        // managed member differs, the remote update may have turned the
+        // plugin desktop-only; without this check the plan would download the
+        // update and the execution preflight would reject every file on
+        // mobile, leaving permanent "needs attention" rows. Read the remote
+        // manifest only for this changed-bundle case, so stable mobile rounds
+        // keep the existing delta-only budget.
+        const localStyles = localByPath.get(`${root}/styles.css`);
+        const members: Array<
+          [string, RemoteFileEntry | undefined, LocalFileEntry | undefined]
+        > = [
+          ["manifest.json", bundle.manifest, localManifest],
+          ["main.js", bundle.main, localMain],
+          ["styles.css", bundle.styles, localStyles],
+        ];
+        const remoteDiffers = members.some(([, remote, local]) => {
+          if (!remote || !local) {
+            return remote !== undefined || local !== undefined;
+          }
+          if (remote.size !== local.size) return true;
+          return remote.sha256Hash === undefined
+            || remote.sha256Hash !== local.hash;
+        });
+        if (!remoteDiffers) continue;
+      }
       candidates.push({
         pluginId,
         manifest: bundle.manifest,
+        localComplete,
       });
     }
 
@@ -7258,6 +7301,14 @@ export class SyncExecutor {
       } else if (incompatibility) {
         if (joiningPluginIds.has(candidate.pluginId)) {
           incompatiblePluginIds.push(candidate.pluginId);
+          continue;
+        }
+        if (candidate.localComplete) {
+          // Keep the existing execution-time failure for host-version
+          // incompatibilities on a complete local bundle. Turning it into a
+          // whole-round throw here would replace one dead end with a larger
+          // one; desktop-only is the only incompatibility this preflight is
+          // allowed to project as device non-participation.
           continue;
         }
         throw new Error(
@@ -18232,7 +18283,9 @@ export class SyncExecutor {
     let commitTail: Promise<void> = Promise.resolve();
     let groupError: unknown = null;
     const pendingGroups: Promise<void>[] = [];
-    const verifyBatchSize = DOWNLOAD_VERIFY_BATCH_SIZE;
+    // Verify group = the approved 8/4 group size (same as the persistence
+    // batch; rationale on `downloadCommitBatch` above).
+    const verifyBatchSize = downloadCommitBatch(this.platform);
     const commitBatchSize = downloadCommitBatch(this.platform);
     const commitByteLimit = downloadCommitGroupBytes(this.platform);
     const createOpenGroup = (): DownloadCommitGroup => ({
@@ -18460,6 +18513,20 @@ export class SyncExecutor {
           metrics.fileTransfers.download.peakConcurrency,
           activePrefetch,
         );
+        // 开始点只占现役「当前文件」槽与字节槽（社区插件 bundle 预取同形，
+        // 2026-11-08）：计数仍按已结算走（2026-10-27），传输中的项不提前推
+        // 高 x/y；已知大小让无中间字节回调的整包通道也从 `0 / 大小` 显示
+        // （2026-11-06）。此前这条车道完全不接 UI——组提交之前侧栏没有任
+        // 何活动，手机上 0/x 会冻结到首个组结算才动。
+        const slotPosition = Math.min(run.settled, run.total);
+        this.progressStore?.setProgress(
+          slotPosition,
+          run.total,
+          item.path,
+          SyncActionType.Download,
+          item.remote?.size,
+        );
+        callbacks.onProgress?.(slotPosition, run.total, item.path);
         try {
           const metadataPreparationError = metadataPreparationErrors.get(item.path);
           if (metadataPreparationError) {
@@ -18472,7 +18539,7 @@ export class SyncExecutor {
           try {
             content = await this.trackTransfer(
               "download",
-              undefined,
+              callbacks.onFileProgress,
               (report) => this.onedrive.downloadFile(
                 this.vaultName,
                 item.path,

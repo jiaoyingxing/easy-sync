@@ -7,7 +7,9 @@
 //    交错，而不是「下载一组 → 核对完 → 再下载下一组」；
 // 3. 逐文件完成反馈仍在本地写入 + 回执 sink 落地后立刻发出，不等组检查点；
 // 4. SC-15 顺序不变：整组 intent 先于本组第一次本地写，整组回执先于组检查点，
-//    组检查点严格按组序提交、不交错；eTag 漂移仍按原路失败关闭。
+//    组检查点严格按组序提交、不交错；eTag 漂移仍按原路失败关闭；
+// 5. 传输车道开始一项内容传输时占用现役「当前文件」槽与字节槽（已知大小
+//    0/大小 + onFileProgress 字节回调），但计数仍按已结算走、不提前推高。
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Platform } from "obsidian";
 import { SyncExecutor } from "../src/sync/sync-executor";
@@ -24,6 +26,7 @@ import {
   makeDownloadLocalStore,
   makeMockOneDrive,
 } from "./helpers/sync-safety-harness";
+import { SyncProgressStore } from "../src/sync/sync-progress";
 
 const CONTENT = new Uint8Array(18).fill(7).buffer;
 const GROUP = 8;
@@ -109,6 +112,8 @@ function makeFixture(options: {
   /** Shared event log, so the test's own download/verify marks and the
    *  fixture's state-write marks land in one orderable sequence. */
   log?: string[];
+  /** Real progress store, for assertions on the current-file/byte slots. */
+  progressStore?: SyncProgressStore;
 }): PipelineFixture {
   const localStore = makeDownloadLocalStore();
   const state = makeActiveV2State(options.entries, []);
@@ -174,14 +179,18 @@ function makeFixture(options: {
     } as unknown as LocalScanner,
     state,
     "testVault",
+    undefined,
+    options.progressStore,
   );
   return { entries: options.entries, state, localStore, log, stateLog, executor };
 }
 
 describe("download group verify/commit pipeline (2026-11-08)", () => {
   const previousMobile = Platform.isMobile;
+  const previousMobileApp = Platform.isMobileApp;
   afterEach(() => {
     Platform.isMobile = previousMobile;
+    Platform.isMobileApp = previousMobileApp;
   });
 
   it("verifies and commits each group while the next group transfers", async () => {
@@ -403,6 +412,107 @@ describe("download group verify/commit pipeline (2026-11-08)", () => {
     // them for the next round's recovery instead of losing the evidence.
     expect(state.mutationLedger).toHaveLength(GROUP);
     expect(state.mutationLedger.every((record) => record.receipt !== null)).toBe(true);
+  });
+
+  it("keeps the mobile verify group at the documented 4 so transfer batches do not degrade to width 1", async () => {
+    // The 2026-11-08 commit shipped the verify-group flush threshold as a flat
+    // 8 while the transfer-batch cap targeted the 8/4 persistence batch — on
+    // mobile the two disagreed (cap 4, flush 8), so a group's files 5–8
+    // transferred one at a time. The documented design (20261108-060140) is
+    // verify group = persistence group = 8 desktop / 4 mobile.
+    Platform.isMobileApp = true;
+    const entries = makeEntries(GROUP * 3 / 2); // 12 files = 3 mobile groups
+    const downloadFile = vi.fn(async () => CONTENT.slice(0));
+    const getDriveItemMetadataByIds = vi.fn(async (
+      ids: readonly string[],
+      reason?: string,
+    ) => metadataReader(entries)(ids));
+    const fixture = makeFixture({ entries, downloadFile, getDriveItemMetadataByIds });
+    const { executor, state, localStore } = fixture;
+
+    const result = await executor.run("manual", {});
+
+    expect(result.errors).toBe(0);
+    expect(result.downloaded).toBe(entries.length);
+    expect(localStore.files.size).toBe(entries.length);
+    expect(state.mutationLedger).toEqual([]);
+
+    // One `$batch` per 4-file group on mobile, and one intent/receipt/
+    // checkpoint write per group — not [8, 4] with a half-size trailing group.
+    const verifySizes = getDriveItemMetadataByIds.mock.calls
+      .filter((call) => call[1] === "downloadVersionVerify")
+      .map((call) => call[0].length);
+    expect(verifySizes).toEqual([4, 4, 4]);
+    expect(fixture.stateLog.filter((line) => line.startsWith("intents:")))
+      .toEqual(["intents:4", "intents:4", "intents:4"]);
+    expect(fixture.stateLog.filter((line) => line.startsWith("checkpoints:")))
+      .toEqual(["checkpoints:4", "checkpoints:4", "checkpoints:4"]);
+  });
+
+  it("reports the transferring file into the current-file slot without advancing the settled count", async () => {
+    // Before the 2026-11-11 fix the transfer lane reported nothing: between
+    // run start and the first commit slice the sidebar showed a frozen 0/x
+    // with no file name and no bytes (the whole transfer phase was invisible).
+    // The bundle-prefetch precedent occupies the slot without pushing the
+    // count; the transfer lane now does the same and wires byte callbacks.
+    Platform.isMobileApp = false;
+    const entries = makeEntries(GROUP);
+    const firstTransferStarted = deferred();
+    const releaseFirstTransfer = deferred();
+    let downloadCalls = 0;
+    const downloadFile = vi.fn(async (
+      _vault: string,
+      _path: string,
+      _url: string,
+      _driveId: string,
+      _size: number,
+      report?: (downloaded: number, total: number) => void,
+    ) => {
+      downloadCalls++;
+      if (downloadCalls === 1) {
+        firstTransferStarted.resolve();
+        await within(releaseFirstTransfer.promise, "first transfer released");
+      }
+      report?.(0, CONTENT.byteLength);
+      report?.(CONTENT.byteLength, CONTENT.byteLength);
+      return CONTENT.slice(0);
+    });
+    const progressStore = new SyncProgressStore();
+    const fixture = makeFixture({
+      entries,
+      downloadFile,
+      getDriveItemMetadataByIds: vi.fn(async (ids: readonly string[]) =>
+        metadataReader(entries)(ids)),
+      progressStore,
+    });
+    const { executor } = fixture;
+    const byteCalls: Array<[number, number]> = [];
+    const runPromise = executor.run("manual", {
+      onFileProgress: (downloaded, total) => {
+        byteCalls.push([downloaded, total]);
+      },
+    });
+
+    await within(firstTransferStarted.promise, "first transfer starts");
+    // While the first transfer is still in flight: the slot names the
+    // transferring file with its known size, and the settled count has not
+    // moved (desktop policy starts at width 1, so exactly one file started).
+    expect(progressStore.state.current).toBe(0);
+    expect(progressStore.state.total).toBe(GROUP);
+    expect(progressStore.state.currentFile).toBe(entries[0].path);
+    expect(progressStore.state.currentItemTotalBytes).toBe(CONTENT.byteLength);
+
+    releaseFirstTransfer.resolve();
+    const result = await within(runPromise, "round finishes");
+
+    expect(result.downloaded).toBe(entries.length);
+    // The byte callbacks reached the UI callback, endpoints included.
+    expect(byteCalls).toContainEqual([0, CONTENT.byteLength]);
+    expect(byteCalls).toContainEqual([CONTENT.byteLength, CONTENT.byteLength]);
+    // The slot calls carried the settled position (0 at transfer time), not a
+    // pushed-up count; settlement later walks the count per file.
+    expect(result.downloaded).toBe(GROUP);
+    expect(progressStore.state.current).toBe(GROUP);
   });
 
   it("leaves at most one group of intent-only downloads when the round cancels inside it", async () => {

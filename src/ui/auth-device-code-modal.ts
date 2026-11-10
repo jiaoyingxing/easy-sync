@@ -165,10 +165,8 @@ export class AuthDeviceCodeModal extends EasySyncModal {
 
     const status = contentEl.createDiv({ cls: "easy-sync-device-status" });
     if (attempt.phase === "waiting") {
-      status.createSpan({ text: t("settings.account.device.waiting") });
-      status.createSpan({ text: " · " });
       this.countdownEl = status.createSpan({
-        text: t("settings.account.device.expiresIn", {
+        text: t("settings.account.device.waiting", {
           time: formatRemaining(attempt.expiresAt),
         }),
       });
@@ -188,7 +186,7 @@ export class AuthDeviceCodeModal extends EasySyncModal {
   private updateCountdown(attempt: DeviceCodeAttemptView): void {
     if (!this.countdownEl) return;
     this.countdownEl.setText(
-      this.deps.t("settings.account.device.expiresIn", {
+      this.deps.t("settings.account.device.waiting", {
         time: formatRemaining(attempt.expiresAt),
       }),
     );

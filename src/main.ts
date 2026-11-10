@@ -109,7 +109,10 @@ import {
   formatDiagRunSummaryTable,
   type DiagRunSummary,
 } from "./sync/diagnostic-run-summary";
-import { EasySyncSettingTab } from "./ui/settings-tab";
+import {
+  EasySyncSettingTab,
+  createEasySyncSettingTab,
+} from "./ui/settings-tab";
 import {
   EasySyncSyncView,
   shouldAutoRebuildPlanReview,
@@ -1322,7 +1325,7 @@ export default class EasySyncPlugin extends Plugin {
 
     // ════ ④ Register UI (Obsidian is usable from here on) ════
 
-    this.settingsTab = new EasySyncSettingTab(this, this.platformFacts);
+    this.settingsTab = createEasySyncSettingTab(this, this.platformFacts);
     this.addSettingTab(this.settingsTab);
     this.registerView(
       SYNC_VIEW_TYPE,
@@ -1808,6 +1811,7 @@ export default class EasySyncPlugin extends Plugin {
     const existing = this.primarySyncViewLeaf();
     if (existing) {
       await this.app.workspace.revealLeaf(existing);
+      this.focusSyncPanel(existing);
       this.refreshSyncNoticeVisibility();
       return;
     }
@@ -1823,20 +1827,44 @@ export default class EasySyncPlugin extends Plugin {
     // a sidebar leaf forward — "If the leaf is in a sidebar, the sidebar will
     // be uncollapsed" (obsidian.d.ts, @since 1.7.2).
     await this.app.workspace.revealLeaf(leaf);
+    this.focusSyncPanel(leaf);
     this.refreshSyncNoticeVisibility();
   }
 
   /**
-   * Settings-page entry to the sync panel. On mobile the settings surface is a
-   * full-screen modal, so revealing the panel alone left the user staring at
-   * the settings screen — the click read as a no-op (2026-10-09 真机反馈).
-   * Reveal first (the drawer opens behind), then dismiss the settings surface
-   * so the panel is what the user lands on. Desktop keeps settings open: there
-   * the settings surface is its own window and never covers the sidebar.
+   * 「打开同步面板」的强聚焦（2026-11-10 用户反馈：桌面端点入口像没反应）。
+   *
+   * 只 revealLeaf 时侧栏虽已展开，但该 leaf 不是活动叶、容器也没拿到焦点；桌面
+   * 设置面又是独立窗口，用户看不到变化。按 OpenPlug 的现役写法成对调用：
+   * `revealLeaf`（展开侧栏／选中 tab）＋ `setActiveLeaf(leaf, { focus: true })`
+   * （设为活动叶并聚焦容器）。移动端由 openSyncPanelFromSettings() 关闭设置面，
+   * 同样无害。
+   */
+  private focusSyncPanel(leaf: WorkspaceLeaf): void {
+    this.app.workspace.setActiveLeaf(leaf, { focus: true });
+  }
+
+  /**
+   * Settings-page entry to the sync panel.
+   *
+   * Desktop: the 1.13+ settings surface is its own window in front of the main
+   * window, so close it first — revealing the panel while settings still covers
+   * the main window reads as a no-op (2026-11-10 user feedback; same order as
+   * OpenPlug's settings entry comment).
+   *
+   * Mobile: the settings surface is a full-screen modal too, but reveal first
+   * and close after. The drawer opens behind the modal; closing first shows a
+   * frame of empty workspace before the panel appears (2026-10-09 real-device
+   * feedback). `activateSyncView` still reveals and focuses the panel.
    */
   async openSyncPanelFromSettings(): Promise<void> {
+    if (this.platformFacts.isMobile) {
+      await this.activateSyncView();
+      this.closePluginSettings();
+      return;
+    }
+    this.closePluginSettings();
     await this.activateSyncView();
-    if (this.platformFacts.isMobile) this.closePluginSettings();
   }
 
   private async runSideActionIntent(

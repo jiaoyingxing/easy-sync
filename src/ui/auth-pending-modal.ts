@@ -73,11 +73,12 @@ export class AuthPendingModal extends EasySyncModal<PendingModalResult> {
 
     this.messageEl = contentEl.createEl("p", {
       text: this.message,
-      cls: "setting-item-description",
+      cls: "setting-item-description easy-sync-pending-message",
     });
 
     // No CTA in a waiting room (success auto-closes): the cancel exit leads
-    // the DOM so phones keep it at the bottom via the host's column-reverse.
+    // the DOM so phones keep it at the bottom via the host's column-reverse;
+    // the reopen retry carries the theme accent and stays last in DOM order.
     const btnRow = createEasySyncModalFooter(contentEl);
     addEasySyncFooterButton(btnRow, {
       label: this.cancelLabel,
@@ -93,6 +94,7 @@ export class AuthPendingModal extends EasySyncModal<PendingModalResult> {
     });
     addEasySyncFooterButton(btnRow, {
       label: this.reopenLabel,
+      variant: "cta",
       onClick: () => {
         this.onReopen?.();
         this.settle({ action: "reopen" });

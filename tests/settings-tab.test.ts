@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
+import { ButtonComponent, Setting, requireApiVersion } from "obsidian";
 import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
 import { createMockElement } from "./__mocks__/obsidian";
-import { EasySyncSettingTab } from "../src/ui/settings-tab";
+import {
+  EasySyncSettingTab,
+  createEasySyncSettingTab,
+} from "../src/ui/settings-tab";
+import { I18n } from "../src/i18n";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
 import type EasySyncPlugin from "../src/main";
@@ -11,27 +16,29 @@ import { functionBody, readSourceFile } from "./helpers/source-scope";
 describe("settings tab", () => {
   it("keeps the settings page a navigation entry, not a second sync workbench", () => {
     const source = readSourceFile("src/ui/settings-tab.ts");
-    const declarativeAccount = source.slice(
-      source.indexOf("export function buildAccountSettingDefinitions("),
-      source.indexOf("export function buildSettingDefinitions("),
+    const declarativeRoot = source.slice(
+      source.indexOf("export function buildSyncPanelActionRow("),
+      source.indexOf("export function buildCommunityPluginSyncPage("),
     );
 
-    expect(declarativeAccount).toContain('t("settings.syncPanel.name")');
-    expect(declarativeAccount).toContain(
-      '.setButtonText(t("settings.syncPanel.button"))',
-    );
-    expect(declarativeAccount).toContain("openSyncPanelFromSettings()");
+    // 2026-11-10：同步面板不再是按钮，根级整行就是按钮（点击／键盘同效）。
+    expect(declarativeRoot).toContain('t("settings.syncPanel.openRow")');
+    expect(declarativeRoot).toContain("openSyncPanelFromSettings()");
+    expect(declarativeRoot).toContain("setting.settingEl.onclick");
+    expect(declarativeRoot).not.toContain("addButton");
     // 同步、计划确认与取消都归侧栏工作台；设置页不得再长出第二份动作
     // （2026-10-09 拍板，取代 2026-08-16 的设置页「立即同步」动作行）。
-    expect(declarativeAccount).not.toContain("startManualSync");
-    expect(declarativeAccount).not.toContain("startFirstSync");
-    expect(declarativeAccount).not.toContain("executePlanReview");
-    expect(declarativeAccount).not.toContain("cancelSync");
+    expect(source).not.toContain("startManualSync");
+    expect(source).not.toContain("startFirstSync");
+    expect(source).not.toContain("executePlanReview");
+    expect(source).not.toContain("cancelSync");
     expect(source).not.toContain("buildSettingsSyncButtonState");
-    expect(zhCN["settings.syncPanel.name"]).toBe("同步面板");
-    expect(zhCN["settings.syncPanel.button"]).toBe("打开");
-    expect(en["settings.syncPanel.name"]).toBe("Sync panel");
-    expect(en["settings.syncPanel.button"]).toBe("Open");
+    expect(zhCN["settings.loginPage.name"]).toBe("登录");
+    expect(zhCN["settings.syncPanel.openRow"]).toBe("打开同步面板");
+    expect(zhCN["settings.communityPluginsSyncPage.name"]).toBe("社区插件同步");
+    expect(en["settings.loginPage.name"]).toBe("Sign in");
+    expect(en["settings.syncPanel.openRow"]).toBe("Open sync panel");
+    expect(en["settings.communityPluginsSyncPage.name"]).toBe("Community plugin sync");
   });
 
   it("keeps notification pop-ups progressive disclosure in the page rows module", () => {
@@ -107,6 +114,54 @@ describe("settings tab", () => {
     expect(tab.containerEl.classList.contains("easy-sync-settings-tab")).toBe(
       true,
     );
+  });
+
+  it("shows an upgrade guide on hosts before 1.13 instead of a blank settings tab", () => {
+    // 1.13 前的宿主不认 getSettingDefinitions()，而主类不再实现 display()；
+    // 手动强装会得到空白页。工厂按宿主能力切到只渲染升级指引的子类。
+    const plugin = {
+      app: {},
+      register: vi.fn(),
+      i18n: new I18n("zh-cn"),
+      manifest: { minAppVersion: "1.14.0" },
+    } as unknown as EasySyncPlugin;
+    const setName = vi.spyOn(Setting.prototype, "setName");
+    const setDesc = vi.spyOn(Setting.prototype, "setDesc");
+    const setButtonText = vi.spyOn(ButtonComponent.prototype, "setButtonText");
+    vi.mocked(requireApiVersion).mockReturnValueOnce(false);
+
+    try {
+      const tab = createEasySyncSettingTab(plugin);
+      expect(tab).toBeInstanceOf(EasySyncSettingTab);
+      tab.display();
+
+      expect(setName).toHaveBeenCalledWith("Obsidian 版本过低");
+      expect(setDesc).toHaveBeenCalledWith(
+        "当前版本 1.13.4，EasySync 需要 1.14.0 以上。请更新并重启。",
+      );
+      expect(setButtonText).toHaveBeenCalledWith("前往官网");
+      // 旧宿主没有 1.13 的 SettingTab.update()：后台刷新入口必须静默。
+      expect(() => tab.refreshSyncState()).not.toThrow();
+      expect(() => tab.refreshAuthState()).not.toThrow();
+    } finally {
+      setName.mockRestore();
+      setDesc.mockRestore();
+      setButtonText.mockRestore();
+      vi.mocked(requireApiVersion).mockReturnValue(true);
+    }
+  });
+
+  it("keeps the old-host guide copy paired across locales", () => {
+    expect(zhCN["settings.hostRequirement.title"]).toBe("Obsidian 版本过低");
+    expect(zhCN["settings.hostRequirement.desc"]).toContain("EasySync 需要");
+    expect(zhCN["settings.hostRequirement.download"]).toBe("前往官网");
+    expect(en["settings.hostRequirement.title"]).toBe(
+      "Obsidian version is too old",
+    );
+    expect(en["settings.hostRequirement.desc"]).toContain(
+      "EasySync requires {required} or later",
+    );
+    expect(en["settings.hostRequirement.download"]).toBe("Visit official site");
   });
 
   it("keeps desktop settings action buttons on one shared minimum width", () => {
@@ -1141,15 +1196,15 @@ describe("settings tab", () => {
     expect(configSource).not.toContain('"settings.syncPluginFiles"');
     // The scope guidance must stay above every switch it explains.
     expect(configSource.indexOf('t("settings.syncScope.intro")')).toBeLessThan(
-      configSource.indexOf('key: "settings.syncCorePlugins"'),
-    );
-    expect(configSource.indexOf('key: "settings.syncCorePlugins"')).toBeLessThan(
       configSource.indexOf('"settings.syncCommunityPlugins"'),
     );
     expect(configSource.indexOf('"settings.syncCommunityPlugins"')).toBeLessThan(
       configSource.indexOf('"settings.syncPluginData"'),
     );
     expect(configSource.indexOf('"settings.syncPluginData"')).toBeLessThan(
+      configSource.indexOf('key: "settings.syncCorePlugins"'),
+    );
+    expect(configSource.indexOf('key: "settings.syncCorePlugins"')).toBeLessThan(
       configSource.indexOf('key: "settings.syncEditor"'),
     );
     expect(configSource.indexOf('key: "settings.syncHotkeys"')).toBeLessThan(
@@ -1179,13 +1234,13 @@ describe("settings tab", () => {
       "开启社区插件数据同步？",
     );
     expect(zhCN["settings.communityPlugins.data.experimentalBulkStep.shared"]).toBe(
-      "当前 {count} 个插件及以后加入的插件：共用一份设置。",
+      "各设备共用一份插件设置。",
     );
     expect(zhCN["settings.communityPlugins.data.experimentalBulkStep.replace"]).toBe(
-      "任一设备修改设置：替换其他设备上的设置。",
+      "任何设备修改，都会覆盖其他设备的设置。",
     );
     expect(zhCN["settings.communityPlugins.data.experimentalBulkStep.conflict"]).toBe(
-      "两侧同时修改：转为冲突，需整份选择保留本机或云端；未保留的一侧修改会丢失。",
+      "两台设备同时修改会冲突，只能整份二选一；另一边的修改会丢失。",
     );
     expect(zhCN["settings.communityPlugins.data.experimentalItemMessage"]).toBe(
       "开启后，“{plugin}”的设置会在设备间同步，开启此项的设备共用一份设置；任一设备的修改会替换其他设备上的设置，无法按设备保留不同设置。",

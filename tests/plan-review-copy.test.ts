@@ -36,7 +36,9 @@ describe("plan review quiet-period guidance", () => {
  *  does) from a decision note (when the plan's decision rows become
  *  actionable). Activation reviews defer conflicts and pending cloud-deletion
  *  confirmations to after the run; ordinary plans can decide them inline —
- *  each sentence must match the timing its rows really have. */
+ *  each sentence must match the timing its rows really have. The cloud-join
+ *  flow line was re-pinned shorter on 2026-11-09: it names the fixed top
+ *  button and states the gate, without internal setup wording. */
 describe("plan confirm boundary sentence and cloud join summary", () => {
   it("boundary sentence is pinned verbatim in both locales", () => {
     const zh = new I18n("zh-cn");
@@ -61,12 +63,20 @@ describe("plan confirm boundary sentence and cloud join summary", () => {
       "This device will switch to the new sync method. After you confirm, EasySync will sync according to the plan below.",
     );
     expect(zh.t("syncPlan.cloudJoinSummary")).toBe(
-      "本设备正在加入已有同步。确认后先登记本机，再按下方计划同步。",
+      "点击上方「确认执行」后，才会按计划同步。",
     );
     expect(en.t("syncPlan.cloudJoinSummary")).toBe(
-      "This device is joining an existing sync. After you confirm, EasySync will first set up the local record, then sync according to the plan below.",
+      "EasySync will sync according to the plan only after you click “Confirm and execute” above.",
     );
     expect(zh.t("syncPlan.cloudJoinSummary")).not.toContain("同步状态");
+    // 2026-11-09 用户拍板：短句直接引用顶部按钮名；按钮改名时必须同步改这句。
+    expect(zh.t("syncPlan.cloudJoinSummary")).toContain(
+      zh.t("syncPlan.confirmExecute"),
+    );
+    expect(en.t("syncPlan.cloudJoinSummary")).toContain(
+      en.t("syncPlan.confirmExecute"),
+    );
+    expect(zh.t("syncPlan.cloudJoinSummary")).not.toContain("登记");
     expect(zh.t("syncPlan.firstSyncSummary")).toBe(
       // 2026-10-12 用户过目的修订（唯一改动＝"这台"→"本设备"，去掉双「这」）。
       "这是本设备的首次同步。确认后按下方计划建立同步。",

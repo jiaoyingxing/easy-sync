@@ -1235,14 +1235,29 @@ describe("sync view status copy and scrolling layout", () => {
     // 会盖掉列表化进背景的过渡，关掉它的 ::after 更会把渐隐整条抹掉——2026-10-27
     // 一次误改正是这两条（已回退）。这里钉住：插件不得改底栏表面，也不得动宿主
     // 画在 `nav-buttons-container` / `workspace-leaf-content` 上的渐隐层。
+    // 按钮自身的底色不属于底栏表面（历史按下态需要主题色底），因此只匹配以
+    // `.nav-buttons-container` 为主体的规则，不匹配它的后代按钮。
     expect(styles).not.toMatch(
-      /\.nav-buttons-container[^{]*\{[^}]*background(?:-color)?:/s,
+      /\.nav-buttons-container(?:[.:][\w-]+)*(?:\s*,[^{}]*)?\s*\{[^}]*background(?:-color)?:/s,
     );
     expect(styles).not.toMatch(
       /\.nav-buttons-container[^{]*::after[^{]*\{[^}]*display:\s*none/s,
     );
     expect(styles).not.toMatch(
       /\.workspace-leaf-content[^{]*::after[^{]*\{[^}]*display:\s*none/s,
+    );
+  });
+
+  it("paints the pressed history toggle with the theme accent", () => {
+    const styles = readSourceFile("styles.css");
+    const activeRule =
+      styles.match(
+        /\.view-content\.easy-sync-view \.nav-buttons-container \.nav-action-button\.is-active\s*\{([^}]*)\}/s,
+      )?.[1] ?? "";
+
+    expect(activeRule).toContain("color: var(--text-accent)");
+    expect(activeRule).toContain(
+      "background-color: hsla(var(--color-accent-hsl), 0.15)",
     );
   });
 });
@@ -3779,6 +3794,25 @@ describe("buildSyncViewContentKey", () => {
     expect(section).toContain("hasDecisionRows");
     expect(section).toContain("SyncActionType.Conflict");
     expect(section).toContain("SyncActionType.ConfirmLocalDelete");
+  });
+
+  it("keeps the top status row as the only visible plan heading", () => {
+    // 2026-11-09 用户拍板：计划正文不再重复「同步计划」大字。顶部状态行
+    // （桌面固定／移动端吸顶）是唯一可见标题；section 只保留 role=group +
+    // aria-label 给读屏——与恢复区同一形状。
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const sectionStart = source.indexOf("private renderPlanReviewSection");
+    const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
+    const section = source.slice(sectionStart, sectionEnd);
+
+    expect(section).not.toContain(
+      'createSection(container, t("syncPlan.sectionTitle"))',
+    );
+    expect(section).not.toContain("easy-sync-section-title");
+    expect(section).toContain('setAttribute("role", "group")');
+    expect(section).toContain(
+      'setAttribute("aria-label", t("syncPlan.sectionTitle"))',
+    );
   });
 
   it("marks a re-staged activation review only after the sidebar showed its baseline", () => {

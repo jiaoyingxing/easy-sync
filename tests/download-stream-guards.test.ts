@@ -192,6 +192,56 @@ describe("slow connection gate — evidence-driven decision function (2026-09-15
     expect(catchSlowError(() => gate.evaluate(windowBytesFor(300)))).toBeNull();
   });
 
+  it("keeps a slow-but-in-budget connection alive (2026-11-10 iOS 3.6 MiB replay)", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    // Steady 80 KiB/s on a 3.6 MiB file: the first cold window lands ~1.2 MiB
+    // and the remaining transfer needs ~32s — inside the download's remaining
+    // budget. Reconnecting here discards the prefix and lands on slower
+    // /content tiers, which is exactly the deadlock this exemption ends.
+    const gate = createSlowConnectionGate("file", {
+      evidence: createSlowLinkEvidence(),
+      totalSize: 3_760_337,
+      budgetLeftMs: () => 100_000,
+    });
+    gate.evaluate(0);
+    advanceWindow();
+    expect(catchSlowError(() => gate.evaluate(windowBytesFor(80)))).toBeNull();
+  });
+
+  it("still abandons a connection that cannot finish inside the remaining budget", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const gate = createSlowConnectionGate("file", {
+      evidence: createSlowLinkEvidence(),
+      totalSize: 3_760_337,
+      // Same rate, but only ~20s left: the ETA (~32s) cannot fit, so the
+      // original cold-start absolute rule still abandons the window.
+      budgetLeftMs: () => 20_000,
+    });
+    gate.evaluate(0);
+    advanceWindow();
+    expect(catchSlowError(() => gate.evaluate(windowBytesFor(80)))).not.toBeNull();
+  });
+
+  it("does not let the budget exemption rescue a collapsed connection", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const evidence = createSlowLinkEvidence();
+    // The link already proved ~400 KiB/s this round; 20 KiB/s is a collapse,
+    // not a steady slow link — the reconnect budget must still apply even
+    // though the file would fit the remaining budget at this rate.
+    for (let i = 0; i < 8; i++) evidence.record(400 * 1024);
+    const gate = createSlowConnectionGate("file", {
+      evidence,
+      totalSize: 1_000_000,
+      budgetLeftMs: () => 600_000,
+    });
+    gate.evaluate(0);
+    advanceWindow();
+    expect(catchSlowError(() => gate.evaluate(windowBytesFor(20)))).not.toBeNull();
+  });
+
   it("keeps the legacy absolute rule for gates without shared evidence", () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

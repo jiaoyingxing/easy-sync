@@ -2,8 +2,10 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { Setting, ButtonComponent, ToggleComponent } from "./__mocks__/obsidian";
 import {
-  buildAccountSettingDefinitions,
+  buildLoginPage,
+  buildRootSettingDefinitions,
   buildSettingDefinitions,
+  getSettingsFooterLinks,
 } from "../src/ui/settings-tab";
 import { I18n } from "../src/i18n";
 import type EasySyncPlugin from "../src/main";
@@ -151,8 +153,6 @@ describe("buildSettingDefinitions", () => {
       t("settings.syncContent.heading"),
       t("settings.rules.name"),
       t("settings.syncCorePlugins.name"),
-      t("settings.syncCommunityPlugins.name"),
-      t("settings.syncPluginData.name"),
       t("settings.syncEditor.name"),
       t("settings.syncAppearance.name"),
       t("settings.syncThemes.name"),
@@ -320,14 +320,15 @@ describe("buildSettingDefinitions", () => {
       items?: Array<{ name?: string; desc?: string }>;
     }>;
 
-    // 规则按板块拆分（不合并）：排除板块＝排除语义句；内容板块＝跨设备事实句。
+    // 规则按板块拆分（不合并）：排除板块＝排除语义句；内容板块＝同步内容开关句
+    //（2026-11-10 拆页后社区插件板块的规则随行搬到「社区插件同步」页）。
     expect(scopeItems[0].desc).toBe(t("settings.syncExclusion.intro"));
     const contentGroup = scopeItems[3] as {
       heading?: string;
       items?: Array<{ name?: string; desc?: string }>;
     };
     expect(contentGroup.heading).toBe(t("settings.syncContent.heading"));
-    expect(contentGroup.items?.[0].desc).toBe(t("settings.syncScope.intro"));
+    expect(contentGroup.items?.[0].desc).toBe(t("settings.syncContent.intro"));
     const autoItems = defs[1].items as typeof scopeItems;
     expect(autoItems[0].desc).toBe(t("settings.autoSync.intro"));
     const handlingGroup = autoItems.find(
@@ -399,7 +400,7 @@ describe("buildSettingDefinitions", () => {
     );
   });
 
-  it("surfaces one description and at most one displayValue per root entry (S3 口径)", () => {
+  it("keeps root entry rows to name + at most one displayValue (2026-11-10 窄列表)", () => {
     const i18n = new I18n("zh-cn");
     const t = i18n.t.bind(i18n);
     const rowsOf = (plugin: EasySyncPlugin) =>
@@ -409,9 +410,10 @@ describe("buildSettingDefinitions", () => {
         status?: string;
       }>;
 
-    // 同步范围：无排除＝留空（不下发 displayValue）；有排除＝「排除 {n} 项」。
+    // 窄列表：根级页面入口不再带说明句（行名自足，说明只在页内）。
     const bareRows = rowsOf(createMockPlugin());
-    expect(bareRows[0].desc).toBe(t("settings.rootNav.scope.desc"));
+    expect(bareRows.every((row) => row.desc === undefined)).toBe(true);
+    // 同步范围：无排除＝留空（不下发 displayValue）；有排除＝「排除 {n} 项」。
     expect(bareRows[0].displayValue).toBeUndefined();
     const withExclusions = createMockPlugin();
     (withExclusions as unknown as { excludedFolders: string[] }).excludedFolders =
@@ -422,7 +424,6 @@ describe("buildSettingDefinitions", () => {
     );
 
     // 自动同步：派生态（mock 默认 interval=3 ⇒ 已开启）。
-    expect(rows[1].desc).toBe(t("settings.rootNav.autoSync.desc"));
     expect(rows[1].displayValue).toBe(t("settings.rootNav.value.autoSyncOn"));
     const off = createMockPlugin();
     off.syncInterval = 0;
@@ -431,13 +432,10 @@ describe("buildSettingDefinitions", () => {
     expect(rowsOf(off)[1].displayValue).toBe(t("settings.rootNav.value.autoSyncOff"));
 
     // 显示：档位词（复用现役选项词）；维护：留空。
-    expect(rows[2].desc).toBe(t("settings.rootNav.display.desc"));
     expect(rows[2].displayValue).toBe(t("settings.notificationPopups.option.all"));
-    expect(rows[4].desc).toBe(t("settings.rootNav.maintenance.desc"));
     expect(rows[4].displayValue).toBeUndefined();
 
     // 关于：无新版＝版本号（无角标）；有新版＝「有新版本」＋ warning 角标。
-    expect(rows[3].desc).toBe(t("settings.rootNav.about.desc"));
     expect(rows[3].displayValue).toBe("1.4.0");
     expect(rows[3].status).toBeUndefined();
     const withUpdate = createMockPlugin();
@@ -449,39 +447,50 @@ describe("buildSettingDefinitions", () => {
   });
 });
 
-describe("buildAccountSettingDefinitions", () => {
-  it("always includes the account/login row", () => {
+describe("buildLoginPage", () => {
+  it("puts the existing account and sync-mode rows inside the login page", () => {
     const plugin = createMockPlugin();
     const i18n = new I18n("zh-cn");
-    const group = buildAccountSettingDefinitions(i18n.t.bind(i18n), plugin);
+    const page = buildLoginPage(i18n.t.bind(i18n), plugin);
 
-    expect((group as { type?: string }).type).toBe("group");
-    const items = (group as { items: Array<{ name?: string }> }).items;
-    // 片⑥ 起账号组为三行：账号行、同步模式行、同步面板行。
-    expect(items.length).toBe(3);
+    expect((page as { type?: string }).type).toBe("page");
+    expect((page as { name?: string }).name).toBe(i18n.t("settings.loginPage.name"));
+    const items = (page as { items: Array<{ name?: string }> }).items;
+    // 2026-11-10：账号行与同步模式行原样搬进「登录」页；同步面板行已升根级动作行。
+    expect(items.length).toBe(2);
     expect(items[0].name).toBe(i18n.t("settings.account.name"));
     expect(items[1].name).toBe(i18n.t("settings.syncMode.name"));
-    expect(items[2].name).toBe(i18n.t("settings.syncPanel.name"));
-  });
-
-  it("hides the sync-panel row until the user is signed in", () => {
-    const plugin = createMockPlugin();
-    const i18n = new I18n("zh-cn");
-    const group = buildAccountSettingDefinitions(i18n.t.bind(i18n), plugin);
-    const items = (group as {
-      items: Array<{ name?: string; visible?: () => boolean }>;
-    }).items;
-    const syncItem = items.find((i) => i.name === i18n.t("settings.syncPanel.name"));
-    expect(syncItem).toBeDefined();
-    // Logged out: the entry must not render (mirrors renderAccountSection).
-    expect(syncItem?.visible?.()).toBe(false);
+    // 根级入口行尾透登录状态（窄列表每行最多一个现值）；未登录亮宿主警示角标。
+    expect((page as { displayValue?: string }).displayValue).toBe(
+      i18n.t("settings.loginPage.value.loggedOut"),
+    );
+    expect((page as { status?: string }).status).toBe("warning");
+    (plugin.auth as unknown as {
+      authState: { isLoggedIn: boolean; displayName?: string };
+    }).authState.isLoggedIn = true;
+    (plugin.auth as unknown as {
+      authState: { displayName?: string };
+    }).authState.displayName = "张三";
+    const signedIn = buildLoginPage(i18n.t.bind(i18n), plugin);
+    // 已登录直接写账号名（用户 2026-11-10 点名，不再写「已登录」）。
+    expect((signedIn as { displayValue?: string }).displayValue).toBe("张三");
+    // 已登录不亮标（角标与现值同判据）。
+    expect((signedIn as { status?: string }).status).toBeUndefined();
+    // 验证中：既不写未登录，也不亮警示标。
+    (plugin.auth as unknown as { isInitializing: boolean }).isInitializing = true;
+    (plugin.auth as unknown as {
+      authState: { isLoggedIn: boolean };
+    }).authState.isLoggedIn = false;
+    const settling = buildLoginPage(i18n.t.bind(i18n), plugin);
+    expect((settling as { displayValue?: string }).displayValue).toBeUndefined();
+    expect((settling as { status?: string }).status).toBeUndefined();
   });
 
   it("hides the sync-mode row until the user is signed in", () => {
     const plugin = createMockPlugin();
     const i18n = new I18n("zh-cn");
-    const group = buildAccountSettingDefinitions(i18n.t.bind(i18n), plugin);
-    const items = (group as {
+    const page = buildLoginPage(i18n.t.bind(i18n), plugin);
+    const items = (page as {
       items: Array<{ name?: string; visible?: () => boolean }>;
     }).items;
     const modeItem = items.find((i) =>
@@ -556,56 +565,267 @@ describe("buildAccountSettingDefinitions", () => {
     expect(rootNames).not.toContain(t("settings.automaticHandling.name"));
   });
 
-  it("opens the sync panel from the signed-in entry row", async () => {
+  it("opens the sync panel from the whole root row, not a button", () => {
+    // 2026-11-10 用户反馈：未登录也必须能看到这条出口（不再有可见谓词）。
     const plugin = createMockPlugin();
-    (plugin.auth as unknown as {
-      authState: { isLoggedIn: boolean; displayName?: string };
-    }).authState.isLoggedIn = true;
     const openSyncPanelFromSettings = (plugin as unknown as {
       openSyncPanelFromSettings: ReturnType<typeof vi.fn>;
     }).openSyncPanelFromSettings;
     const i18n = new I18n("zh-cn");
-    const group = buildAccountSettingDefinitions(i18n.t.bind(i18n), plugin);
-    const items = (group as {
-      items: Array<{
+    const t = i18n.t.bind(i18n);
+    const root = buildRootSettingDefinitions(t, plugin) as unknown as Array<{
+      items?: Array<{
         name?: string;
         visible?: () => boolean;
         render?: (s: never) => void;
       }>;
-    }).items;
-    const syncItem = items.find((i) => i.name === i18n.t("settings.syncPanel.name"));
-    expect(syncItem?.visible?.()).toBe(true);
+    }>;
+    const actionRow = root[0].items?.find(
+      (item) => item.name === t("settings.syncPanel.openRow"),
+    );
+    expect(actionRow).toBeDefined();
+    expect(actionRow?.visible).toBeUndefined();
 
     const setting = new Setting({} as HTMLElement) as never;
-    let clickHandler: (() => void | Promise<void>) | null = null;
-    const btn = new ButtonComponent({} as HTMLElement) as unknown as {
-      buttonEl: unknown;
-      setButtonText: (t: string) => unknown;
-      onClick: (cb: () => void | Promise<void>) => unknown;
-    };
-    btn.buttonEl = { classList: { add: () => undefined } };
-    btn.setButtonText = (() => btn) as never;
-    btn.onClick = ((cb: () => void | Promise<void>) => { clickHandler = cb; return btn; }) as never;
-    vi.spyOn(setting as never, "addButton").mockImplementation(
-      (cb: (b: unknown) => void) => { cb(btn); return setting; },
-    );
-    syncItem!.render!(setting);
+    actionRow!.render!(setting);
+    // 整行即按钮：行壳带 role/tabindex/光标类，行尾一枚箭头；不再产出按钮控件。
+    const rowEl = (setting as unknown as { settingEl: HTMLElement }).settingEl;
+    expect(rowEl.getAttribute("role")).toBe("button");
+    expect(rowEl.getAttribute("tabindex")).toBe("0");
+    expect(
+      (rowEl as unknown as { classList: { contains: (c: string) => boolean } })
+        .classList.contains("easy-sync-settings-row-button"),
+    ).toBe(true);
+    expect(
+      (rowEl as unknown as { classList: { contains: (c: string) => boolean } })
+        .classList.contains("mod-navigable"),
+    ).toBe(true);
 
-    await clickHandler!();
+    (rowEl as unknown as { onclick: () => void }).onclick();
     expect(openSyncPanelFromSettings).toHaveBeenCalledTimes(1);
+
+    // 键盘 Enter／空格与点击同效（整行＝按钮）。
+    const click = vi.fn();
+    (rowEl as unknown as { click: () => void }).click = click;
+    const keydown = (rowEl as unknown as { onkeydown: (e: KeyboardEvent) => void })
+      .onkeydown;
+    keydown({ key: "Enter", preventDefault: vi.fn() } as unknown as KeyboardEvent);
+    keydown({ key: " ", preventDefault: vi.fn() } as unknown as KeyboardEvent);
+    expect(click).toHaveBeenCalledTimes(2);
   });
 
   it("renders the account row without throwing", () => {
     const plugin = createMockPlugin();
     const i18n = new I18n("zh-cn");
-    const group = buildAccountSettingDefinitions(i18n.t.bind(i18n), plugin);
-    const items = (group as { items: Array<{ render?: (s: never) => void }> }).items;
+    const page = buildLoginPage(i18n.t.bind(i18n), plugin);
+    const items = (page as { items: Array<{ render?: (s: never) => void }> }).items;
     for (const item of items) {
       if (item.render) {
         const setting = new Setting({} as HTMLElement) as never;
         expect(() => item.render(setting)).not.toThrow();
       }
     }
+  });
+});
+
+describe("root navigation (2026-11-10 窄列表)", () => {
+  const t = new I18n("zh-cn").t.bind(new I18n("zh-cn"));
+
+  const groupsOf = (plugin: EasySyncPlugin) =>
+    buildRootSettingDefinitions(t, plugin) as unknown as Array<{
+      type?: string;
+      cls?: string;
+      heading?: string;
+      items?: Array<{
+        name?: string;
+        desc?: string;
+        searchable?: boolean;
+        items?: unknown[];
+      }>;
+    }>;
+
+  it("is four heading-less compact navigation groups plus a footer group", () => {
+    const groups = groupsOf(createMockPlugin());
+    expect(groups).toHaveLength(5);
+    expect(groups.every((group) => group.type === "group")).toBe(true);
+    // 四组导航都不加外侧标题；前三组是窄条，支持组单独带自己的类；页脚组另一类。
+    const navigationGroups = groups.slice(0, 4);
+    expect(navigationGroups.every((group) => group.heading === undefined)).toBe(true);
+    expect(navigationGroups.slice(0, 3).every((group) => group.cls === "mod-list")).toBe(true);
+    expect(navigationGroups[3].cls).toBe(
+      "mod-list easy-sync-settings-support-group",
+    );
+    expect(groups[4].cls).toBe("easy-sync-settings-footer-group");
+
+    const rowNames = navigationGroups.flatMap((group) =>
+      (group.items ?? []).map((item) => item.name),
+    );
+    expect(rowNames).toEqual([
+      t("settings.loginPage.name"),
+      t("settings.syncPanel.openRow"),
+      t("settings.communityPluginsSyncPage.name"),
+      t("settings.syncScope.name"),
+      t("settings.autoSync.name"),
+      t("settings.group.display"),
+      t("settings.group.about"),
+      t("settings.group.maintenance"),
+      t("settings.supportPage.name"),
+    ]);
+    // 2026-11-10 用户点名：社区插件同步并入下面这组（组①只留登录／动作行）；
+    // 组④＝根页最下面的「支持 EasySync」入口。
+    expect(navigationGroups.map((group) => (group.items ?? []).map((item) => item.name))).toEqual([
+      [t("settings.loginPage.name"), t("settings.syncPanel.openRow")],
+      [
+        t("settings.communityPluginsSyncPage.name"),
+        t("settings.syncScope.name"),
+        t("settings.autoSync.name"),
+      ],
+      [
+        t("settings.group.display"),
+        t("settings.group.about"),
+        t("settings.group.maintenance"),
+      ],
+      [t("settings.supportPage.name")],
+    ]);
+    // 导航行都不带说明句（说明只在页内）。
+    expect(
+      navigationGroups.flatMap((group) => group.items ?? []).every(
+        (item) => item.desc === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps the footer out of settings search and the navigation row set", () => {
+    const groups = groupsOf(createMockPlugin());
+    const footer = groups[4];
+    expect(footer.items).toHaveLength(1);
+    expect(footer.items?.[0].name).toBe(t("settings.footer.navLabel"));
+    expect(footer.items?.[0].searchable).toBe(false);
+    // 页脚不是导航行：不参与根级图标映射（settings-root-icons 测试同口径）。
+    expect(
+      groups.slice(0, 4).flatMap((group) => group.items ?? []),
+    ).not.toContain(footer.items?.[0]);
+  });
+
+  it("builds the Support EasySync page as About-author row, plugin rows, and bottom note", () => {
+    const groups = groupsOf(createMockPlugin());
+    const supportPage = groups[3].items?.[0] as {
+      type?: string;
+      name?: string;
+      items?: Array<{
+        type?: string;
+        cls?: string;
+        heading?: string;
+        items?: Array<{
+          name?: string;
+          desc?: string;
+          searchable?: boolean;
+          render?: (setting: never) => void;
+        }>;
+      }>;
+    };
+    expect(supportPage.type).toBe("page");
+    expect(supportPage.name).toBe(t("settings.supportPage.name"));
+    expect(supportPage.items).toHaveLength(3);
+
+    const aboutGroup = supportPage.items?.[0];
+    expect(aboutGroup?.type).toBe("group");
+    // 与「关于」页同构：普通分组（无 mod-list），行内边距走宿主默认 20px。
+    expect(aboutGroup?.cls).toBeUndefined();
+    expect(aboutGroup?.items).toHaveLength(1);
+    expect(aboutGroup?.items?.[0].name).toBe(
+      t("settings.supportPage.about.name"),
+    );
+    expect(aboutGroup?.items?.[0].desc).toBe(
+      t("settings.supportPage.about.desc"),
+    );
+
+    const picksGroup = supportPage.items?.[1];
+    expect(picksGroup?.type).toBe("group");
+    expect(picksGroup?.cls).toBe("mod-list easy-sync-settings-support-picks");
+    expect(picksGroup?.heading).toBe(t("settings.supportPage.picksHeading"));
+    expect(picksGroup?.items?.map((item) => item.name)).toEqual([
+      t("settings.supportPage.resojot.name"),
+      t("settings.supportPage.openplug.name"),
+    ]);
+    expect(picksGroup?.items?.[0].desc).toBe(
+      t("settings.supportPage.resojot.desc"),
+    );
+    expect(picksGroup?.items?.[1].desc).toBe(
+      t("settings.supportPage.openplug.desc"),
+    );
+
+    const noteGroup = supportPage.items?.[2];
+    expect(noteGroup?.type).toBe("group");
+    expect(noteGroup?.cls).toBe("easy-sync-settings-support-note-group");
+    expect(noteGroup?.items).toHaveLength(1);
+    expect(noteGroup?.items?.[0].name).toBe(
+      t("settings.supportPage.note"),
+    );
+    expect(noteGroup?.items?.[0].searchable).toBe(false);
+
+    // 顶部行、两条插件行与页底小字都能在声明式行里渲染。
+    for (const item of [
+      aboutGroup?.items?.[0],
+      picksGroup?.items?.[0],
+      picksGroup?.items?.[1],
+      noteGroup?.items?.[0],
+    ]) {
+      const setting = new Setting({} as HTMLElement) as never;
+      expect(() => item!.render!(setting)).not.toThrow();
+    }
+  });
+
+  it("builds the four footer links with language-aware docs", () => {
+    const zh = getSettingsFooterLinks(t, "zh-cn");
+    expect(zh.map((link) => link.label)).toEqual([
+      t("settings.footer.docs"),
+      t("settings.footer.changelog"),
+      t("settings.footer.feedback"),
+      t("settings.footer.contact"),
+    ]);
+    expect(zh.map((link) => link.url)).toEqual([
+      "https://github.com/jiaoyingxing/easy-sync/blob/main/README.md",
+      "https://github.com/jiaoyingxing/easy-sync/releases",
+      "https://github.com/jiaoyingxing/easy-sync/issues/new",
+      "https://www.xiaohongshu.com/user/profile/605dfc23000000000101cfdb",
+    ]);
+    // 2026-11-10 用户确认中文口径：License 写「许可证」，不中英混排。
+    expect(t("settings.footer.license")).toBe("以 MIT 许可证开源");
+
+    const enI18n = new I18n("en");
+    const en = getSettingsFooterLinks(enI18n.t.bind(enI18n), "en");
+    expect(en.map((link) => link.label)).toEqual([
+      "Docs", "Changelog", "Feedback", "Contact",
+    ]);
+    expect(en[0].url).toContain("README-en.md");
+  });
+
+  it("moves the community-plugin rows out of the scope page into their own page", () => {
+    const groups = groupsOf(createMockPlugin());
+    const communityPage = groups[1].items?.find(
+      (item) => item.name === t("settings.communityPluginsSyncPage.name"),
+    ) as { items?: Array<{ name?: string }> } | undefined;
+    // 2026-11-10 规则也随板块拆：新页首行是社区插件板块自己的「规则」。
+    expect(communityPage?.items?.map((item) => item.name)).toEqual([
+      t("settings.rules.name"),
+      t("settings.syncCommunityPlugins.name"),
+      t("settings.syncPluginData.name"),
+    ]);
+
+    // 同步范围页不再有这两行（2026-11-10 用户点名拆出）。
+    const scopePage = groups[1].items?.find(
+      (item) => item.name === t("settings.syncScope.name"),
+    );
+    const namesInScope: string[] = [];
+    const walk = (node: unknown): void => {
+      const typed = node as { name?: string; items?: unknown[] };
+      if (typed.name) namesInScope.push(typed.name);
+      if (Array.isArray(typed.items)) typed.items.forEach(walk);
+    };
+    walk(scopePage);
+    expect(namesInScope).not.toContain(t("settings.syncCommunityPlugins.name"));
+    expect(namesInScope).not.toContain(t("settings.syncPluginData.name"));
   });
 });
 

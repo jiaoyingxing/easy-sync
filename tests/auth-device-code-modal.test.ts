@@ -82,9 +82,8 @@ describe("device code i18n keys", () => {
     expect(zh.t("settings.account.device.title")).toBe("输入代码登录");
     expect(zh.t("settings.account.device.openVerify")).toContain("浏览器");
     expect(zh.t("settings.account.device.copyCode")).toBe("复制代码");
-    expect(zh.t("settings.account.device.waiting")).toContain("登录");
-    expect(zh.t("settings.account.device.expiresIn", { time: "14:32" }))
-      .toBe("14:32 后过期");
+    expect(zh.t("settings.account.device.waiting", { time: "14:32" }))
+      .toBe("等待你在浏览器中完成登录，代码将在14:32后过期。");
     expect(zh.t("settings.account.device.security")).toContain("不要发送给任何人");
     expect(zh.t("settings.account.device.regenerate")).toBe("重新生成代码");
     expect(zh.t("settings.account.device.cancel")).toBe("取消登录");
@@ -99,8 +98,8 @@ describe("device code i18n keys", () => {
     expect(en.t("settings.account.method.device.name")).toBe("Enter a code");
     expect(en.t("settings.account.method.device.desc")).toContain("another device");
     expect(en.t("settings.account.device.openVerify")).toContain("browser");
-    expect(en.t("settings.account.device.expiresIn", { time: "14:32" }))
-      .toBe("expires in 14:32");
+    expect(en.t("settings.account.device.waiting", { time: "14:32" }))
+      .toBe("Waiting for you to finish signing in — the code expires in 14:32.");
     expect(en.t("settings.account.device.security")).toContain("never share");
     expect(en.t("settings.account.device.regenerate")).toBe("Generate a new code");
     expect(en.t("settings.account.cancelLogin")).toBe("Cancel sign-in");

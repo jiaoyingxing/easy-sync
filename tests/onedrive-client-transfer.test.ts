@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import * as obsidian from "obsidian";
 import { getEasySyncPaths } from "../src/obsidian-compat";
 import { OneDriveClient, downloadBudget } from "../src/onedrive/client";
+import { createSlowLinkEvidence } from "../src/onedrive/download-stream-guards";
 import { createRangeStreamDownloader } from "../src/onedrive/range-download";
 import { sha256Hex } from "../src/crypto";
 import { UPLOAD_CHUNK_SLOW_BYTES } from "../src/onedrive/upload-session-policy";
@@ -807,9 +808,11 @@ describe("OneDriveClient.downloadFile", () => {
     vi.useFakeTimers();
     const originalWindow = (globalThis as { window?: unknown }).window;
     // 2026-09-14 sampling: per-connection rates span 84 KiB/s – 3.2 MiB/s on
-    // the same link (7/10 connections below 512 KiB/s). A slow connection
-    // must be dropped at the user-set gate (512 KiB/s over 15 s) so the
-    // waterfall retries on a fresh connection instead of crawling.
+    // the same link (7/10 connections below 512 KiB/s). A ~100 KiB/s window
+    // against a link that already proved MiB/s connections earlier this round
+    // is a collapse, not a steady slow link — the gate drops it (2026-11-10:
+    // the budget exemption only rescues absolute-only judgments, never a
+    // relative collapse) so the waterfall retries on a fresh connection.
     const M = 1024 * 1024;
     const fileBytes = 8 * M;
     const fetchSpy = vi.fn()
@@ -834,6 +837,11 @@ describe("OneDriveClient.downloadFile", () => {
     });
     try {
       const client = new OneDriveClient(async () => "token");
+      // Per-round evidence is shared across files, so an earlier MiB/s
+      // transfer in this round is exactly what the desktop hunt relies on.
+      const evidence = createSlowLinkEvidence();
+      for (let i = 0; i < 8; i++) evidence.record(3 * 1024 * 1024);
+      (client as unknown as { slowLinkEvidence: unknown }).slowLinkEvidence = evidence;
       const pending = client.downloadFile(
         "testVault",
         "recording.m4a",
@@ -861,35 +869,31 @@ describe("OneDriveClient.downloadFile", () => {
     }
   });
 
-  it("accepts a comparable second connection instead of looping (2026-09-15 iPhone replay)", async () => {
+  it("keeps a steady slow connection whose file fits the budget (2026-11-10 iOS replay)", async () => {
     vi.useFakeTimers();
     const originalWindow = (globalThis as { window?: unknown }).window;
-    // 2026-09-15 rewrite: the slow gate judges windows relative to what the
-    // link recently proved. A cold slow window still aborts (legacy absolute
-    // rule), but the reconnect lands on a comparable connection, so the gate
-    // accepts it instead of burning the remaining reconnect budget — the
-    // uniform-slow-link loop that motivated the 2026-09-14 gate is gone.
+    // 现场 replay: 4 MiB at ~60 KiB/s (4 KiB every 67 ms) with no faster
+    // connection anywhere on the link. The cold absolute rule used to abort
+    // the first 15 s window, discard the landed prefix and land on slower
+    // /content tiers until the deadline — the file never arrived. The gate
+    // now keeps it because the ETA (~53 s) fits the remaining budget.
     const M = 1024 * 1024;
     const fileBytes = 4 * M;
-    // ~60 KiB/s: 4096 bytes every 67 ms — the completion-imminence exemption
-    // must not fire (eta ~53s > reconnect cost ~25s at one window in).
-    const trickle = (finite: boolean) => {
+    const trickle = () => {
       let sent = 0;
       return Promise.resolve(new Response(
         new ReadableStream<Uint8Array>({
           async pull(controller) {
             await new Promise<void>((resolve) => setTimeout(resolve, 67));
-            if (finite && sent >= fileBytes / 4096) { controller.close(); return; }
-            if (finite) sent++;
+            if (sent >= fileBytes / 4096) { controller.close(); return; }
+            sent++;
             controller.enqueue(new Uint8Array(4096));
           },
         }),
         { status: 200 },
       ));
     };
-    const fetchSpy = vi.fn()
-      .mockImplementationOnce(() => trickle(false))
-      .mockImplementationOnce(() => trickle(true));
+    const fetchSpy = vi.fn().mockImplementationOnce(() => trickle());
     (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
     vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
       status: 200,
@@ -911,14 +915,10 @@ describe("OneDriveClient.downloadFile", () => {
         "file-id",
         fileBytes,
       );
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(20_000);
       expect(fetchSpy).toHaveBeenCalledTimes(1);
-      // Cold first window aborts once (absolute rule), then the comparable
-      // reconnect is accepted: exactly two connections, no further looping.
-      await vi.advanceTimersByTimeAsync(16_000);
-      expect(fetchSpy).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(120_000);
-      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
       const result = await pending;
       expect(result.byteLength).toBe(fileBytes);
     } finally {
@@ -934,10 +934,12 @@ describe("OneDriveClient.downloadFile", () => {
   it("still abandons collapsing connections and accepts the fourth", async () => {
     vi.useFakeTimers();
     const originalWindow = (globalThis as { window?: unknown }).window;
-    // Genuine link collapse (~308 → ~102 → ~31 KiB/s, each window far below
-    // 0.45 × the recent baseline): the relative judgment keeps reconnecting,
-    // the budget still caps at three aborts, and the fourth connection is
-    // accepted and must complete.
+    // Genuine link collapse after the link had proven fast connections this
+    // round (~308 → ~102 → ~31 KiB/s, each window far below 0.45 × the seeded
+    // MiB/s baseline): the relative judgment keeps reconnecting, the budget
+    // still caps at three aborts, and the fourth is accepted and completes.
+    // 2026-11-10: the budget exemption deliberately does not rescue these —
+    // only absolute-only judgments are exempt.
     const M = 1024 * 1024;
     const fileBytes = 16 * M;
     const trickleForever = (ms: number) => () => Promise.resolve(new Response(
@@ -970,6 +972,10 @@ describe("OneDriveClient.downloadFile", () => {
       const client = new OneDriveClient(async () => "token");
       (client as unknown as { rangeStreamDownloader: unknown })
         .rangeStreamDownloader = null;
+      // Earlier transfers in this round proved MiB/s connections.
+      const evidence = createSlowLinkEvidence();
+      for (let i = 0; i < 8; i++) evidence.record(3 * 1024 * 1024);
+      (client as unknown as { slowLinkEvidence: unknown }).slowLinkEvidence = evidence;
       const pending = client.downloadFile(
         "testVault",
         "big.bin",

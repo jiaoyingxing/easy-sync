@@ -21,12 +21,17 @@ export const SETTINGS_TAB_ICON = "cloud";
 /**
  * 根级导航行图标：页名 i18n 键 → lucide 裸 id。
  *
- * 键必须是 `getSettingDefinitions()` 各页 `name` 用的同一个 i18n 键（对账钉子＝
+ * 键必须是根级各行 `name` 用的同一个 i18n 键（对账钉子＝
  * tests/settings-root-icons.test.ts）；装饰器按当前语言现算行名，所以改文案或切
  * 语言都不会漂移。值互不重复（两行同图标＝用户分不清），且全部经宿主注册表核对
- * （2026-10-17，1.14.4，注册表 1934 项）。
+ * （2026-10-17，1.14.4，注册表 1934 项；2026-11-10 新增三枚同表复核）。
  */
 export const SETTINGS_ROOT_ICON_BY_NAME_KEY = {
+  // 2026-11-10 根级窄列表：登录页／「打开同步面板」动作行／社区插件同步页各补一枚，
+  // 与五条页面入口＋支持页同表（装饰按「行名＝页名」匹配）。
+  "settings.loginPage.name": "log-in",
+  "settings.syncPanel.openRow": "panel-left",
+  "settings.communityPluginsSyncPage.name": "puzzle",
   "settings.syncScope.name": "folder-open",
   // 用户点名 `rotate-cw-clock`：宿主注册表无此图标（rotate／clock 家族已普查），
   // 按方案备选取 `timer`（语义＝自动／定时）。
@@ -34,6 +39,8 @@ export const SETTINGS_ROOT_ICON_BY_NAME_KEY = {
   "settings.group.display": "bell",
   "settings.group.about": "info",
   "settings.group.maintenance": "wrench",
+  // 2026-11-10 用户拍板：根页最后一组「支持 EasySync」，星形图标。
+  "settings.supportPage.name": "star",
 } as const;
 
 /**

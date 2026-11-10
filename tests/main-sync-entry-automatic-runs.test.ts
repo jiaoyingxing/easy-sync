@@ -86,6 +86,7 @@ vi.mock("../src/sync/diagnostic-logger", () => ({
 
 vi.mock("../src/ui/settings-tab", () => ({
   EasySyncSettingTab: class {},
+  createEasySyncSettingTab: () => new (class {})(),
 }));
 
 vi.mock("../src/ui/sync-view", async () => {
