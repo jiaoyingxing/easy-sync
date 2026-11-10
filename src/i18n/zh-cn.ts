@@ -258,7 +258,7 @@ const zhCN: LocaleStrings = {
   "settings.about.author.name": "作者",
   "settings.about.author.desc": "焦应行（Jiao Yingxing）",
   "settings.about.feedback.name": "问题反馈",
-  "settings.about.feedback.desc": "使用中遇到问题，可在 GitHub 提交 Issue，或通过小红书私信联系作者。",
+  "settings.about.feedback.desc": "使用中遇到问题，可在 GitHub 提交 Issue，或通过小红书私信联系我。",
   "settings.about.contact.github": "GitHub",
   "settings.about.contact.xiaohongshu": "小红书",
 

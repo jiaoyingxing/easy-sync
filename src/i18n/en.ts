@@ -259,7 +259,7 @@ const en: LocaleStrings = {
   "settings.about.author.name": "Author",
   "settings.about.author.desc": "Jiao Yingxing",
   "settings.about.feedback.name": "Feedback",
-  "settings.about.feedback.desc": "If you run into a problem, open an issue on GitHub or contact the author on Xiaohongshu.",
+  "settings.about.feedback.desc": "If you run into a problem, open an issue on GitHub or contact me on Xiaohongshu.",
   "settings.about.contact.github": "GitHub",
   "settings.about.contact.xiaohongshu": "Xiaohongshu",
 
