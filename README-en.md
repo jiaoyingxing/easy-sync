@@ -117,7 +117,7 @@ The `files` directory contains the vault files included in sync, and you can bro
 
 ### 2.2 How data is transferred
 
-Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files. The plugin checks for new releases through a public CDN (jsDelivr) — it reads the latest version number only and uploads nothing.
+Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files. The plugin checks for new releases through GitHub raw files (`raw.githubusercontent.com`) first and a public CDN (jsDelivr) as fallback — it reads the latest version number only and uploads nothing; if both fail, it silently retries after one hour.
 
 The current Microsoft permissions are:
 
@@ -146,7 +146,7 @@ Other options can be enabled as needed:
 | Sync exclusions | Apply only to the current device; excluded folders are neither uploaded nor downloaded, and existing files are not deleted merely because of the exclusion |
 | Sync scope | Editor settings, appearance, themes and snippets, hotkeys, bookmarks, and core plugins can be controlled separately |
 | Community plugins | Plugin files can be selected individually; each plugin's `data.json` is controlled separately by **Community plugin data** |
-| Community plugin data | Each plugin's `data.json` can be selected separately; this feature is still experimental, so back up plugin settings on every device before enabling it |
+| Community plugin data | Each plugin's `data.json` can be selected separately; devices with this on share one copy, so a change on any device replaces the settings on the others — leave out plugins that need per-device settings |
 | Auto sync | Under the master switch, three channels — **Sync on startup**, **Scheduled sync**, and **Sync after changes** — are configured separately; **Sync now** remains available when auto sync is off |
 | Automatic handling | Merging non-overlapping text edits is on by default; applying remote deletions locally is off by default, and uncertain cases become conflicts or pending decisions |
 | Diagnostic logging | Leave it off for normal use; enable it when investigating a problem and generating a diagnostic report |
@@ -164,12 +164,12 @@ When the corresponding option is enabled, these objects under `.obsidian` are sy
 - Hotkeys (`hotkeys.json`)
 - Core plugin enable states (`core-plugins.json`)
 - Bookmarks (`bookmarks.json`)
-- Community plugins: the three plugin files (`main.js`, `manifest.json`, `styles.css`) of plugins participating in sync on this device; plugin data (`data.json`) requires a separate opt-in under **Community plugin data** (experimental)
+- Community plugins: the three plugin files (`main.js`, `manifest.json`, `styles.css`) of plugins participating in sync on this device; plugin data (`data.json`) requires a separate opt-in under **Community plugin data**, and devices with it on share one copy of those settings
 - EasySync itself: the plugin files always propagate to other devices, with no setting needed
 
 Community plugin **enable state is not part of the sync scope**: each device can enable or disable plugins independently.
 
-Community plugins don't delete across devices either: uninstalling affects only that device, and a deleted cloud copy comes back as long as some other device still syncs the plugin. To delete one everywhere: uninstall it on every device, then use the delete icon on its row in Settings → Sync scope → Manage community plugins to clear the cloud copy.
+Community plugins don't delete across devices either: uninstalling affects only that device, and a deleted cloud copy comes back as long as some other device still syncs the plugin. To delete one everywhere: uninstall it on every device, then use the delete icon on its row in Settings → Community plugin sync → Manage community plugins to clear the cloud copy.
 
 Note: even with automatic merging of non-overlapping text edits enabled, files under `.obsidian` are never merged automatically — conflicts there always require you to choose the local or the remote side.
 
