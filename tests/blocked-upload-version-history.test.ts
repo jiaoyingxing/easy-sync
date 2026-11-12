@@ -11,8 +11,9 @@
  *    "did our write land, and did someone replace it afterwards?" The field
  *    history below is the real thing, read from that incident's cloud folder.
  *
- * Both are diagnostics only: they never settle a record, so these tests also
- * pin that no settlement path is touched.
+ * Both are diagnostics only: they never settle a record. The assertions below
+ * cover the diagnostic log/call surface; they do not separately assert that
+ * settlement state is untouched.
  */
 
 import { readFileSync } from "node:fs";

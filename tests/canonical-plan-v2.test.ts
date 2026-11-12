@@ -437,8 +437,8 @@ describe("canonical V2 plan candidate", () => {
   it("defers a reconcile action whose expected remote facts no longer match the projection", () => {
     // 计划层延后（`RetryLater` + `reason.identityReplacement.verificationPending`，
     // 文案自陈「本轮未作更改」、设计语义＝下一轮再验证）——执行器暂停门第四豁免族
-    // （`planningDeferredErrors`）唯一的计划生产点，本项钉住「计划的产出 reason」与
-    // 「执行器按同一 reason 计入豁免族」两处字面量的同一性。
+    // （`planningDeferredErrors`）唯一的计划生产点。本项只钉计划侧产出的 reason；
+    // 执行器按同一 reason 计入豁免族的断言在另一个测试文件。
     // 构造条件：reconcile 动作按锚点拼写（"Note.md"）通过范围谓词，占用者节点的
     // 投影拼写（"note.md"）没通过 ⇒ `remoteFilesById` 找不到动作预期的远端事实，
     // 守卫把该路径交回普通规划而不是按失效预期改写身份。
@@ -877,7 +877,7 @@ describe("canonical V2 plan candidate", () => {
 
   // F29 切片 1（2026-10-16）：文件夹移动的**后代投影闸**。归约层在提交文件夹移动
   // 回执时要求该文件夹之下每个 file anchor 在**已提交索引**里的投影 == 机械翻译
-  // （`folder-state-reducer-v2.ts:810-823`）；云端把这棵子树改成非整体形状（后代被
+  // （`folder-state-reducer-v2.ts` 的 reviewed subtree 归约：逐 anchor 投影比对）；云端把这棵子树改成非整体形状（后代被
   // 重新挂到别处／身份被替换／锚点成墓碑）时该断言结构性不可满足、回执永不提交
   // （野外案 2026-10-16：Android 1.5.9 整库停机、无出口）。本层做同构预检：不等即
   // 扣下、改产延后行（复用现成 reason，行内出口可用），后代先由文件层按现状对账、
@@ -3394,7 +3394,7 @@ describe("canonical plan large-file gate wiring", () => {
     // 保留原并集断言（任一处接线），逐点断言见下。
     expect(source).toContain(field);
 
-    // 收窄取证：原断言是文件级并集，六处接线里删掉任意一处仍绿。
+    // 收窄取证：原断言是文件级并集，七处接线里删掉任意一处仍绿。
     // 逐点钉＝要求字段落在该 builder 调用的对象字面量内，缺一处即红。
     const pinSite = (builder: string, terminator: string, from = 0): number => {
       const start = source.indexOf(builder, from);

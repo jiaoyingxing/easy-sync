@@ -50,8 +50,9 @@ interface SelectProvablyReplacedIdentityRetirementInputV2 {
   preserveFolderPath: (path: string) => boolean;
   configDir: string;
   automaticDeleteLocalFiles: boolean;
-  /** Paths already attempted this round; they keep their review row. */
-  skippedPaths: ReadonlySet<string>;
+  /** Paths already attempted this round; unprovable candidates are added by
+   *  the selector and keep their review row. */
+  skippedPaths: Set<string>;
   /** Remaining plan-time content downloads. Absent = no download allowed. */
   remainingDownloads: number;
   resolveRemoteContentHash: (
@@ -63,15 +64,19 @@ interface SelectProvablyReplacedIdentityRetirementInputV2 {
 interface ProvablyReplacedIdentityRetirementV2 {
   path: string;
   snapshot: StaleIdentityResolutionSnapshotV1;
-  downloaded: boolean;
+  /** Whole-file verification downloads consumed by this selection. */
+  downloadsConsumed: number;
 }
 
 /**
  * Pick the first replacement whose occupant hash is already known or can be
  * read within the remaining budget. Returns null when no candidate can be
- * proven this round. A candidate whose bytes differ (or cannot be read) is
- * added to `skippedPaths` for this round only; the ordinary review row keeps
- * its full safety net.
+ * proven this round. Candidates whose bytes differ (or cannot be read) are
+ * recorded in `skippedPaths` for the rest of the round: they keep their review
+ * row and the caller does not re-select and re-download them. `downloadsConsumed`
+ * reports how many verification downloads this selection used, including reads
+ * made for candidates that turned out different, so the caller charges every
+ * download to the round's budget.
  */
 export async function selectNextProvablyReplacedIdentityRetirementV2(
   input: SelectProvablyReplacedIdentityRetirementInputV2,
@@ -87,6 +92,7 @@ export async function selectNextProvablyReplacedIdentityRetirementV2(
     && action.reason === "replacement-with-local-relocation"
     && !input.skippedPaths.has(action.path),
   );
+  let downloadsConsumed = 0;
   for (const action of actions) {
     const anchor = input.envelope.anchors.byAnchorId[action.anchorId];
     if (
@@ -99,9 +105,11 @@ export async function selectNextProvablyReplacedIdentityRetirementV2(
     if (!occupant) continue;
 
     let remoteHash = occupant.sha256Hash?.toLowerCase();
-    let downloaded = false;
     if (!remoteHash) {
-      if (input.remainingDownloads <= 0) continue;
+      if (downloadsConsumed >= input.remainingDownloads) continue;
+      // Charge the attempt before it runs: a failed or different read still
+      // consumed one of the round's verification downloads.
+      downloadsConsumed += 1;
       try {
         remoteHash = (await input.resolveRemoteContentHash(
           {
@@ -112,15 +120,18 @@ export async function selectNextProvablyReplacedIdentityRetirementV2(
           },
           { current: 1, total: 1 },
         )).toLowerCase();
-        downloaded = true;
       } catch {
+        input.skippedPaths.add(action.path);
         continue;
       }
     }
     if (
       occupant.size !== anchor.size
       || remoteHash !== anchor.contentHash.toLowerCase()
-    ) continue;
+    ) {
+      input.skippedPaths.add(action.path);
+      continue;
+    }
 
     const snapshot = buildStaleIdentityResolutionSnapshotV1(
       action.path,
@@ -148,7 +159,7 @@ export async function selectNextProvablyReplacedIdentityRetirementV2(
       },
     );
     if (!snapshot) continue;
-    return { path: action.path, snapshot, downloaded };
+    return { path: action.path, snapshot, downloadsConsumed };
   }
   return null;
 }

@@ -228,6 +228,11 @@ export function canonicalize(value: unknown, depth: number): unknown {
  *  teardown; pair-wise consecutive comparison only needs collision odds far
  *  below one-in-trillions, which two lanes give even for large states.
  *
+ *  Both lanes mix the full 16-bit UTF-16 code unit. A masked low byte in one
+ *  lane plus an overlapping `(low << 1) | high` term in the other made
+ *  distinct code units feed both lanes identical inputs — 丁 (U+4E01) and
+ *  䰁 (U+4C01), for example, hashed to the same 64-bit value.
+ *
  *  Exported for the per-item termination blade (S4): both blades hash with
  *  the same function so a per-item fingerprint and a round fingerprint are
  *  comparable evidence. */
@@ -235,12 +240,9 @@ export function stableHash64(text: string): string {
   let laneLow = 0x811c9dc5;
   let laneHigh = 0x01000193;
   for (let index = 0; index < text.length; index++) {
-    const code = text.charCodeAt(index) & 0xff;
+    const code = text.charCodeAt(index);
     laneLow = Math.imul(laneLow ^ code, 0x01000193) >>> 0;
-    laneHigh = Math.imul(
-      laneHigh ^ ((code << 1) | (text.charCodeAt(index) >>> 8)),
-      0x85ebca6b,
-    ) >>> 0;
+    laneHigh = Math.imul(laneHigh ^ code, 0x85ebca6b) >>> 0;
   }
   laneLow ^= text.length;
   laneHigh ^= 0x27d4eb2f ^ text.length;

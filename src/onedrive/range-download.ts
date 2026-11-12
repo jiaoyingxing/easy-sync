@@ -336,13 +336,25 @@ function isConnectionRangeFailure(error: unknown): boolean {
  *  only. */
 function classifyRangeStreamFailure(
   error: unknown,
-  signal: AbortSignal,
+  signal: AbortSignal | null | undefined,
 ): RangeStreamFailureKind {
-  if (signal.aborted) return "cancel";
+  if (signal?.aborted) return "cancel";
   if (isProtocolRangeFailure(error)) return "protocol";
   if (isConnectionRangeFailure(error)) return "connection";
   if (isAbortError(error)) return "cancel";
   return "terminal";
+}
+
+/** True when a failed multi-range attempt was a user cancel: a linked signal
+ *  abort, or an AbortError with no connection markers. Exported for the
+ *  caller's fallback short-circuit so both layers share the classifier's
+ *  priority (a transport-level AbortError must not skip the single-stream
+ *  fallback). */
+export function isRangeCancel(
+  error: unknown,
+  signal: AbortSignal | null | undefined,
+): boolean {
+  return classifyRangeStreamFailure(error, signal) === "cancel";
 }
 
 /** Returns null when Node https is unavailable (mobile): the caller then
@@ -421,8 +433,11 @@ export function createRangeStreamDownloader(
                 failFast: true,
               });
             } catch (error) {
-              if (isAbortError(error) || input.signal.aborted) throw error;
+              // Same cancel predicate as the outer catch: a transport-level
+              // AbortError with connection markers is a connection failure,
+              // not a user cancel.
               const kind = classifyRangeStreamFailure(error, input.signal);
+              if (kind === "cancel") throw error;
               diag?.warn(
                 "onedrive",
                 `${input.label} — multi-range degraded round failed at ${RANGE_DEGRADED_STREAMS} streams; falling back to single stream (streams=1)`,
@@ -441,8 +456,9 @@ export function createRangeStreamDownloader(
         }
 
         if (credit.total !== input.fileSize) {
-          // Fail closed: the assembled buffer is discarded with this promise;
-          // the caller falls back to the single-stream waterfall.
+          // Fail closed on the incomplete assembly, but keep the buffer: the
+          // catch below hands it to the single-stream resume instead of
+          // re-downloading what already landed.
           throw new OneDriveError(
             OneDriveErrorType.NetworkError,
             `${input.label} multi-range assembly incomplete (${credit.total}/${input.fileSize})`,
@@ -465,11 +481,12 @@ export function createRangeStreamDownloader(
         input.onProgress?.(input.fileSize, input.fileSize);
         return assembly.buffer;
       } catch (error) {
-        const aborted = isAbortError(error) || input.signal.aborted;
-        const failureKind = aborted
-          ? null
-          : classifyRangeStreamFailure(error, input.signal);
-        if (!aborted) {
+        // The classifier's priority is the only cancel rule here: an AbortError
+        // name alone is not enough, because Node shapes a torn socket as one
+        // too. Only a linked signal abort (or an AbortError with no connection
+        // markers) skips the partial hand-off and the failure evidence.
+        const failureKind = classifyRangeStreamFailure(error, input.signal);
+        if (failureKind !== "cancel") {
           // 回退不重下 (2026-10-28): whatever ended this attempt, the windows
           // that did land are assets. Hand the assembly and its first hole to
           // the caller so the single-stream fallback continues there instead
@@ -557,6 +574,11 @@ async function runRangeRound(options: RangeRoundOptions): Promise<RangeRoundOutc
   let fatalError: unknown = null;
   let connectionError: unknown = null;
   let userAborted = false;
+  /** The error that ended the round as a cancel. Re-throwing it instead of a
+   *  fresh synthetic AbortError keeps the shape honest: the synthetic message
+   *  ("Aborted") matches the connection-marker pattern, so a standalone cancel
+   *  would otherwise be re-classified as a connection failure one layer up. */
+  let cancelError: unknown = null;
 
   const runWorker = async (): Promise<void> => {
     while (!stopped && !controller.signal.aborted) {
@@ -575,6 +597,7 @@ async function runRangeRound(options: RangeRoundOptions): Promise<RangeRoundOutc
         });
       } catch (error) {
         if (input.signal.aborted) {
+          cancelError = error;
           userAborted = true;
           stopped = true;
           controller.abort();
@@ -585,8 +608,10 @@ async function runRangeRound(options: RangeRoundOptions): Promise<RangeRoundOutc
         if (controller.signal.aborted) return;
         const kind = classifyRangeStreamFailure(error, input.signal);
         if (kind === "cancel") {
-          // Standalone AbortError with no outer cancel: keep the historical
-          // propagation shape so the caller still treats it as a cancel.
+          // Standalone AbortError with no outer cancel: re-throw it unchanged
+          // so the next classifier still sees a cancel (a synthetic "Aborted"
+          // error would be read as a connection failure instead).
+          cancelError = error;
           userAborted = true;
           stopped = true;
           controller.abort();
@@ -621,6 +646,7 @@ async function runRangeRound(options: RangeRoundOptions): Promise<RangeRoundOutc
   }
 
   if (userAborted || input.signal.aborted) {
+    if (cancelError !== null) throw asThrownError(cancelError);
     throw Object.assign(new Error("Aborted"), { name: "AbortError" });
   }
   if (fatalError !== null) throw asThrownError(fatalError);

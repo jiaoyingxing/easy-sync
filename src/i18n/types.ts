@@ -618,9 +618,9 @@ export interface LocaleStrings {
   "reason.folder.local-source-changed": string;
   "reason.folder.parent-version-changed": string;
   "reason.folder.remote-version-changed": string;
-  "reason.folder.remote-content-version-unavailable": string;
   "reason.folder.local-create-unconfirmed": string;
   "reason.folder.local-inspection-failed": string;
+  "reason.folder.delete-wait-remote": string;
   "reason.circuitBreaker": string;
   "reason.circuitBreaker.network": string;
   "reason.circuitBreaker.remoteMoving": string;

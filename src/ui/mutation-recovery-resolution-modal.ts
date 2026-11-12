@@ -133,7 +133,9 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
     return this.awaitResult();
   }
 
-  /** One review modal at a time: same target rejected, another replaces. */
+  /** One review modal at a time: same target rejected, another replaces. A
+   *  promise-snapshot open has no target yet, so its key is null and a second
+   *  promise-snapshot open is rejected instead of replacing. */
   override open(): void {
     const key = this.snapshot?.path ?? null;
     if (!this.takeOverSingleInstance(key, { replace: true })) {

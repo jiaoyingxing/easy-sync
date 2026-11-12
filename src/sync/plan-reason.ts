@@ -2,8 +2,10 @@
  * 封闭的计划 reason 词汇表（重构刀 1）。
  *
  * `SyncPlanItem.reason` / `PlanReviewItem.reason` 此前是自由字符串。本表是
- * 唯一字面值来源：所有落进计划项 reason 的取值都属于 `PlanReason` 封闭联合
- * （39 值＝24 直产＋12 folder 派生＋3 熔断，均有真实生产点，tsc 闭合仲裁）。
+ * 计划项 reason 字面值的来源，`PlanReason` 封闭联合由 tsc 仲裁
+ * （39 值＝24 直产＋12 folder 派生＋3 熔断）。仍有裸字面量消费点
+ * （如 sync-executor 的 plannerIssueCodeForReason switch，契约门只扫
+ * `.reason ===/!==` 比较），改表值时须一并核对。
  *
  * 硬边界（方案单 §四）：reason 字面值被封进计划摘要（canonicalPlanItemFactsV2），
  * **任何字面值改动都会作废在途待确认计划的摘要比对**。本刀只加类型，字面值

@@ -171,8 +171,9 @@ describe("runRsMigrationTransaction", () => {
       remotelySaveDirId: "rs-dir-id",
       vaultDirId: SOURCE_DIR_ID,
     });
-    // Listings in order: destination pre-check (empty), source children,
-    // post-move destination (children + metadata file), cleanup re-list.
+    // Listings in order: destination pre-check (empty), source children, then
+    // the cleanup re-list (the persistent mock: children + metadata file after
+    // the move). The move-success path has no separate post-move destination read.
     harness.listChildren
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([

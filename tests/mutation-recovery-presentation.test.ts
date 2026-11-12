@@ -416,6 +416,8 @@ describe("folder recovery settle exit presentation", () => {
     const i18n = new I18n("zh-cn");
     const t = i18n.t.bind(i18n);
     const state = { ...base };
+    // 唯一判据是 manualResolutionAvailable；这里为 false（folder 记录由恢复批
+    // 自动结算，不是本函数的输入分支）。
 
     // Folder records auto-settle in the recovery batch: no top-slot button,
     // no settlement pointer — only the honest blocked status remains.
@@ -585,6 +587,26 @@ describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
     expect(actions?.every((action) => action.className === null)).toBe(true);
   });
 
+  it("offers a version choice when the move converged on one path with diverged content", () => {
+    // Both surviving copies sit at the target path (the source path is gone on
+    // both sides) but their bytes differ: the path move is complete and only
+    // the content decision remains (2026-11-11 field report, 1.3.8 -> 1.6.9).
+    const actions = resolveOrdinaryResolutionActions(moveSnapshot({
+      localTarget: true,
+      remoteTarget: true,
+      localHash: "b".repeat(64),
+    }));
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.keepLocalVersion",
+      "syncView.mutationResolution.keepRemoteVersion",
+    ]);
+    expect(actions?.map((action) => action.choice)).toEqual([
+      "keep-local",
+      "keep-remote",
+    ]);
+    expect(actions?.every((action) => action.className === null)).toBe(true);
+  });
+
   it("drops an unavailable direction instead of rendering it", () => {
     const actions = resolveOrdinaryResolutionActions(moveSnapshot({
       localTarget: true,
@@ -716,12 +738,16 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     expect(resolveOrdinaryResolutionActions(
       snapshotFor({ local: true, remote: true, bundle: true }),
     )).toBeNull();
-    // A move-style review with one copy per side but different content has no
-    // executable single-step settlement yet; the caller keeps the honest
-    // "do not delete either side" body (2026-10-31).
+    // A move record whose source path is gone and whose surviving copy sits at
+    // the same path on both sides is an ordinary version choice: the two-step
+    // create-then-retire settlement has nothing to retire, the chosen version
+    // simply overwrites the other at that path (2026-11-11 field report).
     expect(resolveOrdinaryResolutionActions(
       snapshotFor({ local: true, remote: true, sourcePath: "old/a.md" }),
-    )).toBeNull();
+    )?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.keepLocalVersion",
+      "syncView.mutationResolution.keepRemoteVersion",
+    ]);
   });
 
   it("pins the visible copy and the body slot", () => {

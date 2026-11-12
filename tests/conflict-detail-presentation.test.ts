@@ -5,6 +5,7 @@ import {
   getDiffLineNumberWidth,
 } from "../src/ui/conflict-detail-modal";
 import {
+  conflictHasMissingLocalSide,
   shouldAutoLoadRemoteComparison,
   summarizeConflictDetail,
 } from "../src/ui/conflict-detail-presentation";
@@ -199,6 +200,8 @@ describe("conflict detail presentation", () => {
 
     expect(source).toContain("localHighlighted: Boolean(localIsNewer)");
     expect(source).toContain("remoteHighlighted: Boolean(remoteIsNewer)");
+    expect(source).toContain("localHighlighted: localLarger");
+    expect(source).toContain("remoteHighlighted: remoteLarger");
     expect(sharedSource.match(/addClass\("easy-sync-meta-highlight"\)/g)).toHaveLength(2);
     expect(styles).toMatch(
       /\.easy-sync-meta-highlight\s*\{[^}]*color:\s*var\(--text-accent\);[^}]*font-weight:\s*600;/s,
@@ -285,6 +288,28 @@ describe("conflict detail presentation", () => {
     expect(automaticCall).toBeGreaterThan(
       source.indexOf("!shouldAutoLoadRemoteComparison("),
     );
+  });
+});
+
+describe("conflict detail missing local side", () => {
+  it("treats a deleted local side with a remote fact as known-absent", () => {
+    expect(conflictHasMissingLocalSide({ remote: { size: 3 } })).toBe(true);
+  });
+
+  it("keeps a carried local fact on the honest read-failure path", () => {
+    expect(conflictHasMissingLocalSide({
+      local: { size: 3 },
+      remote: { size: 3 },
+    })).toBe(false);
+    expect(conflictHasMissingLocalSide({ local: { size: 3 } })).toBe(false);
+  });
+
+  it("does not invent a missing local side without a remote fact", () => {
+    expect(conflictHasMissingLocalSide({})).toBe(false);
+    expect(conflictHasMissingLocalSide({
+      local: undefined,
+      remote: undefined,
+    })).toBe(false);
   });
 });
 

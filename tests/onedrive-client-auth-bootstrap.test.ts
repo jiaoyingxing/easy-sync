@@ -1,5 +1,6 @@
 // 鉴权与驱动器引导：CloudBootstrapV2 CAS、Vault 初始化、驱动器可用性
-// 由 tests/onedrive-client.test.ts 按主题拆分而来（纯搬运，用例名与断言未改）。
+// 由 tests/onedrive-client.test.ts 按主题拆分而来；此后 623c97f7 又向本文件
+// 新增了 legacy storage 等用例（不再是纯搬运）。
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as obsidian from "obsidian";
@@ -752,6 +753,121 @@ describe("OneDriveClient vault initialization", () => {
     const client = new OneDriveClient(async () => "token");
 
     await client.initVaultScope(vaultName);
+    await client.uploadFile(vaultName, "probe.md", new ArrayBuffer(1));
+
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: "PUT",
+      url: expect.stringContaining(`/vaults/${legacy}/files/probe.md:/content`),
+    }));
+  });
+
+  it("keeps the resolved legacy storage name across an expected-absence probe", async () => {
+    const vaultName = "中文测试仓库";
+    const canonical = encodeURIComponent(vaultName);
+    const legacy = encodeURIComponent(canonical);
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      const url = options.url;
+      if (url.endsWith("/vaults:/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { value: [
+            { id: "canonical", name: vaultName, folder: {} },
+            { id: "legacy", name: canonical, folder: {} },
+          ] },
+        };
+      }
+      if (url.includes(`/vaults/${canonical}/files/.obsidian/plugins:/children`)) {
+        return { status: 200, headers: {}, json: { value: [{ id: "easy-sync", name: "easy-sync", folder: {} }] } };
+      }
+      if (url.includes(`/vaults/${canonical}/files/.obsidian:/children`)) {
+        return { status: 200, headers: {}, json: { value: [{ id: "plugins", name: "plugins", folder: {} }] } };
+      }
+      if (url.includes(`/vaults/${canonical}/files:/children`)) {
+        return { status: 200, headers: {}, json: { value: [{ id: "obsidian", name: ".obsidian", folder: {} }] } };
+      }
+      if (url.includes(`/vaults/${legacy}/files:/children`)) {
+        return { status: 200, headers: {}, json: { value: [{ id: "notes", name: "Notes", folder: {} }] } };
+      }
+      if (url.includes(`/vaults/${legacy}/files/missing.md`)) {
+        return {
+          status: 404,
+          headers: {},
+          json: { error: { code: "itemNotFound", message: "not found" } },
+        };
+      }
+      if (url.endsWith("/me/drive/special/approot")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            id: "app-root",
+            name: "EasySync",
+            folder: {},
+            specialFolder: { name: "approot" },
+            parentReference: { driveId: "drive-id" },
+          },
+        };
+      }
+      if (url.endsWith("/me/drive/items/app-root/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { value: [{
+            id: "vaults-root-id",
+            name: "vaults",
+            folder: {},
+            parentReference: { id: "app-root", driveId: "drive-id" },
+          }] },
+        };
+      }
+      if (url.endsWith("/me/drive/items/vaults-root-id/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { value: [
+            {
+              id: "canonical",
+              name: vaultName,
+              folder: {},
+              parentReference: { id: "vaults-root-id", driveId: "drive-id" },
+            },
+            {
+              id: "legacy",
+              name: canonical,
+              folder: {},
+              parentReference: { id: "vaults-root-id", driveId: "drive-id" },
+            },
+          ] },
+        };
+      }
+      if (url.endsWith("/me/drive/items/legacy/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { value: [
+            {
+              id: "files-root-id",
+              name: "files",
+              folder: {},
+              parentReference: { id: "legacy", driveId: "drive-id" },
+            },
+            {
+              id: "plugin-root-id",
+              name: ".easy-sync",
+              folder: {},
+              parentReference: { id: "legacy", driveId: "drive-id" },
+            },
+          ] },
+        };
+      }
+      return { status: 200, headers: {}, json: { id: "uploaded", eTag: "etag" } };
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await client.initVaultScope(vaultName);
+    await expect(client.getDriveItemMetadata(vaultName, "missing.md"))
+      .resolves.toBeNull();
     await client.uploadFile(vaultName, "probe.md", new ArrayBuffer(1));
 
     expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({

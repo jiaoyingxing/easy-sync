@@ -1,7 +1,7 @@
 // S1 观测刀——每轮事实指纹、阻断项分类计数、连续两轮同指纹的「空转」判定。
 // 合同：docs/archive/2026-08/20260814-1155（事实指纹口径：scope／对象身份／
 //       本机内容摘要／远端 ID 与版本／共同基线版本／ledger 与审阅修订）＋
-//       docs/temp/20261016-151934 §六 S1 行／§七 观测判据／§八 不做范围。
+//       docs/archive/2026-11/20261016-151934 同步引擎第一性原理复校准 §六 S1 行／§七 观测判据／§八 不做范围。
 // 边界：输出只进诊断日志；零控制流改动（反向控制项钉住）、零用户可见面、
 //       零新增写入；比较状态只在内存、随插件实例生命周期持有、不持久化。
 
@@ -27,6 +27,7 @@ import {
   buildSyncRoundFingerprint,
   buildRoundBlockedClassifications,
   observeSyncRoundEnd,
+  stableHash64,
   type SyncIdleObservationInput,
 } from "../src/sync/sync-idle-observation";
 
@@ -142,9 +143,7 @@ const makeBreakerIssue = (overrides: Partial<PendingIssue> = {}): PendingIssue =
 function makeExecutor(
   state: ReturnType<typeof makeActiveV2State>,
   diag?: DiagnosticLogger,
-  remoteEntries: RemoteFileEntry[] = [STUCK_REMOTE],
 ): SyncExecutor {
-  void remoteEntries;
   return new SyncExecutor(
     makeMockOneDrive(makeActiveClientDefaults()),
     makeMockScanner(),
@@ -477,6 +476,18 @@ describe("S1 fact fingerprint composition", () => {
   });
 });
 
+// stableHash64 还被逐项终止指纹与本地删除授权事实哈希复用，所以它的碰撞面
+// 不只是观测噪声：成对可构造的完全碰撞会让两段不同事实得到同一个授权哈希。
+describe("stableHash64", () => {
+  it("separates code units that share a low byte but differ in the high byte", () => {
+    // 旧实现把低 8 位喂给 laneLow、把「(低字节 << 1) | 高字节」喂给 laneHigh：
+    // 两条 lane 的输入在高字节 bit1 上重叠，丁(U+4E01) 与 䰁(U+4C01) 因此
+    // 得到完全相同的 64 位输出（0636d90b733cfd40）。完整 16 位码元参与
+    // 混合后，同一长度的不同串在每条 lane 上都必须分开。
+    expect(stableHash64("丁.md")).not.toBe(stableHash64("䰁.md"));
+  });
+});
+
 // ---- Executor behavior: observation wiring at round end ----
 
 describe("S1 sync idle observation (executor wiring)", () => {
@@ -526,7 +537,7 @@ describe("S1 sync idle observation (executor wiring)", () => {
       setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
     });
-    const executor = makeExecutor(state as never, diag, []);
+    const executor = makeExecutor(state as never, diag);
 
     const first = await executor.run("manual", {});
     const second = await executor.run("manual", {});

@@ -51,7 +51,8 @@ describe("computeDiff", () => {
   });
 
   it("handles completely different files", () => {
-    // Generate sufficiently different content to exceed MAX_D
+    // Two 100-line files with completely different content (edit distance ≈ 200,
+    // still below MAX_D = 1000).
     const local = Array.from({ length: 100 }, (_, i) => `local-line-${i}`).join("\n");
     const remote = Array.from({ length: 100 }, (_, i) => `remote-line-${i}`).join("\n");
     const result = computeDiff(local, remote);

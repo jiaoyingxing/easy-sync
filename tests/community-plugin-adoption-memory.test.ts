@@ -90,6 +90,25 @@ describe("community-plugin adoption memory", () => {
     expect(same).toEqual(memory);
   });
 
+  it("ignore keeps the reader's canonical order for ids that compare differently", () => {
+    let memory = createEmptyCommunityPluginAdoptionMemory();
+    for (const pluginId of ["x-y", "x_y", "plugin-a", "plugin-A"]) {
+      memory = reduceCommunityPluginAdoptionMemory(memory, {
+        type: "ignore",
+        pluginId,
+      });
+      // The reader is the canonical authority and state-manager validates
+      // every persisted memory with it before writing.
+      expect(() => readCommunityPluginAdoptionMemory(memory)).not.toThrow();
+    }
+    expect(memory.ignoredPluginIds).toEqual([
+      "plugin-a",
+      "plugin-A",
+      "x_y",
+      "x-y",
+    ]);
+  });
+
   it("reconcile replaces the pending set canonically", () => {
     let memory = createEmptyCommunityPluginAdoptionMemory();
     memory = reduceCommunityPluginAdoptionMemory(memory, {

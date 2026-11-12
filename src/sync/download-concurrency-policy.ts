@@ -62,7 +62,7 @@ interface DownloadBatchObservation {
  * Conservative, per-run download concurrency controller.
  *
  * Pre-lock ramp (unchanged): every sync round starts at one, two healthy
- * batches reach two, four reach the platform ceiling (3 desktop / 2 mobile).
+ * batches reach two, four reach the platform ceiling (4 desktop / 2 mobile).
  * "Healthy" is bandwidth evidence, or — since {@link isSmallFileHealthyBatch}
  * — a completed transfer in the small-file tier that showed a real request
  * window; the 512 KiB/s gate alone could never open for 18-byte notes.
@@ -90,7 +90,7 @@ export class DownloadConcurrencyPolicy {
   /** Consecutive completed small-file batches without bandwidth evidence. */
   private smallFileBatches = 0;
 
-  /** Platform ceiling: desktop adapts 1 → 2 → 3; mobile is capped at 2
+  /** Platform ceiling: desktop adapts 1 → 2 → 4; mobile is capped at 2
    *  (A2 mobile read-only prefetch — memory bound 2 × ≤8 MiB in flight). */
   constructor(
     private readonly maxConcurrency = ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,

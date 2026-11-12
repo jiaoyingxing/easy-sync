@@ -659,9 +659,9 @@ describe("V2 folder anchors and pure planner", () => {
   });
 
   // A1 新建接缝（create-remote 同型）：分歧父未锚定时文件夹层仍会发出 create-remote
-  // 候选（上游条件闸 folder-state-v2.ts:378 只在同轮有锚点落进
-  // local-rename-evidence-conflict 时为真）。该形状的合同钉子同样锚在计划层
-  // （tests/canonical-plan-v2.test.ts「A1 拼写别名」的零 CreateRemoteFolder 一条）。
+  // 候选（上游条件闸在缺本机侧疑案分支同样把 unresolvedLocalIdentity 计入）。该形状的
+  // 合同钉子同样锚在计划层（tests/canonical-plan-v2.test.ts「A1 拼写别名」的零
+  // CreateRemoteFolder 一条）。
 
   it("keeps an exact folder move independent from a changed incoming file", () => {
     const current = envelope({
@@ -1482,6 +1482,91 @@ describe("V2 folder anchors and pure planner", () => {
     });
     expect(ambiguous.items.some((item) =>
       item.type === "conflict" && item.reason === "anchored-folder-missing-local")).toBe(true);
+  });
+
+  it("keeps planning unrelated one-sided folder creates while a rename suspect holds the anchor (2026-11-11 freeze scope)", () => {
+    // Field shape (1.6.9 report 20261111): one anchored folder's identity is
+    // undecidable after a user reorganisation, and the global
+    // unresolvedLocalIdentity flag then suppressed EVERY unanchored create —
+    // deferrals grew 42→106 across eight rounds while unrelated new folders
+    // were plain victims. The freeze must cover only the rename suspects
+    // (byte-level content overlap with the anchor's descendants) and their
+    // subtrees; folders with no content overlap plan their ordinary creates.
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [
+          { id: "old", name: "Old" },
+          { id: "unrelated-remote", name: "UnrelatedRemote" },
+        ],
+        fileAnchors: [fileAnchor("note-old", "Old/note.md", hashA, 10)],
+        folderAnchors: [folderAnchor("old", "Old")],
+      }),
+      // The anchor's bytes reappear inside TWO unclaimed folders, so no single
+      // inferred destination exists and the missing-local branch judges both
+      // as rename suspects ("OldRenamed" and "SecondSuspect"). "Fresh" carries
+      // only its own disjoint bytes: no overlap, not a suspect, not an empty
+      // shell — it must not share their freeze.
+      localFiles: [
+        localFile("OldRenamed/note.md", hashA, 10),
+        localFile("SecondSuspect/note.md", hashA, 10),
+        localFile("Fresh/readme.md", hashB, 20),
+      ],
+      localFolders: localFolders("OldRenamed", "SecondSuspect", "Fresh"),
+      localFolderScanComplete: true,
+    });
+    // The suspects themselves stay frozen for review (anchored missing-local
+    // conflict names both)…
+    const conflict = report.items.find((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local");
+    expect(conflict).toEqual(expect.objectContaining({ path: "Old" }));
+    expect(conflict?.affectedPaths).toEqual(
+      expect.arrayContaining(["OldRenamed", "SecondSuspect"]));
+    // …and neither suspect plans a create while the ambiguity holds.
+    expect(report.items).not.toContainEqual(expect.objectContaining({
+      type: "create-remote",
+      path: "OldRenamed",
+    }));
+    expect(report.items).not.toContainEqual(expect.objectContaining({
+      type: "create-remote",
+      path: "SecondSuspect",
+    }));
+    // …while the unrelated fresh folders keep their ordinary one-sided
+    // creates: local-only "Fresh" uploads, remote-only "UnrelatedRemote"
+    // downloads. Neither carries any byte of the anchor's descendants.
+    expect(report.items).toContainEqual(expect.objectContaining({
+      type: "create-remote",
+      path: "Fresh",
+    }));
+    expect(report.items).toContainEqual(expect.objectContaining({
+      type: "create-local",
+      path: "UnrelatedRemote",
+    }));
+  });
+
+  it("keeps the remote-side freeze scoped to the missing-remote path pair (2026-11-11 freeze scope)", () => {
+    // Mirror direction: the anchor's cloud folder is gone and the local one
+    // moved, so the pair is undecided (anchored-folder-missing-remote). An
+    // unrelated remote-only folder must still plan its local create instead
+    // of being globally suppressed by unresolvedRemoteIdentity.
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "unrelated-remote", name: "UnrelatedRemote" }],
+        fileAnchors: [fileAnchor("note-old", "Old/note.md", hashA, 10)],
+        folderAnchors: [folderAnchor("old", "Old")],
+      }),
+      localFiles: [localFile("OldRenamed/note.md", hashA, 10)],
+      localFolders: localFolders("OldRenamed"),
+      localFolderScanComplete: true,
+    });
+    expect(report.items).toContainEqual(expect.objectContaining({
+      type: "conflict",
+      reason: "anchored-folder-missing-remote",
+      path: "Old",
+    }));
+    expect(report.items).toContainEqual(expect.objectContaining({
+      type: "create-local",
+      path: "UnrelatedRemote",
+    }));
   });
 
   it("mirrors an in-app folder deletion when delete-gesture evidence binds the anchor (P1)", () => {

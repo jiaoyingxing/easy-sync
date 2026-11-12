@@ -351,12 +351,25 @@ describe("range stream downloader (C Node h1 载体)", () => {
       { chunks: [new Uint8Array([1, 2])], contentRange: "bytes 0-3/8", hangNext: true },
       { chunks: [new Uint8Array([5, 6, 7, 8])], contentRange: "bytes 4-7/8" },
     ]);
+    const connectionFailures: number[] = [];
     const downloader = createRangeStreamDownloader(https as never)!;
 
-    const pending = downloader.download(makeInput({ signal: controller.signal }));
+    const pending = downloader.download(makeInput({
+      signal: controller.signal,
+      adaptation: {
+        nowMs: () => 0,
+        recordCleanTransfer: () => {},
+        recordConnectionFailure: () => { connectionFailures.push(1); },
+        recordRateLimited: () => {},
+      },
+    }));
     await vi.advanceTimersByTimeAsync(1);
     controller.abort();
-    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    const failure = await pending.then(() => null, (error: unknown) => error);
+    expect(failure).toMatchObject({ name: "AbortError" });
+    // A cancel is neither resumable nor a connection failure.
+    expect(readRangePartialDownload(failure)).toBeNull();
+    expect(connectionFailures).toHaveLength(0);
     // window A used exactly one request: user cancel never reconnects
     expect(requestCount()).toBe(2);
   });
@@ -385,11 +398,19 @@ describe("range stream recovery after a failed multi-stream pass (2026-10-27 G1)
 
   type RangeServerFault =
     | "connection"
+    /** Transport teardown that Node reports with `name: "AbortError"` (the
+     *  message/code still mark it as a connection fault). It must not be
+     *  mistaken for a user cancel. */
+    | "connection-abort-name"
     | "http2"
     | "connection-after-body"
     /** Socket dies before the first body byte: the window keeps whatever a
      *  previous attempt had already landed (zero on its first attempt). */
     | "connection-before-body"
+    /** Cancel-shaped AbortError with no connection markers and no outer signal
+     *  abort: it must stay a cancel, not become a synthetic "Aborted" error
+     *  that the next classifier reads as a connection failure. */
+    | "standalone-abort"
     | "protocol"
     | null;
 
@@ -455,19 +476,32 @@ describe("range stream recovery after a failed multi-stream pass (2026-10-27 G1)
 
           const mode = fault(record);
           const rejectBeforeBody = mode === "connection-before-body";
+          const standaloneAbort = mode === "standalone-abort";
           const connectionFault = mode === "connection"
+            || mode === "connection-abort-name"
             || mode === "http2"
             || mode === "connection-after-body"
             || rejectBeforeBody;
           const body = source.subarray(start, end + 1);
-          const firstChunk = mode === "connection" || mode === "http2"
+          const firstChunk = mode === "connection"
+            || mode === "connection-abort-name"
+            || mode === "http2"
             ? body.subarray(0, Math.ceil(body.byteLength / 2))
             : body;
           const transportError = mode === "http2"
             ? Object.assign(new Error("ERR_HTTP2_PROTOCOL_ERROR"), {
               code: "ERR_HTTP2_PROTOCOL_ERROR",
             })
-            : Object.assign(new Error("aborted"), { code: "ECONNRESET" });
+              : mode === "connection-abort-name"
+                ? Object.assign(new Error("Aborted"), {
+                  name: "AbortError",
+                  code: "ECONNRESET",
+                })
+                : mode === "standalone-abort"
+                  ? Object.assign(new Error("user cancelled"), {
+                    name: "AbortError",
+                  })
+                  : Object.assign(new Error("aborted"), { code: "ECONNRESET" });
           const node = {
             statusCode: mode === "protocol" ? 200 : 206,
             headers: {
@@ -481,6 +515,10 @@ describe("range stream recovery after a failed multi-stream pass (2026-10-27 G1)
               return {
                 next: (): Promise<IteratorResult<Uint8Array>> => {
                   if (rejectBeforeBody) {
+                    settle();
+                    return Promise.reject(transportError);
+                  }
+                  if (standaloneAbort) {
                     settle();
                     return Promise.reject(transportError);
                   }
@@ -690,6 +728,109 @@ describe("range stream recovery after a failed multi-stream pass (2026-10-27 G1)
     // Aborts and unrelated errors never carry a resume position.
     expect(readRangePartialDownload(new Error("aborted"))).toBeNull();
     expect(readRangePartialDownload(null)).toBeNull();
+  });
+
+  it("G: treats a bare AbortError from the degraded round as a connection failure, not a cancel", async () => {
+    const source = patternedSource(WINDOW_BYTES * WINDOW_COUNT);
+    // Node shapes a torn socket as `name: "AbortError"` while the message/code
+    // still mark it as a connection fault. The classifier checks the connection
+    // markers first; the degraded-round catch must not short-circuit on the
+    // name before that.
+    const server = makeRangeServer(source, () => "connection-abort-name");
+    const { diag, warnings } = makeDiagSpy();
+    const connectionFailures: number[] = [];
+    const downloader = createRangeStreamDownloader(server.https as never, diag)!;
+
+    const failure = await downloader.download({
+      ...downloadInput(source),
+      adaptation: {
+        nowMs: () => 0,
+        recordCleanTransfer: () => {},
+        recordConnectionFailure: () => { connectionFailures.push(1); },
+        recordRateLimited: () => {},
+      },
+    }).then(() => null, (error: unknown) => error);
+
+    // The original transport error keeps its identity (name included).
+    expect(failure).toMatchObject({ name: "AbortError", code: "ECONNRESET" });
+    // The degraded round still logs its downgrade diagnosis ...
+    expect(warnings.some((message) =>
+      message.includes("degraded round failed at 4 streams")
+      && message.includes("streams=1"))).toBe(true);
+    // ... the landed bytes still reach the single-stream fallback ...
+    const partial = readRangePartialDownload(failure)!;
+    expect(partial).not.toBeNull();
+    expect(partial.landedOffset).toBeGreaterThan(0);
+    // ... and the tier is still recorded as a connection failure.
+    expect(connectionFailures).toHaveLength(1);
+  });
+
+  it("H: hands off the partial for a bare AbortError even when no lower tier exists", async () => {
+    const source = patternedSource(WINDOW_BYTES * 2);
+    const server = makeRangeServer(source, () => "connection-abort-name");
+    const { diag, warnings } = makeDiagSpy();
+    const connectionFailures: number[] = [];
+    const downloader = createRangeStreamDownloader(server.https as never, diag)!;
+    const windows: RangeWindow[] = [
+      { start: 0, end: WINDOW_BYTES - 1 },
+      { start: WINDOW_BYTES, end: source.byteLength - 1 },
+    ];
+
+    const failure = await downloader.download({
+      ...downloadInput(source),
+      windows,
+      adaptation: {
+        nowMs: () => 0,
+        recordCleanTransfer: () => {},
+        recordConnectionFailure: () => { connectionFailures.push(1); },
+        recordRateLimited: () => {},
+      },
+    }).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({ name: "AbortError", code: "ECONNRESET" });
+    // Two streams is already the lowest multi-stream tier, so there is no
+    // degraded round and no downgrade warning — but the half window that did
+    // land must still be handed to the single-stream fallback.
+    const partial = readRangePartialDownload(failure)!;
+    expect(partial).not.toBeNull();
+    expect(partial.landedOffset).toBe(Math.ceil(WINDOW_BYTES / 2));
+    expect(connectionFailures).toHaveLength(1);
+    expect(warnings.some((message) =>
+      message.includes("degraded round failed"))).toBe(false);
+  });
+
+  it("I: rethrows a standalone AbortError unchanged instead of a synthetic connection-shaped one", async () => {
+    const source = patternedSource(WINDOW_BYTES * 2);
+    // No outer abort and no connection markers: this is a cancel, not a torn
+    // socket. The round used to replace it with `new Error("Aborted")`, whose
+    // message matches the connection pattern and made the outer catch attach a
+    // partial and record a connection failure.
+    const server = makeRangeServer(source, () => "standalone-abort");
+    const { diag } = makeDiagSpy();
+    const connectionFailures: number[] = [];
+    const downloader = createRangeStreamDownloader(server.https as never, diag)!;
+    const windows: RangeWindow[] = [
+      { start: 0, end: WINDOW_BYTES - 1 },
+      { start: WINDOW_BYTES, end: source.byteLength - 1 },
+    ];
+
+    const failure = await downloader.download({
+      ...downloadInput(source),
+      windows,
+      adaptation: {
+        nowMs: () => 0,
+        recordCleanTransfer: () => {},
+        recordConnectionFailure: () => { connectionFailures.push(1); },
+        recordRateLimited: () => {},
+      },
+    }).then(() => null, (error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      name: "AbortError",
+      message: "user cancelled",
+    });
+    expect(readRangePartialDownload(failure)).toBeNull();
+    expect(connectionFailures).toHaveLength(0);
   });
 });
 

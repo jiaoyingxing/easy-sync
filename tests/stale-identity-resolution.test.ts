@@ -394,14 +394,13 @@ describe("reviewed stale identity retirement", () => {
       };
       // The folder-state conflict must actually be produced for this code to
       // reach the builder; each shape has its own local/remote precondition,
-      // so only assert the builder returns null gracefully for shapes that do
-      // not currently produce the deferred row (fail-closed), while the code
-      // is accepted as a valid issue code (does not throw).
-      expect(() => buildStaleIdentityResolutionSnapshotV1(
+      // so assert the builder returns null for shapes that do not currently
+      // produce the deferred row (fail-closed).
+      expect(buildStaleIdentityResolutionSnapshotV1(
         "Notes",
         code,
         facts(envelope, [], []),
-      )).not.toThrow();
+      )).toBeNull();
     }
   });
 });

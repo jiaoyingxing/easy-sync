@@ -8,9 +8,11 @@
  *  - unknown errors: returned as null so callers keep the raw message —
  *    never guess a cause for an unmapped error.
  *
- * English users always receive the raw message: `presentKnownError` returns
- * null for the file/internal tables when the locale is English, so the
- * English locale never displays template placeholders or fabricated copy.
+ * English users receive the raw message for the file/internal tables:
+ * `presentKnownError` returns null for those when the locale is English.
+ * Plugin-bundle errors keep their parameterized English templates in both
+ * locales, so the English locale never displays template placeholders or
+ * fabricated copy.
  */
 
 import type { LocaleStrings } from "./types";

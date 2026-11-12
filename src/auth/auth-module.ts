@@ -189,8 +189,9 @@ export class AuthModule {
   /** In-flight poll tick so manual/immediate checks never race a timer tick */
   private deviceTickPromise: Promise<void> | null = null;
 
-  /** Start time of the last poll tick — immediate checks respect a gap so a
-   *  focus storm cannot hammer the provider faster than its interval */
+  /** Start time of the last poll tick — immediate checks respect a fixed 2s
+   *  gap so a focus storm cannot hammer the provider on every event (the
+   *  provider's own interval is usually longer) */
   private lastDeviceTickAt = 0;
 
   /** Poll tick counter for per-tick diagnostics */
@@ -504,9 +505,9 @@ export class AuthModule {
    *  is opened here, so this may be awaited freely — the "open verification
    *  page" action happens later on its own user click inside the modal.
    *
-   *  Returns the attempt view for the waiting modal; on failure the previous
-   *  attempt is left untouched only if the request itself failed before
-   *  replacing it (the caller decides whether to retry). */
+   *  Returns the attempt view for the waiting modal; any previous attempt is
+   *  replaced before the request is sent, so a failed request leaves the new
+   *  attempt (the caller decides whether to retry). */
   async beginDeviceCodeLogin(): Promise<DeviceCodeAttemptView> {
     this.diag?.log("auth", `beginDeviceCodeLogin() called, isLoggedIn=${this.state.isLoggedIn}, isPending=${!!this.pending}`);
 
@@ -1022,10 +1023,18 @@ export class AuthModule {
           // transition to logged-out.
           throw error;
         }
-        // Transient (network flake, 5xx, timeout, unexpected provider
-        // rejection): the stored credential is still valid, so the session
-        // stays logged in and a later attempt retries. Unified as NetworkError
-        // so downstream classification never mistakes this for a logout.
+        if (error.type === AuthErrorType.NetworkError) {
+          // Already a transient transport failure with its own localized
+          // message. Re-wrapping would nest the error copy (the field log
+          // read "认证网络错误：认证网络错误：net::ERR_NETWORK_IO_SUSPENDED")
+          // and bury the original transport detail. Keep the single
+          // classification downstream already relies on.
+          throw error;
+        }
+        // Transient (5xx, timeout, unexpected provider rejection): the stored
+        // credential is still valid, so the session stays logged in and a
+        // later attempt retries. Unified as NetworkError so downstream
+        // classification never mistakes this for a logout.
         throw new AuthError(
           AuthErrorType.NetworkError,
           this.tr("auth.error.networkError", "Network error during authentication.", {

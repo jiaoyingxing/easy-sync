@@ -1290,6 +1290,96 @@ describe("one-way local-only copy (仅接收片②)", () => {
       expect(harness.copyEntries.some((entry) => entry.path === path)).toBe(false);
     }
   });
+  it("keeps the round's record upkeep identical while a path is ignored", async () => {
+    const roundWithIgnore = async (ignored: readonly string[]) => {
+      const harness = await makeCopyHarness({ remoteText: baseText });
+      Object.assign(harness.state as never as Record<string, unknown>, {
+        localOnlyIgnoreMemory: {
+          schemaVersion: 1,
+          kind: "local-only-ignore-memory",
+          ignoredPaths: [...ignored],
+        },
+      });
+      harness.executor.setSyncDirection("one-way");
+      await harness.executor.run("manual", {}, true);
+      return {
+        copies: [...harness.state.localOnlyCopyEntries],
+        note: textAt(harness.files, notePath),
+        copy: textAt(harness.files, harness.copyPath),
+        base: harness.state.baseSnapshot.map((entry) => entry.path),
+      };
+    };
+
+    const plain = await roundWithIgnore([]);
+    const ignored = await roundWithIgnore([copyNameFor(notePath, localMtime)]);
+
+    // 忽略只影响提醒：副本照留、原路径照还原、记录照写、基线照更新。
+    // 记录时间戳取 Date.now()，比较时只看路径/类别等事实。
+    const stripTimes = (run: typeof plain) => ({
+      ...run,
+      copies: run.copies.map((entry) => ({
+        version: entry.version,
+        path: entry.path,
+        copyPath: entry.copyPath,
+        kind: entry.kind,
+      })),
+    });
+    expect(stripTimes(ignored)).toEqual(stripTimes(plain));
+    expect(ignored.copies).toHaveLength(1);
+    expect(ignored.copy).toBe(localText);
+    expect(ignored.note).toBe(baseText);
+  });
+
+  it("follows a remote deletion in one-way mode without any pending delete row", async () => {
+    // 双向对照：同一个夹具在默认策略（不跟随）下会登记一条待确认删除。
+    const twoWay = await makeCopyHarness({
+      // 本机内容与基线一致（未被改过）＝"远端删除、本机照做"的待确认形态；
+      // 本机改动过的形态是冲突行，不属于本用例。
+      localText: baseText,
+      remoteText: baseText,
+      remoteMissing: true,
+    });
+    const twoWayRound = await twoWay.executor.run("manual", {}, true);
+    expect(twoWay.upsertPendingDeletes).toHaveBeenCalled();
+    expect(textAt(twoWay.files, notePath)).toBe(baseText);
+    expect(twoWayRound.metrics?.automaticHandling.deleteLocal).toMatchObject({
+      candidates: 0,
+      completed: 0,
+      failed: 0,
+    });
+
+    // 单向：删除直接跟随（本机文件被删），且不出现待确认删除；执行计数按
+    // 生效策略记到 completed（片⑥ 收口）。
+    const oneWay = await makeCopyHarness({
+      localText: baseText,
+      remoteText: baseText,
+      remoteMissing: true,
+    });
+    oneWay.executor.setSyncDirection("one-way");
+    const round = await oneWay.executor.run("manual", {}, true);
+    expect(oneWay.upsertPendingDeletes).not.toHaveBeenCalled();
+    expect(textAt(oneWay.files, notePath)).toBeUndefined();
+    expect(round.deleted).toBe(1);
+    expect(round.metrics?.automaticHandling.deleteLocal).toMatchObject({
+      candidates: 1,
+      completed: 1,
+      failed: 0,
+    });
+    // 第四个读点（pendingDeleteRemovals）同样按生效策略：结算回执里必须带着
+    // 这条路径的待确认删除清账，否则下次同步会重新冒出同一行。
+    const combinedWrites = vi.mocked(
+      oneWay.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls;
+    expect(combinedWrites.flatMap((call) => call[0])).toContainEqual(
+      expect.objectContaining({
+        checkpoint: expect.objectContaining({
+          pendingDeleteRemovals: [notePath],
+        }),
+      }),
+    );
+  });
+
+});
 
 /**
  * 片④ 单向模式「上传到云端」动作——真实执行器证据。
@@ -1619,95 +1709,6 @@ describe("one-way local-only upload action (片④)", () => {
     expect(harness.uploadFile).not.toHaveBeenCalled();
   });
 
-  it("keeps the round's record upkeep identical while a path is ignored", async () => {
-    const roundWithIgnore = async (ignored: readonly string[]) => {
-      const harness = await makeCopyHarness({ remoteText: baseText });
-      Object.assign(harness.state as never as Record<string, unknown>, {
-        localOnlyIgnoreMemory: {
-          schemaVersion: 1,
-          kind: "local-only-ignore-memory",
-          ignoredPaths: [...ignored],
-        },
-      });
-      harness.executor.setSyncDirection("one-way");
-      await harness.executor.run("manual", {}, true);
-      return {
-        copies: [...harness.state.localOnlyCopyEntries],
-        note: textAt(harness.files, notePath),
-        copy: textAt(harness.files, harness.copyPath),
-        base: harness.state.baseSnapshot.map((entry) => entry.path),
-      };
-    };
-
-    const plain = await roundWithIgnore([]);
-    const ignored = await roundWithIgnore([copyNameFor(notePath, localMtime)]);
-
-    // 忽略只影响提醒：副本照留、原路径照还原、记录照写、基线照更新。
-    // 记录时间戳取 Date.now()，比较时只看路径/类别等事实。
-    const stripTimes = (run: typeof plain) => ({
-      ...run,
-      copies: run.copies.map((entry) => ({
-        version: entry.version,
-        path: entry.path,
-        copyPath: entry.copyPath,
-        kind: entry.kind,
-      })),
-    });
-    expect(stripTimes(ignored)).toEqual(stripTimes(plain));
-    expect(ignored.copies).toHaveLength(1);
-    expect(ignored.copy).toBe(localText);
-    expect(ignored.note).toBe(baseText);
-  });
-
-  it("follows a remote deletion in one-way mode without any pending delete row", async () => {
-    // 双向对照：同一个夹具在默认策略（不跟随）下会登记一条待确认删除。
-    const twoWay = await makeCopyHarness({
-      // 本机内容与基线一致（未被改过）＝"远端删除、本机照做"的待确认形态；
-      // 本机改动过的形态是冲突行，不属于本用例。
-      localText: baseText,
-      remoteText: baseText,
-      remoteMissing: true,
-    });
-    const twoWayRound = await twoWay.executor.run("manual", {}, true);
-    expect(twoWay.upsertPendingDeletes).toHaveBeenCalled();
-    expect(textAt(twoWay.files, notePath)).toBe(baseText);
-    expect(twoWayRound.metrics?.automaticHandling.deleteLocal).toMatchObject({
-      candidates: 0,
-      completed: 0,
-      failed: 0,
-    });
-
-    // 单向：删除直接跟随（本机文件被删），且不出现待确认删除；执行计数按
-    // 生效策略记到 completed（片⑥ 收口）。
-    const oneWay = await makeCopyHarness({
-      localText: baseText,
-      remoteText: baseText,
-      remoteMissing: true,
-    });
-    oneWay.executor.setSyncDirection("one-way");
-    const round = await oneWay.executor.run("manual", {}, true);
-    expect(oneWay.upsertPendingDeletes).not.toHaveBeenCalled();
-    expect(textAt(oneWay.files, notePath)).toBeUndefined();
-    expect(round.deleted).toBe(1);
-    expect(round.metrics?.automaticHandling.deleteLocal).toMatchObject({
-      candidates: 1,
-      completed: 1,
-      failed: 0,
-    });
-    // 第四个读点（pendingDeleteRemovals）同样按生效策略：结算回执里必须带着
-    // 这条路径的待确认删除清账，否则下次同步会重新冒出同一行。
-    const combinedWrites = vi.mocked(
-      oneWay.state.recordMutationReceiptsAndCloudDeletions,
-    ).mock.calls;
-    expect(combinedWrites.flatMap((call) => call[0])).toContainEqual(
-      expect.objectContaining({
-        checkpoint: expect.objectContaining({
-          pendingDeleteRemovals: [notePath],
-        }),
-      }),
-    );
-  });
-
   it("does nothing in two-way mode", async () => {
     const harness = await makeUploadHarness({ direction: "two-way" });
 
@@ -1867,6 +1868,5 @@ describe("one-way local-only upload action (片④)", () => {
     expect(excluded.createFolderPath).not.toHaveBeenCalled();
     expect(excluded.uploadFile).not.toHaveBeenCalled();
   });
-});
 });
 

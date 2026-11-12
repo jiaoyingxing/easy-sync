@@ -65,6 +65,7 @@ describe("OneDriveClient.getFileMetadataByPaths", () => {
   it("isolates a failed 20-path chunk so only its own paths degrade to per-item reads", async () => {
     const paths = Array.from({ length: 25 }, (_unused, index) => `chunk-${index}.md`);
     let batchPosts = 0;
+    let failedChunkPosts = 0;
     const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(
       async (request) => {
         const body = JSON.parse(request.body as string) as {
@@ -72,6 +73,7 @@ describe("OneDriveClient.getFileMetadataByPaths", () => {
         };
         batchPosts++;
         if (body.requests[0].url.includes("chunk-0.md")) {
+          failedChunkPosts++;
           // The first chunk's POST fails with a gateway timeout; the client
           // retries it, then isolates it.
           return {
@@ -109,6 +111,10 @@ describe("OneDriveClient.getFileMetadataByPaths", () => {
     }
     // One POST for the healthy chunk plus the failed chunk's own attempts.
     expect(batchPosts).toBeGreaterThan(1);
+    // The failed chunk is retried before isolation (default
+    // MAX_REQUEST_ATTEMPTS=3: initial + two retries), so its POST count
+    // proves the retry rather than just the 20+5 chunking.
+    expect(failedChunkPosts).toBe(3);
     expect(requestSpy).toHaveBeenCalledTimes(batchPosts);
   });
 });

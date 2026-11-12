@@ -409,7 +409,7 @@ describe("RecoveryModal list", () => {
     expect(byClass(rows[1], "easy-sync-recovery-time")?.textContent)
       .toBe(new Date(STAMP_AT).toLocaleString());
     expect(byClass(rows[1], "easy-sync-recovery-size")?.textContent).toBe("12 B");
-    // 行主体不是按钮：动作用户看得见的只有详情页脚。
+    // 行主体不是按钮：动作用户看得见的只有详情头部 .easy-sync-recovery-header-actions。
     expect(rows[0].__tag).toBe("div");
     expect(allByClass(rows[0], "easy-sync-detail-actions")).toHaveLength(0);
   });

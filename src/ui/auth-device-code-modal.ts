@@ -1,8 +1,8 @@
 /**
  * AuthDeviceCodeModal — waiting room for a device code login attempt.
  *
- * Shows the big 9-character code, opens the pre-filled verification page
- * (same-device path: zero typing), offers manual copy for another device,
+ * Shows the big 9-character code, copies it and opens the verification page
+ * (same-device path: one paste), offers manual copy for another device,
  * counts down to expiry, and auto-completes when the poll succeeds — the
  * user never has to press anything after returning from the browser.
  *

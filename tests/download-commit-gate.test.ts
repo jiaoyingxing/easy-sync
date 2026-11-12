@@ -8,7 +8,7 @@ import type { LocalScanner } from "../src/sync/types";
 /**
  * 落盘门 `commitDownloadedTempFile` 的写后状态分档（`DECISIONS` 2026-09-23 第 9 点）。
  *
- * 门是九处调用共用的唯一用户文件替换入口，判据只有一条：写完回读磁盘看到什么。
+ * 门是八处调用共用的唯一用户文件替换入口，判据只有一条：写完回读磁盘看到什么。
  * 这里钉住——宿主可见的文件走原地写（不改名、暂存文件清掉、留底退休）；宿主把
  * 未保存的行合并进来算落地且记账仍是云端版本；写入没落地时文件不被改动；宿主
  * 不认得的路径保持原子替换；本地事实与扫描不符时在写之前就停下。
@@ -208,7 +208,7 @@ describe("commitDownloadedTempFile", () => {
       await versionOf("remote\n"),
     );
 
-    // 记账仍是云端版本（8B），不是磁盘上的合并结果；合并结果留给下一轮按本机改动上传。
+    // 记账仍是云端版本（7B），不是磁盘上的合并结果；合并结果留给下一轮按本机改动上传。
     expect(result).toEqual({ size: REMOTE_SIZE, mtime: 1 });
     expect(DECODER.decode(harness.files.get("note.md"))).toBe("remote\nuser typed\n");
     expect(harness.warnings.some((line) => line.includes("merged unsaved editor text"))).toBe(true);

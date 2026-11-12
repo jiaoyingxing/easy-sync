@@ -575,7 +575,8 @@ describe("StateEnvelopeV2Store", () => {
     }));
     spies.rename.mockRejectedValue(new Error("Unable to rename, unknown reason"));
     // 写通道被挂载层篡改（读回与写入源不一致）：必须拒绝，宁可本轮失败、
-    // 下一轮恢复，也不能让不可信内容占住已提交槽。
+    // 下一轮恢复，也不能让不可信内容占住已提交槽。本用例后面三轮分别验证：
+    // 篡改轮拒绝、仍篡改时保留 previous、通道恢复后写回旧信封并结清 journal。
     spies.write.mockImplementation(async (path: string, value: string) => {
       if (path === paths.committed) {
         const tampered = JSON.parse(value);
@@ -591,6 +592,25 @@ describe("StateEnvelopeV2Store", () => {
     expect(files.has(paths.committed)).toBe(true);
     expect(JSON.parse(files.get(paths.committed)!).remoteIndex.cursorRevision)
       .toBe(999);
+    // 下一轮仍被篡改：篡改内容与 journal 绑定的 previous 同序号但内容不同，
+    // 不得当成「已回滚」清理——完好的 previous 必须保留到通道恢复。
+    await expect(store.recoverInterruptedPublish(envelope().scope))
+      .rejects.toThrow("Unable to rename, unknown reason");
+    expect(files.has(paths.previous)).toBe(true);
+    expect(JSON.parse(files.get(paths.previous)!).remoteIndex.cursorRevision)
+      .toBe(1);
+    expect(JSON.parse(files.get(paths.committed)!).remoteIndex.cursorRevision)
+      .toBe(999);
+    // 通道恢复后下一轮把 previous 写回并结清 journal。
+    spies.write.mockImplementation(async (path: string, value: string) => {
+      files.set(path, value);
+    });
+    await expect(store.recoverInterruptedPublish(envelope().scope))
+      .resolves.toBe("rolled-back");
+    expect(JSON.parse(files.get(paths.committed)!)).toEqual(envelope(1));
+    expect(files.has(paths.previous)).toBe(false);
+    expect(files.has(paths.recovery)).toBe(false);
+    expect(await store.load(envelope().scope)).toEqual(envelope(1));
   });
 
   it("publishes over a converged leftover journal when its cleanup was refused", async () => {
@@ -1057,6 +1077,15 @@ describe("StateEnvelopeV2Store", () => {
   });
 
   it("loads pre-S5 envelopes but validates initialized folder identity generations", async () => {
+    // Pre-S5: no folderAnchors field at all. Loading must accept it as-is.
+    const { adapter: preS5Adapter } = makeAdapter();
+    const preS5Store = new StateEnvelopeV2Store(preS5Adapter, paths);
+    const preS5 = envelope();
+    delete (preS5 as { folderAnchors?: unknown }).folderAnchors;
+    await preS5Store.publish(preS5);
+    const loadedPreS5 = await preS5Store.load(preS5.scope);
+    expect(loadedPreS5.folderAnchors).toBeUndefined();
+
     const { adapter } = makeAdapter();
     const store = new StateEnvelopeV2Store(adapter, paths);
     const initialized = envelope();

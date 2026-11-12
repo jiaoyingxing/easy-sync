@@ -1,7 +1,7 @@
 /**
  * CSS class parity gate.
  *
- * 背景（see docs/dev-logs/2026-08/20260824-0340 与 ...-0415）：
+ * 背景（see docs/dev-logs/2026-08/20260824-033536 与 20260824-034600）：
  * dfa4397c 的全仓清理审计按"src 字面量零命中"删掉了 .easy-sync-diff-added /
  * -removed 及 content 配色共 4 条 rules，但渲染代码用模板字符串动态拼接类名
  * （`easy-sync-diff-${line.type}`），字面量扫描必然零命中——造成误删，diff
@@ -30,7 +30,7 @@ import { join } from "node:path";
 const SRC_DIR = "src";
 const CSS_FILE = "styles.css";
 
-/** 历史从未定义过样式的结构性钩子（git 溯源见 08024-0415 日志排查）。
+/** 历史从未定义过样式的结构性钩子（git 溯源见 20260824-034600 日志排查）。
  *  easy-sync-ribbon 例外：2026-08-26 拍板 ribbon 去色，三条
  *  `.easy-sync-ribbon[data-easy-sync-status=...]` 颜色规则整体删除
  *  （styles.css 不再定义该类），图标/tooltip 动态保留 → 该类现为无样式的
@@ -81,7 +81,7 @@ function cssClasses(): Set<string> {
 
 /** Line markers for DOM-construction calls whose arguments carry class names. */
 const DOM_CALL =
-  /(?:createDiv|createSpan|createEl|addClass|removeClass|toggleClass|setClass)\s*\(|className\s*[:=]|classList\.(?:add|remove|toggle)\s*\(/;
+  /(?:createDiv|createSpan|createEl|addClass|removeClass|toggleClass|setClass)\s*\(|className\s*[:=]|cls\s*:|classList\.(?:add|remove|toggle)\s*\(/;
 
 interface Usage {
   kind: "literal" | "prefix";

@@ -103,24 +103,26 @@ export function resolveOrdinaryResolutionActions(
   if (snapshot.sourcePath !== undefined) {
     const localPresent = snapshot.local.filter((fact) => fact.exists);
     const remotePresent = snapshot.remote.filter((fact) => fact.exists);
-    if (
-      localPresent.length === 1
-      && remotePresent.length === 1
-      && localPresent[0].path !== remotePresent[0].path
-    ) {
+    if (localPresent.length === 1 && remotePresent.length === 1) {
       const sameContent = localPresent[0].hash === remotePresent[0].hash
         && localPresent[0].size === remotePresent[0].size;
+      // Same surviving path on both sides (the move completed, only the bytes
+      // diverged): there is no location decision, so the labels always name
+      // the version. Different paths keep the location wording when the
+      // content is identical (2026-11-11 field report).
+      const locationChoice = localPresent[0].path !== remotePresent[0].path
+        && sameContent;
       return available([
         {
           choice: "keep-local",
-          labelKey: sameContent
+          labelKey: locationChoice
             ? "syncView.mutationResolution.keepLocal"
             : "syncView.mutationResolution.keepLocalVersion",
           className: null,
         },
         {
           choice: "keep-remote",
-          labelKey: sameContent
+          labelKey: locationChoice
             ? "syncView.mutationResolution.keepRemote"
             : "syncView.mutationResolution.keepRemoteVersion",
           className: null,

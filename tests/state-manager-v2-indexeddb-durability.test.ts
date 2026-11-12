@@ -220,9 +220,10 @@ describe("StateManager V2 production controller", () => {
       await state.commitMutationCheckpoint(intent.operationId);
 
       // One commit publishes two immutable records (the delta and its commit
-      // witness). Each is written once and read back once while staged — the
-      // committed path is the pre-rename target, so it is never re-read to
-      // prove bytes that the staged read-back already proved.
+      // witness). Both are written once; the staged read-back covers two
+      // distinct paths (the assertion below does not prove each path is read
+      // exactly once). The committed path is the pre-rename target, so it is
+      // never re-read to prove bytes that the staged read-back already proved.
       const recoveryDir = paths.stateV2IndexedDbRecoveryDir;
       const recoveryReads = harness.rawAdapter.read.mock.calls
         .map((call) => String(call[0]))

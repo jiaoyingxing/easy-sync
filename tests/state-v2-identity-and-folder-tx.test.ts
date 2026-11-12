@@ -640,6 +640,166 @@ describe("V1 to V2 controlled production activation", () => {
     }
   });
 
+  // 2026-11-11 field report: an unreadable local folder (storage bridge
+  // failure) surfaced only as a deferral with no row, no diagnostics and a
+  // misleading shared copy. The three tests below pin the honest routing.
+  it("surfaces an unreadable local folder at delete pre-check as a pending row and one diag warn", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    // Remove the CLOUD folder (and its child file, so no orphaned remote
+    // identity remains) while the local tree stays: the next plan follows the
+    // cloud deletion and reaches the DeleteLocalFolder pre-check. Auto-delete
+    // is enabled so the folder row executes instead of queueing a confirm.
+    for (let index = harness.remoteItemState.length - 1; index >= 0; index--) {
+      const id = harness.remoteItemState[index].id;
+      if (id === "folder-notes" || id === "file-a") {
+        harness.remoteItemState.splice(index, 1);
+      }
+    }
+    harness.executor.setAutomaticHandlingPolicy({
+      autoDeleteLocalFiles: true,
+      mergeNonOverlappingText: true,
+    });
+
+    // The local inspection must answer `uncertain`: index lookup throws.
+    const originalAbstract =
+      harness.scanner.vault.getAbstractFileByPath.getMockImplementation()!;
+    harness.scanner.vault.getAbstractFileByPath.mockImplementation((path: string) => {
+      if (path === "Notes") throw new Error("index probe failed");
+      return originalAbstract(path);
+    });
+    const originalStat =
+      harness.scanner.vault.adapter.stat.getMockImplementation()!;
+    harness.scanner.vault.adapter.stat.mockImplementation(async (path: string) => {
+      if (path === "Notes") throw new Error("stat rejected");
+      return originalStat(path);
+    });
+
+    const deferred = await harness.executor.run("manual");
+
+    // The folder delete deferred without errors, and the unreadable local
+    // folder owns a pending row with the honest reason.
+    expect(deferred).toMatchObject({
+      deferred: 1,
+      foldersDeleted: 0,
+      errors: 0,
+    });
+    const issue = harness.state.pendingIssues.find(
+      (row) => row.path === "Notes",
+    );
+    expect(issue).toEqual(expect.objectContaining({
+      path: "Notes",
+      actionType: SyncActionType.FolderDeferred,
+      reason: "reason.folder.local-inspection-failed",
+    }));
+    // Exactly one aggregated warn names the failing layer (the index probe
+    // throws first, so the layer is the vault index); the error fingerprint
+    // is in the data, never the path in the message.
+    const warns = harness.diag.warn.mock.calls.filter(
+      (call) => typeof call[1] === "string"
+        && call[1].startsWith("local folder inspection uncertain"),
+    );
+    expect(warns).toHaveLength(1);
+    expect(warns[0][1]).toContain("index");
+    // 指纹在 data 里；消息只带层名，不带路径。
+    expect(warns[0][2]).toMatchObject({ layer: "index", count: 1 });
+    expect(String(warns[0][1])).not.toContain("Notes");
+  });
+
+  it("keeps the cloud-side delete pre-check a transient wait with the honest copy and no pending row", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    // Local folder gone; the cloud copy is deliberately still there. The
+    // planner mirrors the local deletion (delete-remote) and the executor's
+    // remote pre-checks keep seeing the live cloud object.
+    harness.localFolderPaths.delete("Notes");
+
+    const deferred = await harness.executor.run("manual");
+
+    expect(deferred).toMatchObject({
+      deferred: 1,
+      foldersDeleted: 0,
+      errors: 0,
+    });
+    // A transient wait produces no blocked row and no inspection warn.
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.diag.warn.mock.calls.filter(
+      (call) => typeof call[1] === "string"
+        && call[1].startsWith("local folder inspection uncertain"),
+    )).toHaveLength(0);
+  });
+
+  it("aggregates repeated uncertain inspections into one warn with a count", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    // Two cloud-only folders whose local pre-check reads `uncertain`.
+    harness.remoteItemState.push({
+      id: "folder-cloud-a",
+      name: "CloudA",
+      folder: {},
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-cloud-a",
+    }, {
+      id: "folder-cloud-b",
+      name: "CloudB",
+      folder: {},
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-cloud-b",
+    });
+    const originalAbstract =
+      harness.scanner.vault.getAbstractFileByPath.getMockImplementation()!;
+    harness.scanner.vault.getAbstractFileByPath.mockImplementation((path: string) => {
+      if (path === "CloudA" || path === "CloudB") return null;
+      return originalAbstract(path);
+    });
+    const originalStat =
+      harness.scanner.vault.adapter.stat.getMockImplementation()!;
+    harness.scanner.vault.adapter.stat.mockImplementation(async (path: string) => {
+      if (path === "CloudA" || path === "CloudB") {
+        throw new Error("stat rejected");
+      }
+      return originalStat(path);
+    });
+
+    const deferred = await harness.executor.run("manual");
+
+    // Both creates deferred on the unreadable local state, both get rows…
+    expect(deferred).toMatchObject({ deferred: 2, errors: 0 });
+    expect(harness.state.pendingIssues.filter(
+      (issue) => issue.reason === "reason.folder.local-inspection-failed",
+    )).toHaveLength(2);
+    // …but the warn is one line, not one per folder.
+    const warns = harness.diag.warn.mock.calls.filter(
+      (call) => typeof call[1] === "string"
+        && call[1].startsWith("local folder inspection uncertain"),
+    );
+    expect(warns).toHaveLength(1);
+  });
+
   it("keeps the not-applied classification when the local folder create itself throws", async () => {
     const harness = makeHarness();
     await harness.state.load();

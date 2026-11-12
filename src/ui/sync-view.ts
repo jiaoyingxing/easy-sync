@@ -884,8 +884,10 @@ interface CompletedFileRowsDiff {
  *  of the same path supersedes the older row). Comparing the previous
  *  path→row-key ledger against the desired order yields the minimal DOM
  *  operations: prepend new rows, remove re-completed or cap-retired rows.
- *  Completed entries are append-immutable (sync-progress only appends and
- *  trims), so a row key can never change without a new entry arriving. */
+ *  Completed entries are normally append-only, but a shared checkpoint that
+ *  fails to commit rewrites the same file's row to failed in place
+ *  (sync-progress.revertCompletedFile), so a row key can change without a new
+ *  entry arriving. */
 export function diffCompletedFileRows(
   ledger: ReadonlyMap<string, string>,
   files: readonly FileProgress[],
@@ -1129,6 +1131,39 @@ export function buildSyncPlanVirtualWindow(input: Readonly<{
     offset: input.offsets[start] ?? 0,
     totalHeight,
   };
+}
+
+/**
+ * Expand a virtual window so every pinned row stays mounted. Pinning is what
+ * keeps a settling decision row on screen while the viewport moves; on a full
+ * rebuild it is also what makes the first mount contain that row instead of
+ * freezing an empty list (the old rows are gone with `container.empty()`).
+ * An empty window (the list itself is out of view) mounts just the pinned
+ * rows, so a rebuild never has to mount the whole list to keep one row alive.
+ */
+export function expandSyncPlanVirtualWindow(input: Readonly<{
+  window: { start: number; end: number; offset: number };
+  rowKeys: readonly string[];
+  pinnedKeys: ReadonlySet<string>;
+  offsets: readonly number[];
+}>): { start: number; end: number; offset: number } {
+  if (input.pinnedKeys.size === 0) return input.window;
+  let firstPinned = -1;
+  let lastPinned = -1;
+  for (let index = 0; index < input.rowKeys.length; index += 1) {
+    if (!input.pinnedKeys.has(input.rowKeys[index])) continue;
+    if (firstPinned < 0) firstPinned = index;
+    lastPinned = index;
+  }
+  if (firstPinned < 0) return input.window;
+  const emptyWindow = input.window.start === input.window.end;
+  const start = emptyWindow
+    ? firstPinned
+    : Math.min(input.window.start, firstPinned);
+  const end = emptyWindow
+    ? lastPinned + 1
+    : Math.max(input.window.end, lastPinned + 1);
+  return { start, end, offset: input.offsets[start] ?? 0 };
 }
 
 interface SyncPlanDisplayRow {
@@ -1631,9 +1666,9 @@ export function buildSyncViewContentKey(
         `${row.pluginId}:${row.displayName}:${row.desktopOnly ? 1 : 0}`
       )
       .join("|");
-    // 本机独有条目：行事实全进指纹——显示路径（`path`）、行 key／忽略键
-    // （`targetPath`）与类别。待处理区行会再按 `isSideActionQueued` 过滤，但那份
-    // 过滤只会与 runKey（isRunning）同时变化——有排队项时
+    // 本机独有条目：行事实全进指纹——显示路径、行 key 与忽略键（均取
+    // `targetPath`）、原 `path` 与类别。待处理区行会再按 `isSideActionQueued`
+    // 过滤，但那份过滤只会与 runKey（isRunning）同时变化——有排队项时
     // `hasSideActionsInFlight` 必为真——所以未过滤集合足够。
     const localOnly = (input.localOnlyRows ?? [])
       .map((row) => `${row.path}:${row.targetPath}:${row.kind}`)
@@ -3406,8 +3441,9 @@ export class EasySyncSyncView extends ItemView {
       : null;
     const action = resolveSyncViewPrimaryAction({
       isLoggedIn: state.isLoggedIn,
-      // 同步入口占用同样落到运行档：canCancel 仍为假（检测/准备不可取消），
-      // 于是拿到现役的禁用「处理中…」，而不是一颗点了只弹 busy 的「立即同步」。
+      // 同步入口占用同样落到运行档：入口只读准备期 armed 后 canCancel 为真，
+      // 主动作显示「取消同步」；未 armed 时拿到现役的禁用「处理中…」，而不是
+      // 一颗点了只弹 busy 的「立即同步」。
       isRunning: state.isRunning || state.syncEntryInProgress,
       canCancel: state.canCancel,
       planReviewActive: state.planReviewActive,
@@ -4149,20 +4185,24 @@ export class EasySyncSyncView extends ItemView {
       return virtualOffsets;
     };
 
+    // 行 key 在本轮渲染内稳定；窗口挂载用它们把「正在结算的行」钉进窗口
+    // （见 expandSyncPlanVirtualWindow）。整屏重建时旧行已随 container.empty()
+    // 消失，冻结窗口只会把空列表冻住，所以钉住行而不是冻结整窗。
+    const rowKeys = rows.map((row) => row.key);
     const renderPendingWindow = (): void => {
-      // A row whose decision is still settling has to stay mounted: the user
-      // is waiting on that exact row, and a window shift would take it away.
-      if (rows.some((row) => this.planDecisionRowsInFlight.has(row.key))) {
-        return;
-      }
       const offsets = resolveOffsets();
       const listRect = virtualList.getBoundingClientRect();
       const viewportRect = this.resolvePlanViewportRect();
-      const windowState = buildSyncPlanVirtualWindow({
+      const windowState = expandSyncPlanVirtualWindow({
+        window: buildSyncPlanVirtualWindow({
+          offsets,
+          listTop: listRect.top,
+          viewportTop: viewportRect.top,
+          viewportBottom: viewportRect.bottom,
+        }),
+        rowKeys,
+        pinnedKeys: this.planDecisionRowsInFlight,
         offsets,
-        listTop: listRect.top,
-        viewportTop: viewportRect.top,
-        viewportBottom: viewportRect.bottom,
       });
       const nextKey =
         `${windowState.start}:${windowState.end}:${windowState.offset}`;
@@ -4484,7 +4524,7 @@ export class EasySyncSyncView extends ItemView {
           if (!confirmed) return;
           // 批量删除确认后立即进入官方 mod-loading 加载态：按钮文字被官方
           // CSS 隐藏并显示旋转圆圈，用户能看出插件正在处理而不是卡死。
-          // 窗口重挂后的按钮由下方 batchDeleteInFlight 分支重新挂类，
+          // 窗口重挂后的按钮由下方的在飞行动作类型分支重新挂类，
           // 加载态可持续到整批结束。
           confirmAllButton.buttonEl.addClass("mod-loading");
           confirmAllButton.setDisabled(true);
@@ -4493,11 +4533,15 @@ export class EasySyncSyncView extends ItemView {
       });
     // 重挂后恢复加载态：批量删除仍在队列/执行中时，按钮保持官方旋转
     // 加载态与禁用，直到整批结束（hasSideActionsInFlight 归 false）。
+    // 批量删除的文件波以 DeleteRemote 上报、文件夹壳以 DeleteLocalFolder
+    // 上报；ConfirmLocalDelete 是逐条入口的类型，不会出现在批量里。
     if (
       this.plugin.syncExecutor?.hasSideActionsInFlight
       && this.plugin.progressStore.state.activityKind === "sideAction"
-      && this.plugin.progressStore.state.currentActionType
-        === SyncActionType.ConfirmLocalDelete
+      && (this.plugin.progressStore.state.currentActionType
+          === SyncActionType.DeleteRemote
+        || this.plugin.progressStore.state.currentActionType
+          === SyncActionType.DeleteLocalFolder)
     ) {
       confirmAllButton.buttonEl.addClass("mod-loading");
       confirmAllButton.setDisabled(true);
@@ -5087,11 +5131,8 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
-  /**
-   * Folder-intent blocked recovery records carry no keep-side content
-   * decision: the exit confirms continuing from the current two-sided
-   * facts. Zero-write settlement; ordinary planning takes over afterwards.
-   */
+  /** Open the community-plugin bundle review modal for one plugin and apply
+   *  the user's keep-local/keep-remote choice to the blocked recovery record. */
   private async openCommunityPluginBundleReview(pluginId: string): Promise<void> {
     if (this.mutationRecoveryResolutionOpening) return;
     const rowKey = `bundle-review:${pluginId}`;
@@ -5721,23 +5762,21 @@ export class EasySyncSyncView extends ItemView {
           renderedKey = "";
           return;
         }
-        // A row whose decision is still settling has to stay mounted: the user
-        // is waiting on that exact row, and a window shift would take it away.
-        // Only the window that holds such a row freezes; other groups render.
-        if (
-          hasInlineDecisions
-          && rows.some((row) => this.planDecisionRowsInFlight.has(row.key))
-        ) {
-          return;
-        }
+        // 与待处理窗口同一规则：把正在结算的行钉进窗口，而不是冻结整组。
+        // 冻结在整屏重建路径上会把新建的空列表冻住（旧行已随重建消失）。
         const offsets = resolveOffsets();
         const listRect = virtualList.getBoundingClientRect();
         const viewportRect = this.resolvePlanViewportRect();
-        const windowState = buildSyncPlanVirtualWindow({
+        const windowState = expandSyncPlanVirtualWindow({
+          window: buildSyncPlanVirtualWindow({
+            offsets,
+            listTop: listRect.top,
+            viewportTop: viewportRect.top,
+            viewportBottom: viewportRect.bottom,
+          }),
+          rowKeys: rows.map((row) => row.key),
+          pinnedKeys: this.planDecisionRowsInFlight,
           offsets,
-          listTop: listRect.top,
-          viewportTop: viewportRect.top,
-          viewportBottom: viewportRect.bottom,
         });
         const nextKey =
           `${windowState.start}:${windowState.end}:${windowState.offset}`;

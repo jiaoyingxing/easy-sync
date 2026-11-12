@@ -50,11 +50,16 @@ describe("public 1.2.7 community plugin enablement retirement", () => {
     expect(pluginData["easy-sync-plan-review-active"]).toBe(false);
     expect(pluginData["easy-sync-plan-review-items"]).toEqual([]);
     expect(pluginData["easy-sync-plan-review-revision"]).toBe(8);
+    expect(state.planReviewRevision).toBe(8);
     expect(state.consumeCommunityPluginEnablementRetiredThisLoad()).toBe(true);
     expect(state.consumeCommunityPluginEnablementRetiredThisLoad()).toBe(false);
 
     await state.incrementRemoteGeneration();
     expect(pluginData["community-plugin-enablement-state"]).toBeUndefined();
+    // The in-memory revision must match the value the retirement persisted:
+    // a later full save may not roll the monotonic CAS sequence back to 7.
+    expect(pluginData["easy-sync-plan-review-revision"]).toBe(8);
+    expect(state.planReviewRevision).toBe(8);
   });
 
   it("is idempotent and does not announce a fresh install", async () => {

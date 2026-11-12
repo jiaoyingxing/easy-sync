@@ -15,7 +15,8 @@ import {
  * 对照表，让漂移不必靠读注释争论。三类语义：
  * - `identityPath` 系（`recovery-anchor-v2.ts:65` 唯一共享导出。原
  *   `folder-state-reducer-v2.ts`／`folder-state-v2.ts`／`stale-identity-resolution.ts`
- *   三份私有副本已于 2026-10-23 删除；文件末尾的源码守卫阻止新副本回流）＝
+ *   三份私有副本已于 2026-10-23 删除；文件末尾的源码守卫只匹配名字恰为
+ *   `identityPath` 的声明，等价实现 `normalizeIdentityPath` 不在守卫内）＝
  *   NFC ＋ `toLocaleLowerCase("en-US")`（折大小写）——身份判等的主流语义；
  * - `nfcPath` 系＝只做 NFC，**区分大小写**；
  * - 逐字节＝不归一化。
@@ -82,7 +83,11 @@ describe("path identity ledger", () => {
       }
       if (found) break;
     }
-    if (!found) return;   // 本运行环境的 Unicode 折叠不改变长度：缺口不在此处
+    if (!found) {
+      throw new Error(
+        "no case-folding length pair in the samples — the mis-slice precondition is not demonstrated",
+      );
+    }
     expect(found.a.length).not.toBe(found.b.length);
   });
 
@@ -104,7 +109,8 @@ describe("path identity ledger", () => {
   it("isAnchoredDescendantV2 is case-sensitive while the shared path key folds case", () => {
     // `normalizeVaultPathKey` 折大小写，`isAnchoredDescendantV2` 只做 NFC；
     // `folder-state-reducer-v2.ts` 的 `isAtOrBelow` 当前也是 NFC-only——真正的
-    // 折叠/NFC 冲突在 `canonical-plan-v2.ts:831` 与 `:3353`，不在本测试的断言面内。
+    // 折叠/NFC 冲突在 `canonical-plan-v2.ts` 的 `isNfcAtOrBelowV2`，不在本测试
+    // 的断言面内。
     const anchorPath = "Notes/Child/a.md";
     const sourceRoot = "notes";
     expect(belowFolded(anchorPath, sourceRoot)).toBe(true);

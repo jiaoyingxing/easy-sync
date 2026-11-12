@@ -16,8 +16,9 @@ import { describe, expect, it } from "vitest";
  *   `docs/**` 不算代码依赖：文档提到一个符号名不构成"需要继续导出"。
  * - "出现过"＝按标识符词法匹配。名字出现在别的文件的注释或字符串里也算"出现过"
  *   ⇒ 本门偏向**少报**（不会因为评论里的名字而误红），代价是极少数真冗余可能漏网。
- * - `export default`、`export * from`、`export { X } from` 三类是模块对外面的一部分，
- *   不在本门判据内（前两类没有本地名字，第三类是显式再导出）。
+ * - `export * from` 与 `export { X } from` 不在本门判据内（显式再导出）；
+ *   `export default` 的具名声明会被 `EXPORT_DECLARATION` 捕获（匿名默认导出
+ *   没有本地名字，自然不判）。
  */
 
 const SURFACE_ROOTS = ["src", "tests", "scripts"];

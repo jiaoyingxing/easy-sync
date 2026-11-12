@@ -5,7 +5,6 @@ import { createAuthBrowserLauncher } from "../src/auth/auth-browser";
 import { MS_AUTH_CONFIG } from "../src/auth/types";
 
 // We mock generateCodeChallengeSync (the sync path now used by login()).
-// generateCodeChallenge (async) is kept unmocked for other test paths.
 const syncChallengeMock = vi.hoisted(() => ({
   generateCodeChallengeSync: vi.fn(() => "challenge-sync-fixed"),
 }));
@@ -1330,6 +1329,45 @@ describe("AuthModule login persistence (transient refresh failures)", () => {
     expect(auth.authState.isLoggedIn).toBe(true);
     expect(remove).not.toHaveBeenCalled();
     expect(storedToken).toBe("stored-refresh-token");
+  });
+
+  it("does not nest the network-error prefix when the refresh transport fails", async () => {
+    // 2026-11-11 现场日志读成「认证网络错误：认证网络错误：net::ERR…」：
+    // tokenRequest 已把传输失败包成带本地化文案的 NetworkError，refresh 的
+    // catch 又包了一层。下游只需要一个分类和一个原始传输细节。
+    const storedToken: string | null = "stored-refresh-token";
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        throw new Error("net::ERR_NETWORK_IO_SUSPENDED");
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Offline User", id: "offline-account" },
+      };
+    });
+    const auth = new AuthModule(
+      makeContext({
+        secretStorage: {
+          set: vi.fn().mockResolvedValue(undefined),
+          get: vi.fn(async () => storedToken),
+          remove: vi.fn().mockResolvedValue(undefined),
+        },
+        diag: makeDiagnostics(),
+      }),
+      (key, params) => key === "auth.error.networkError"
+        ? `AUTH_NET[${params?.details}]`
+        : key,
+    );
+
+    await auth.initialize();
+    const failure = await auth.refreshAccessToken().then(
+      () => null,
+      (error: unknown) => error as { type: string; message: string },
+    );
+
+    expect(failure?.type).toBe("NetworkError");
+    expect(failure?.message).toBe("AUTH_NET[net::ERR_NETWORK_IO_SUSPENDED]");
   });
 
   it("logs out and deletes the credential when refresh is structurally rejected (invalid_grant)", async () => {

@@ -449,6 +449,9 @@ describe("remote identity projection adversarial contract", () => {
       folder(ROOT_NEW, "files", "vault-root"),
       file("upper", "Note.md", ROOT_NEW),
       file("lower", "note.md", ROOT_NEW),
+      // Unicode 归一化重复：NFC 与 NFD 拼写不同、归一后相同。
+      file("nfc", "Caf\u00e9.md", ROOT_NEW),
+      file("nfd", "Cafe\u0301.md", ROOT_NEW),
     ]);
 
     expect(result.result.success).toBe(false);

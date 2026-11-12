@@ -66,7 +66,7 @@ import {
   PUBLIC_113_NETWORK_RECOVERY_INCIDENT,
 } from "./fixtures/network-recovery-incidents";
 import { V2FilePlanTestHarness } from "./helpers/v2-file-plan-test-harness";
-import { createFileTransferMetrics } from "../src/sync/executor-metrics";
+import { createFileTransferMetrics, createMutationPersistenceMetrics, createAutomaticHandlingMetrics } from "../src/sync/executor-metrics";
 import type {
   CommunityPluginManifestObservationV1,
 } from "../src/sync/community-plugin-bundle";
@@ -3287,5 +3287,329 @@ describe("hint-proven rename base truth", () => {
     });
 
     expect(receipt.checkpoint.fileMoveHintRemovals).toEqual(["id-old.md"]);
+  });
+});
+
+describe("F8 — hint-proven fusion failure paths through receipt/checkpoint", () => {
+  // 2026-11-05（三）登记：融合上传的失败路径此前只在 `executeRenameRemoteItem`
+  // 内直测，没有穿过 executor 的 `recordMutationReceipt` / `commitMutationCheckpoint`
+  // 门。这里从 `executeSinglePlanItem` 原始入口出发，确认四条失败路径都留下
+  // 可提交的只移动收据，并穿过 executor 的收据/检查点调用门与测试态 V2 归约。
+  const oldContent = new TextEncoder().encode("version one\n").buffer;
+  const newContent = new TextEncoder().encode("version two\n").buffer;
+
+  function makeRun() {
+    const policy = { autoDeleteLocalFiles: false, mergeNonOverlappingText: true };
+    return {
+      startedAt: Date.now(),
+      total: 1,
+      settled: 0,
+      pendingConflicts: [],
+      pendingDeletes: [],
+      pendingIssues: [],
+      resolvedIssuePaths: new Set<string>(),
+      skipBaseline: new Set<string>(),
+      settledSkipPaths: new Set<string>(),
+      skipDeltaDisabled: false,
+      remoteUpserts: [],
+      remoteDeletes: [],
+      baseUpserts: [],
+      baseRemovals: [],
+      metrics: {
+        uploadBytes: 0,
+        uploadReadMs: 0,
+        activeUploads: 0,
+        peakUploads: 0,
+        fileTransfers: {
+          upload: createFileTransferMetrics(),
+          download: createFileTransferMetrics(),
+        },
+        mutationPersistence: createMutationPersistenceMetrics(),
+        automaticHandling: createAutomaticHandlingMetrics(policy),
+      },
+      uploadPolicy: {},
+      downloadPolicy: {},
+      folderCreates: [],
+      folderMoves: [],
+      folderDeletes: [],
+      smallUploads: [],
+      largeUploads: [],
+      downloads: [],
+      cleanupItems: [],
+      passthroughItems: [],
+      isFolderCreate: () => false,
+      isFolderMove: () => false,
+      isFolderDelete: () => false,
+    } as never;
+  }
+
+  async function makeFusionHarness(options: {
+    itemPath: string;
+    uploadFile?: ReturnType<typeof vi.fn>;
+    uploadedBytes?: ArrayBuffer;
+    uploadSourceMissing?: boolean;
+  }) {
+    const oldHash = await sha256Hex(oldContent);
+    const newHash = await sha256Hex(newContent);
+    const scope: SyncScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const parentId = options.itemPath.startsWith(".obsidian/")
+      ? "config-folder"
+      : scope.filesRootId;
+    const movedItem: DriveItem = {
+      id: "id-note",
+      name: options.itemPath.split("/").pop()!,
+      eTag: "etag-moved",
+      cTag: "ctag-moved",
+      size: oldContent.byteLength,
+      lastModifiedDateTime: new Date(1).toISOString(),
+      parentReference: { id: parentId },
+      file: { hashes: {} },
+    };
+    const uploadFile = options.uploadFile ?? vi.fn().mockResolvedValue({
+      id: "id-note",
+      name: options.itemPath.split("/").pop(),
+      size: newContent.byteLength,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      lastModifiedDateTime: new Date(2).toISOString(),
+      parentReference: { id: parentId },
+    });
+    const onedrive = makeMockOneDrive({
+      moveItemById: vi.fn().mockResolvedValue(movedItem),
+      uploadFile,
+      getFileMetadata: vi.fn(async (_vault: string, path: string) =>
+        path === options.itemPath
+          ? {
+            driveId: "id-note",
+            parentId,
+            size: oldContent.byteLength,
+            mtime: 1,
+            eTag: "etag-moved",
+            cTag: "ctag-moved",
+          }
+          : null),
+    });
+    const state = makeActiveV2State(
+      [{
+        path: "test-note.md",
+        driveId: "id-note",
+        parentId: scope.filesRootId,
+        size: oldContent.byteLength,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: oldHash,
+      }],
+      [{
+        path: "test-note.md",
+        hash: oldHash,
+        size: oldContent.byteLength,
+        eTag: "etag-old",
+      }],
+      options.itemPath.startsWith(".obsidian/")
+        ? {
+          remoteFolders: [{
+            path: ".obsidian",
+            driveId: "config-folder",
+            parentId: scope.filesRootId,
+            name: ".obsidian",
+            eTag: "etag-config",
+          }],
+        }
+        : {},
+    );
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter: makeMockAdapter({
+            readBinary: options.uploadSourceMissing
+              ? vi.fn().mockRejectedValue(new Error("File does not exist"))
+              : vi.fn(async () => options.uploadedBytes ?? newContent.slice(0)),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn(),
+        scanFile: vi.fn(),
+        inspectFile: vi.fn().mockResolvedValue(
+          options.uploadSourceMissing ? { status: "missing" } : { status: "present" },
+        ),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    (executor as unknown as { activeSyncScope: SyncScope })
+      .activeSyncScope = scope;
+    const item = {
+      type: SyncActionType.RenameRemote,
+      path: options.itemPath,
+      renameFrom: "test-note.md",
+      targetParentRemoteId: parentId,
+      baseEtag: "etag-old",
+      local: {
+        path: options.itemPath,
+        hash: newHash,
+        size: newContent.byteLength,
+        mtime: 1,
+        binary: false,
+      },
+      remote: {
+        path: "test-note.md",
+        driveId: "id-note",
+        parentId,
+        size: oldContent.byteLength,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+      },
+    } as SyncPlanItem;
+    const result = {
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+      filesMoved: 0,
+    } as SyncResult;
+    const receiptSpy = state.recordMutationReceipt as unknown as {
+      mock: { calls: unknown[][] };
+    };
+    const commitSpy = state.commitMutationCheckpoint as unknown as {
+      mock: { calls: unknown[][] };
+    };
+    const settle = async () => {
+      const run = makeRun();
+      await (executor as unknown as {
+        executeSinglePlanItem(
+          plan: SyncPlan,
+          result: SyncResult,
+          callbacks: Record<string, never>,
+          operationEpoch: number,
+          policy: { autoDeleteLocalFiles: boolean; mergeNonOverlappingText: boolean },
+          run: unknown,
+          item: SyncPlanItem,
+        ): Promise<unknown>;
+      }).executeSinglePlanItem(
+        { scope } as SyncPlan,
+        result,
+        {},
+        0,
+        { autoDeleteLocalFiles: false, mergeNonOverlappingText: true },
+        run,
+        item,
+      );
+      return { result, run };
+    };
+    return {
+      state,
+      executor,
+      item,
+      oldHash,
+      newHash,
+      receiptSpy,
+      commitSpy,
+      settle,
+      uploadFile,
+    };
+  }
+
+  it("keeps a config-path edit on the move-only receipt and commits it", async () => {
+    const harness = await makeFusionHarness({
+      itemPath: ".obsidian/app.json",
+    });
+
+    await harness.settle();
+
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.receiptSpy.mock.calls).toHaveLength(1);
+    expect(harness.commitSpy.mock.calls).toHaveLength(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === ".obsidian/app.json")).toMatchObject({
+      hash: harness.oldHash,
+      size: oldContent.byteLength,
+    });
+    expect(harness.state.remoteSnapshot.find((entry) =>
+      entry.path === ".obsidian/app.json")?.driveId).toBe("id-note");
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "test-note.md")).toBeUndefined();
+  });
+
+  it("falls back to the move-only receipt when the fused upload hits 409", async () => {
+    const harness = await makeFusionHarness({
+      itemPath: "renamed-note.md",
+      uploadFile: vi.fn().mockRejectedValue(
+        new OneDriveError(OneDriveErrorType.Conflict, "remote moved under the upload", 409),
+      ),
+    });
+
+    await harness.settle();
+
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.receiptSpy.mock.calls).toHaveLength(1);
+    expect(harness.commitSpy.mock.calls).toHaveLength(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "renamed-note.md")).toMatchObject({
+      hash: harness.oldHash,
+      size: oldContent.byteLength,
+    });
+    expect(harness.state.remoteSnapshot.find((entry) =>
+      entry.path === "renamed-note.md")?.driveId).toBe("id-note");
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "test-note.md")).toBeUndefined();
+  });
+
+  it("falls back to the move-only receipt when the upload source disappeared", async () => {
+    const harness = await makeFusionHarness({
+      itemPath: "renamed-note.md",
+      uploadSourceMissing: true,
+    });
+
+    await harness.settle();
+
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.receiptSpy.mock.calls).toHaveLength(1);
+    expect(harness.commitSpy.mock.calls).toHaveLength(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "renamed-note.md")).toMatchObject({
+      hash: harness.oldHash,
+      size: oldContent.byteLength,
+    });
+    expect(harness.state.remoteSnapshot.find((entry) =>
+      entry.path === "renamed-note.md")?.driveId).toBe("id-note");
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "test-note.md")).toBeUndefined();
+  });
+
+  it("falls back to the move-only receipt when the local hash drifted after scan", async () => {
+    const drifted = new TextEncoder().encode("version changed again\n").buffer;
+    const harness = await makeFusionHarness({
+      itemPath: "renamed-note.md",
+      uploadedBytes: drifted,
+    });
+
+    await harness.settle();
+
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.receiptSpy.mock.calls).toHaveLength(1);
+    expect(harness.commitSpy.mock.calls).toHaveLength(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "renamed-note.md")).toMatchObject({
+      hash: harness.oldHash,
+      size: oldContent.byteLength,
+    });
+    expect(harness.state.remoteSnapshot.find((entry) =>
+      entry.path === "renamed-note.md")?.driveId).toBe("id-note");
+    expect(harness.state.baseSnapshot.find((entry) =>
+      entry.path === "test-note.md")).toBeUndefined();
   });
 });

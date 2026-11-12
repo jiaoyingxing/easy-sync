@@ -106,8 +106,8 @@ describe("community plugin manager catalog refresh visibility", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(refresh).toHaveBeenCalledOnce();
-    // The deferred-after-sync marker survives the failed follow-up, so a later
-    // inventory revision still triggers the retry once the round has ended.
+    // The marker is cleared before the retry attempt; this assertion only pins
+    // the state after the failed follow-up (production does not re-queue it).
     expect(modal.catalogRefreshSkippedWhileSyncing).toBe(true);
     expect(modal.renderPluginListArea).not.toHaveBeenCalled();
   });

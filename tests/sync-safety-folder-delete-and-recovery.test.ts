@@ -860,7 +860,8 @@ describe("confirm delete waves", () => {
   });
 
   it("refuses an oversized, duplicate or folder wave before any write or erase", () => {
-    // The wave slice caps itself at CONFIRM_DELETE_WAVE (8/16), so these edges
+    // The wave slice caps itself at `confirmDeleteWave()` (8 mobile / 16 desktop),
+    // so these edges
     // are unreachable through `confirmRemoteDeletes`; pin the fail-closed guard
     // itself, exactly like the cleanup-wave limit test.
     const members = (count: number) =>
@@ -1527,6 +1528,194 @@ describe("folder confirm-delete batch absence verification", () => {
       "trash:FolderX",
     ]);
     expect(executor.hasSideActionsInFlight).toBe(false);
+  });
+
+  it("retries a folder shell whose per-item entry ran before the batch's file wave", async () => {
+    const folder = "FolderX";
+    const children = ["FolderX/n1.md", "FolderX/n2.md"];
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-test" };
+    const parentRemoteId = "committed-parent-id";
+    const localEntry = (path: string, index: number) => ({
+      path,
+      hash: `local-hash-${index}`.padEnd(64, "0"),
+      size: 10 + index,
+      mtime: 1,
+      binary: false,
+    });
+    const pendingRemoteDeletes: SyncPlanItem[] = [
+      ...children.map((path, index) => {
+        const local = localEntry(path, index);
+        return {
+          type: SyncActionType.ConfirmLocalDelete,
+          path,
+          local,
+          decisionToken: {
+            version: 1,
+            vaultName: "testVault",
+            accountId: scope.accountId,
+            scope,
+            local: { exists: true, hash: local.hash, size: local.size },
+            remote: { exists: false },
+            ancestorHash: null,
+          },
+        } as unknown as SyncPlanItem;
+      }),
+      {
+        type: SyncActionType.ConfirmLocalDelete,
+        path: folder,
+        folder: {
+          remoteId: "remote-folder",
+          parentRemoteId,
+          parentPath: "",
+          childCount: children.length,
+        },
+      } as unknown as SyncPlanItem,
+    ];
+    const diskFiles = new Set(children);
+    const events: string[] = [];
+    let releaseFirstList: (() => void) | null = null;
+    let listCalls = 0;
+    const adapter = makeMockAdapter({
+      exists: vi.fn().mockResolvedValue(false),
+      list: vi.fn(async (dirPath: string) => {
+        listCalls += 1;
+        if (dirPath === folder && listCalls === 1) {
+          // Hold the per-item folder entry on the queue while the batch is
+          // admitted, so the batch really sees the shell as already queued.
+          await new Promise<void>((resolve) => {
+            releaseFirstList = resolve;
+          });
+        }
+        if (dirPath !== folder) return { files: [], folders: [] };
+        const files = [...diskFiles]
+          .filter((path) => path.startsWith(`${folder}/`))
+          .map((path) => path.slice(folder.length + 1));
+        return { files, folders: [] };
+      }),
+      remove: vi.fn(async (path: string) => {
+        diskFiles.delete(path);
+        events.push(`remove:${path}`);
+      }),
+    });
+    const trashed = new Set<string>();
+    const trashFile = vi.fn(async (folderFile: unknown) => {
+      const path = (folderFile as { path?: string }).path ?? "";
+      trashed.add(path);
+      events.push(`trash:${path}`);
+    });
+    const envelope = createFileStateShadowEnvelopeV2({
+      scope,
+      lifecycleEpoch: 1,
+      commitSeq: 1,
+      committedAt: 1,
+      remoteEntries: [],
+      remoteFolders: [],
+      baseEntries: [],
+    });
+    envelope.folderAnchors = {
+      schemaVersion: 2,
+      byAnchorId: {
+        "folder-anchor-x": {
+          anchorId: "folder-anchor-x",
+          remoteId: "remote-folder",
+          lastPath: folder,
+          parentRemoteId,
+          confirmedGeneration: 1,
+          confirmedAt: 1,
+        },
+      },
+    };
+    const state = {
+      ...remoteStateStub(),
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+      boundAccountId: scope.accountId,
+      remoteScope: scope,
+      pendingRemoteDeletes,
+      planReviewRevision: 0,
+      baseSnapshot: [],
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      peekCommittedV2Envelope: vi.fn(() => envelope),
+      retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
+    } as unknown as StateManager;
+    const vault = {
+      configDir: ".obsidian",
+      adapter,
+      getFileByPath: vi.fn().mockReturnValue(null),
+      getFiles: vi.fn().mockReturnValue([]),
+      getName: vi.fn().mockReturnValue("testVault"),
+      getAbstractFileByPath: vi.fn((path: string) =>
+        trashed.has(path) ? null : path === folder ? new TFolder(path) : null),
+    };
+    const onedrive = makeMockOneDrive({
+      getFileMetadataByPaths: vi.fn(async (_vaultName: string, batch: readonly string[]) =>
+        new Map(batch.map((path) => [path, null]))),
+      getFileMetadata: vi.fn(async () => null),
+      getDriveItemMetadataById: vi.fn(async () => null),
+    });
+    const messages: string[] = [];
+    const i18nStub = {
+      t: (key: string, params?: Record<string, string | number>): string =>
+        key === "notice.delete.failed"
+          ? `failed[${params?.reason ?? ""}]`
+          : key,
+    } as unknown as ConstructorParameters<typeof SyncExecutor>[4];
+    const noticeCenterStub = {
+      show: vi.fn((entry: { message: string }) => {
+        messages.push(entry.message);
+      }),
+    } as unknown as ConstructorParameters<typeof SyncExecutor>[10];
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault,
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        inspectFile: vi.fn(async (path: string) => {
+          const entry = localEntry(path, children.indexOf(path));
+          return { status: "present" as const, entry };
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+      i18nStub,
+      undefined,
+      undefined,
+      { trashFile } as unknown as import("obsidian").FileManager,
+      undefined,
+      undefined,
+      noticeCenterStub,
+    );
+
+    // The per-item folder confirm is admitted first and blocks while the
+    // members still exist, so it reports "folder not empty" and keeps the row
+    // pending. A stale panel snapshot then confirms the whole batch while the
+    // shell entry is still the queue's current owner.
+    const first = executor.confirmRemoteDelete(folder);
+    const batch = executor.confirmRemoteDeletes([folder, ...children]);
+    for (let attempt = 0; attempt < 50 && !releaseFirstList; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    releaseFirstList?.();
+    await Promise.all([first, batch]);
+
+    // The batch deletes the members and then retries the shell instead of
+    // dropping it as "already queued": one confirm removes everything.
+    expect(diskFiles.size).toBe(0);
+    expect([...trashed]).toEqual([folder]);
+    expect(events).toEqual([
+      "remove:FolderX/n1.md",
+      "remove:FolderX/n2.md",
+      "trash:FolderX",
+    ]);
+    // Only the per-item attempt's "folder not empty" notice remains; the
+    // batch itself reports no failure.
+    expect(messages.filter((message) => message.includes("folderNotEmpty")))
+      .toHaveLength(1);
   });
 
   it("keeps a folder row pending with actionable guidance while members remain", async () => {

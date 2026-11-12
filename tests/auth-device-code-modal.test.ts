@@ -42,7 +42,9 @@ describe("formatRemaining", () => {
   it("formats the remaining time as m:ss (ceil)", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-21T00:00:00Z"));
-    expect(formatRemaining(Date.now() + 892_000)).toBe("14:52");
+    // 892.001s: ceil → 893s = 14:53. An integer-second fixture cannot tell
+    // ceil from floor/round.
+    expect(formatRemaining(Date.now() + 892_001)).toBe("14:53");
   });
 
   it("clamps at 0:00 once the deadline passes", () => {

@@ -9,9 +9,11 @@ import {
   isNewerVersion,
   isUpdateReminderSuppressed,
   loadUpdateCheckState,
+  parseManifestVersion,
   resolveNextUpdateCheckDelay,
   saveUpdateCheckState,
   seedUpdateCheckStateFromLegacyPluginData,
+  shouldShowUpdateReminder,
   SNOOZE_DURATION_MS,
   UPDATE_CHECK_INTERVAL_MS,
   type UpdateCheckStorage,
@@ -415,6 +417,9 @@ const KEY_UPLOAD_DOWNGRADE_NOTICE = "easy-sync-upload-downgrade-notice-v1";
 const RIBBON_SUCCESS_DURATION_MS = 5_000;
 const SYNC_RESULT_NOTICE_DURATION_MS = 2_000;
 const SYNC_PROGRESS_NOTICE_KEY = "sync-progress";
+/** Render-path floor between plugin-folder manifest reads while the running
+ *  version still looks behind the published release (see update reminder). */
+const INSTALLED_MANIFEST_REREAD_MS = 10_000;
 const DESCENDANT_FILE_RECONSTRUCTION_CONTINUATION_DELAY_MS = 250;
 const COMMUNITY_PLUGIN_FILE_DELETE_UNINSTALL_DELAY_MS = 150;
 const DESCENDANT_FILE_RECONSTRUCTION_RETRY_DELAYS_MS =
@@ -1284,10 +1289,11 @@ export default class EasySyncPlugin extends Plugin {
 
     this.scanner = new LocalScanner(this.app.vault, undefined, this.manifest.id);
     this.scanner.setDiag(this.diag);
-    this.applySyncPathSettings(); // Apply saved path settings after scanner is created
-    // loadSyncSettings() runs before the scanner exists, so its applyMaxFileSize()
-    // call is a silent no-op — this is the only restore point that reaches the
-    // scanner; without it every reload quietly reverts the threshold to default.
+    // Settings are still loading in the background (kicked off before the
+    // scanner existed): apply the values known so far so the scanner starts
+    // with a complete config. The settings read re-applies the real values
+    // once it settles, so this is not the only restore point.
+    this.applySyncPathSettings();
     this.applyMaxFileSize();
     this.onedrive = new OneDriveClient(
       () => this.auth!.getAccessToken(),
@@ -1383,7 +1389,13 @@ export default class EasySyncPlugin extends Plugin {
       // The check's throttle bookkeeping comes from the settings read; wait
       // for it so a slow cold read cannot degrade into "due" and refetch.
       void this.ensureSettingsLoaded()
-        .then(() => this.runUpdateCheckFlow())
+        .then(() => {
+          // The reminder can show from persisted lastKnownLatest before the
+          // network round runs; read the installed copy first so an update
+          // that landed while Obsidian was closed never flashes the row.
+          this.refreshInstalledManifestVersion(true);
+          this.runUpdateCheckFlow();
+        })
         .catch(() => undefined);
     });
 
@@ -1491,6 +1503,9 @@ export default class EasySyncPlugin extends Plugin {
         this.requestDescendantFileReconstructionContinuation("foreground");
         void this.scheduleCommunityPluginLocalReconciliation("foreground");
         this.schedulePersistedCommunityPluginJoinSync("foreground");
+        // Returning to the app often follows an update outside it; re-read the
+        // installed copy so the reminder retires without waiting for a reload.
+        this.refreshInstalledManifestVersion(true);
         // Device-code login: check the token endpoint immediately on return
         // instead of waiting for the next (possibly throttled) poll tick.
         void this.auth?.checkDeviceCodeNow();
@@ -1500,6 +1515,7 @@ export default class EasySyncPlugin extends Plugin {
       }
     });
     this.registerDomEvent(window, "focus", () => {
+      this.refreshInstalledManifestVersion(true);
       void this.auth?.checkDeviceCodeNow();
       void this.auth?.refreshNowIfNeeded();
     });
@@ -1592,18 +1608,95 @@ export default class EasySyncPlugin extends Plugin {
   private updateLastKnownLatest: string | null = null;
   private updateSnooze: UpdateReminderSnooze | null = null;
   private updateCheckTimer: number | null = null;
+  /** Version written in the plugin folder's manifest.json; unlike
+   *  `this.manifest.version` it advances without a reload. */
+  private installedManifestVersion: string | null = null;
+  private installedManifestVersionReadAt = 0;
+  private installedManifestVersionReading = false;
 
   /** Sidebar row model, or null when nothing should be shown. Single source
    *  of truth for both the body-mode gate and the row render. */
   getUpdatePromptState(): { latest: string; current: string } | null {
     const latest = this.updateLastKnownLatest;
     if (!latest) return null;
+    this.refreshInstalledManifestVersion();
+    return this.computeUpdatePromptState();
+  }
+
+  /** Pure read of the current row model; the disk refresh lives in the
+   *  public getter so this can be reused when a refresh settles. */
+  private computeUpdatePromptState(): { latest: string; current: string } | null {
+    const latest = this.updateLastKnownLatest;
+    if (!latest) return null;
     const current = this.manifest.version;
-    if (!isNewerVersion(latest, current)) return null;
+    if (!shouldShowUpdateReminder({
+      latest,
+      current,
+      installed: this.installedManifestVersion,
+    })) {
+      return null;
+    }
     if (isUpdateReminderSuppressed(latest, this.updateSnooze, Date.now())) {
       return null;
     }
     return { latest, current };
+  }
+
+  /**
+   * The running manifest version only advances on reload; the copy on disk
+   * advances the moment an update lands (host update awaiting reload, manual
+   * copy, self-sync download). Reading it lets the reminder retire as soon as
+   * the files are in place instead of pointing at an update the host can no
+   * longer offer. Read failures keep the last known value and never suppress.
+   */
+  private refreshInstalledManifestVersion(force = false): void {
+    if (this.unloaded || this.installedManifestVersionReading) return;
+    // Only the reminder's own gate needs this read: once the running version
+    // matches the published release no row can show, so an idle device does
+    // no extra folder reads.
+    const latest = this.updateLastKnownLatest;
+    if (!latest || !isNewerVersion(latest, this.manifest.version)) return;
+    const now = Date.now();
+    if (!force && now - this.installedManifestVersionReadAt < INSTALLED_MANIFEST_REREAD_MS) {
+      return;
+    }
+    this.installedManifestVersionReadAt = now;
+    this.installedManifestVersionReading = true;
+    const { manifestFile } = getEasySyncPaths(this.app.vault, this.manifest.id);
+    let read: Promise<string>;
+    try {
+      read = this.app.vault.adapter.read(manifestFile);
+    } catch {
+      this.installedManifestVersionReading = false;
+      return;
+    }
+    void read.then(
+      (text) => {
+        this.installedManifestVersionReading = false;
+        if (this.unloaded) return;
+        const version = parseManifestVersion(text);
+        if (version === this.installedManifestVersion) return;
+        const wasVisible = this.computeUpdatePromptState() !== null;
+        this.installedManifestVersion = version;
+        if (version !== null && version !== this.manifest.version) {
+          this.diag.log("lifecycle", "installed manifest version differs from running", {
+            installed: version,
+            current: this.manifest.version,
+          });
+        }
+        if ((this.computeUpdatePromptState() !== null) !== wasVisible) {
+          this.syncView?.render();
+        }
+      },
+      () => {
+        // Unreadable folder state (plugin being replaced, permissions): the
+        // reminder keeps its previous decision and the next read retries.
+        this.installedManifestVersionReading = false;
+      },
+    ).catch(() => {
+      // A render torn down mid-read must not surface as an unhandled rejection.
+      this.installedManifestVersionReading = false;
+    });
   }
 
   /** 「去更新」：stateless handoff to the host's own plugin detail page.
@@ -2115,9 +2208,9 @@ export default class EasySyncPlugin extends Plugin {
   /**
    * Confirm one cloud-deletion follow row.
    *
-   * File rows become a device-local decision consumed by the next plan; the
-   * plan path owns every local delete. Folder rows (and pre-token legacy rows)
-   * keep the existing side-action exit, which is outside this slice.
+   * Both file and folder rows write their device-local decision record and
+   * join the same side-action batch; the record is the crash/failure net and
+   * is pruned once the queued batch deletes the rows.
    */
   async confirmRemoteDelete(path: string): Promise<boolean> {
     await this.ensureStateLoaded();
@@ -4592,8 +4685,9 @@ export default class EasySyncPlugin extends Plugin {
   async resetSyncState(): Promise<void> {
     // Reset is the exit users are pointed at when a load fails, so this
     // pre-flight is best effort: letting it reject would seal off the very path
-    // that recovers from a failed load. The load inside the try below still
-    // runs and reports a genuine failure through the normal notice path.
+    // that recovers from a failed load. The load inside the try below decides
+    // what the reset may act on: a settings failure fails closed with the
+    // normal notice path, a state failure is reported and the reset proceeds.
     await this.ensureStateLoaded().catch(() => undefined);
     if (!await this.invalidateAndDrainSyncActivity("reset")) {
       this.noticeCenter.show({
@@ -4620,7 +4714,40 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
     try {
-      await this.ensureStateLoaded();
+      // The pre-flight above is best effort; this is the load the reset acts
+      // on. A failed settings read must fail closed here: the reset re-saves
+      // the in-memory settings at the end, so persisting defaults over the
+      // user's settings would be worse than a visible failure. A failed state
+      // read is the case reset exists for: report it and let the reset run.
+      try {
+        await this.ensureStateLoaded();
+      } catch (error) {
+        try {
+          await this.ensureSettingsLoaded();
+        } catch (settingsError) {
+          this.diag.error(
+            "state",
+            "local sync state reset failed",
+            settingsError instanceof Error
+              ? `${settingsError.name}: ${settingsError.message}`
+              : String(settingsError),
+          );
+          this.noticeCenter.show({
+            key: "reset-failed",
+            message: this.i18n.t("settings.reset.failed"),
+            priority: NOTICE_PRIORITY.attention,
+            durationMs: 10_000,
+          });
+          return;
+        }
+        this.diag.warn(
+          "state",
+          "reset proceeding after the local state load failed",
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error),
+        );
+      }
       // The reset is definitely starting: capture a pre-reset report for
       // every variant (normal / isolated / forced). Best-effort by contract —
       // a failed report never blocks the exit. resetSnapshot=true keeps this
@@ -4770,6 +4897,23 @@ export default class EasySyncPlugin extends Plugin {
       }
       this.updateStatusBar();
       this.syncView?.render();
+    } catch (error) {
+      // Unexpected failures outside the guarded sub-steps above still report
+      // through the same notice path: the reset entry must never reject into
+      // a caller with no handler (the button would look dead).
+      this.diag.error(
+        "state",
+        "local sync state reset failed",
+        error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error),
+      );
+      this.noticeCenter.show({
+        key: "reset-failed",
+        message: this.i18n.t("settings.reset.failed"),
+        priority: NOTICE_PRIORITY.attention,
+        durationMs: 10_000,
+      });
     } finally {
       this.releaseOpLock();
     }
@@ -5903,11 +6047,6 @@ export default class EasySyncPlugin extends Plugin {
   // ---- Auto-sync ----
 
   /**
-   * Persisted V2 mutation intent is itself a recovery trigger. This gate only
-   * arms the timer-only scheduler; the scheduler cannot inspect or mutate
-   * sync state and still re-enters through the shared operation lock.
-   */
-  /**
    * B4 (2026-09-28 用户拍板): while a mutation-recovery pause is active,
    * bounded scheduler observations may continue ONLY when the stuck record
    * has no manual exit — the configuration-path class whose automatic
@@ -5950,9 +6089,9 @@ export default class EasySyncPlugin extends Plugin {
    * cause owns (an incomplete round, a cancelled round, a legacy
    * conflict-only pause). Only the former may be ended by a settling
    * observation: the documented rule is that every other pause is released by
-   * a user-initiated round, and the in-memory block reason is not durable
-   * across restarts, so the persisted recovery row is the marker
-   * (2026-10-13 review finding).
+   * a user-initiated round. The in-memory block reason is the freshest owner
+   * signal within one session; the persisted recovery row is the fallback
+   * after a restart, when that reason is gone.
    */
   private pauseIsRecoveryBlockOwned(): boolean {
     if (this.mutationRecoveryBlockReason !== null) return true;
@@ -5963,6 +6102,11 @@ export default class EasySyncPlugin extends Plugin {
     return active?.recovery?.state === "blocked";
   }
 
+  /**
+   * Persisted V2 mutation intent is itself a recovery trigger. This gate only
+   * arms the timer-only scheduler; the scheduler cannot inspect or mutate
+   * sync state and still re-enters through the shared operation lock.
+   */
   private requestMutationRecoveryObservation(trigger: string): boolean {
     if (
       !this.isAutoSyncMasterEnabled()
@@ -6291,7 +6435,9 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
 
-    // P1: retain the deletion-gesture evidence before the dirty timer fires.
+    // P1: retain the deletion-gesture evidence as soon as the delete is
+    // observed. The capture is not awaited (best effort), so a state write
+    // slower than the dirty debounce can still land after planning starts.
     // The hint binds the committed folder ID; the planner consumes it only
     // after the scan re-confirms the folder is gone and the cloud copy still
     // sits at the anchor path. Unanchored folders record nothing.
@@ -7865,13 +8011,14 @@ export default class EasySyncPlugin extends Plugin {
    * Dedicated cloud cleanup for a community plugin this device no longer
    * holds locally. Gated on the device-local participation phase: active
    * joins/restores/participations, in-flight exits and blocked restores
-   * never enter the transaction. Deletion is authorized ONLY by a freshly
-   * refreshed remote catalog — the committed snapshot's identities can be
-   * stale, and planning from them once produced a silent no-op reported as
-   * success (2026-09-15). The executor transaction performs the conditional
-   * deletes. Records the cleanup marker that keeps the row hidden until the
-   * bundle reappears, and reports completion or blockage through the notice
-   * center.
+   * never enter the transaction. Deletion is authorized by the remote catalog
+   * this call refreshes — planning against stale committed identities once
+   * produced a silent no-op reported as success (2026-09-15). When sync
+   * activity is in flight the refresh returns the current scope-validated
+   * catalog instead of re-listing, and the executor transaction re-verifies
+   * every identity before deleting. Records the cleanup marker that keeps the
+   * row hidden until the bundle reappears, and reports completion or blockage
+   * through the notice center.
    */
   async runCommunityPluginCloudCleanup(pluginId: string): Promise<boolean> {
     await this.ensureStateLoaded();
@@ -10307,6 +10454,11 @@ export default class EasySyncPlugin extends Plugin {
     return { pendingUploads: facts.total, dismissed: facts.dismissed };
   }
 
+  /** 设置页动作在弹框前捕获的操作 epoch（与范围设置变更同形）。 */
+  captureOperationEpoch(): number {
+    return this.operationLifecycle.capture();
+  }
+
   /**
    * 片⑥ 模式切换（一次可恢复的设置事务）。
    *
@@ -10330,11 +10482,6 @@ export default class EasySyncPlugin extends Plugin {
    * 不碰；关闭方向把本机独有条目按 per-class 作废退场（记录退场，文件与忽略
    * 记忆都保留）。
    */
-  /** 设置页动作在弹框前捕获的操作 epoch（与范围设置变更同形）。 */
-  captureOperationEpoch(): number {
-    return this.operationLifecycle.capture();
-  }
-
   async updateSyncDirection(
     direction: SyncDirection,
     operationEpoch?: number,

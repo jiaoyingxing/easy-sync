@@ -20,8 +20,9 @@ import {
  * 两条被路由的错误族——reducer 吸收拒绝（27 kind 封闭词表）与请求超时
  * （SyntheticRequestTimeoutError＋OneDriveError.requestTimeoutMs 标记位）——
  * 的处置分支此前挂在错误消息文本上（includes/startsWith/冒号前缀集合）。
- * 本门钉住：①类型化通道按 code 判别；②过渡期文本兜底通道行为不变；
- * ③拒绝消息逐字节等于旧 `new Error` 形态（展示/指纹面零漂移）。
+ * 本门钉住：①类型化通道按 kind 判别；②过渡期文本兜底已退役（裸 Error＋消息
+ * 文本不再被识别，fail-closed）；③拒绝消息逐字节等于旧 `new Error` 形态（展示/
+ * 指纹面零漂移）。
  */
 describe("v2 state refusal routing (刀 2)", () => {
   it("pins the closed refusal vocabulary at 27 kinds", () => {

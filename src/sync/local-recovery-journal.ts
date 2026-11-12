@@ -67,6 +67,9 @@ export class LocalRecoveryJournal {
     original: ArrayBuffer | null,
     downloaded: RecoveryVersion,
   ): Promise<void> {
+    if (await this.readIntent()) {
+      throw new Error("Local recovery is already in progress");
+    }
     await this.ensureDir();
     await this.removeIfExists(this.copiedOriginalPath);
     if (expected) {
@@ -88,10 +91,12 @@ export class LocalRecoveryJournal {
   }
 
   /**
-   * Legacy mode: the replacement chain no longer renames the target aside
-   * (in-place write with a copied original instead), but a crash on an older
-   * build can leave a rename-mode intent behind and `recover()` must still be
-   * able to settle it.
+   * Rename-mode preparation: the target is moved aside to a recovery copy
+   * before replacement. The host-visible replacement chain uses an in-place
+   * write with a copied original instead, but paths outside the vault index
+   * (the config directory and other non-host-visible paths) still take this
+   * route, and a crash on an older build can leave a rename-mode intent
+   * behind that `recover()` must still be able to settle.
    */
   async prepareRenamedOriginal(
     targetPath: string,
@@ -310,10 +315,16 @@ export class LocalRecoveryJournal {
     const nextPath = `${this.intentPath}.next`;
     // Recover orphaned staging file from a previous crash during writeIntent
     if (await this.adapter.exists(nextPath)) {
+      // Read the staged intent before touching the canonical file: when rename
+      // is unavailable, writeIntent's direct write is the only copy in place.
+      const staged = await this.adapter.read(nextPath);
       try {
         await this.removeIfExists(this.intentPath);
         await this.adapter.rename(nextPath, this.intentPath);
       } catch {
+        // Adopt the staged intent with a direct write instead of dropping both
+        // copies (the same fallback writeIntent uses when rename is missing).
+        await this.adapter.write(this.intentPath, staged);
         await this.removeIfExists(nextPath);
       }
     }
@@ -339,8 +350,8 @@ export class LocalRecoveryJournal {
       await this.adapter.rename(nextPath, this.intentPath);
     } catch {
       // Fall back to direct write when rename is unavailable (e.g. mock adapters
-      // that don't simulate cross-path renames). The write-then-verify in
-      // readIntent guards against torn writes on real filesystems.
+      // that don't simulate cross-path renames). The staged `.next` stays
+      // behind for readIntent, which adopts it even when rename keeps failing.
       await this.adapter.write(this.intentPath, json);
     }
   }

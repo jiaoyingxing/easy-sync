@@ -395,6 +395,7 @@ describe("buildSettingDefinitions", () => {
   // 豁免写法同款，选择器前缀 .setting-group 压过宿主分割线规则的 specificity。
   it("ships the acknowledged-rule follower divider suppression in styles.css", () => {
     const css = readFileSync("styles.css", "utf8");
+    expect(css).toContain("content: none");
     expect(css).toContain(
       ".setting-group .easy-sync-setting-rule-acknowledged + .setting-item::before",
     );

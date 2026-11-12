@@ -257,6 +257,9 @@ describe("CloudBootstrapV2 publication", () => {
     // 16-hex Personal drive IDs as equal; before the fix every round ended in
     // "dirty: invalid-current" with no self-healing.
     const env = envelope(1);
+    // 16-hex Personal drive ID：默认夹具的 "drive" 小写前后相同，case-only
+    // 兼容路径根本没被走到。
+    env.scope.driveId = "A1B2C3D4E5F60718";
     const cloudScope = {
       ...env.scope,
       driveId: env.scope.driveId.toLowerCase(),

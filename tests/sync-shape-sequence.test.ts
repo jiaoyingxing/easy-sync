@@ -16,11 +16,11 @@
 //     绝不取本机哈希）、身份连续、内容零改动、拉锯收敛。
 //     （现役引擎在「远端单向移动＋本机未动」的兄弟形状选择跟随远端——那
 //     一方向不做本条判例的断言对象；本条保护的是执行链回执可写这一面。）
-//   · F27-A（大小写拼写分叉的规划层守卫，随 1.6.0 冻结、未发布）：
+//   · F27-A（大小写拼写分叉的规划层守卫，随 1.6.0 发布）：
 //     本机文件落入与索引只差大小写的父目录 → 计划层把身份移动扣成延后行，
 //     绝不发射以本机拼写作父路径的 renameRemote；断言：零内容动作、待办行
 //     位置可辨认、跨轮计数稳定不增账不停摆；其余文件照常同步。
-//   · A1-乙（目的地父目录拼写别名闸，同上随 1.6.0 冻结）：
+//   · A1-乙（目的地父目录拼写别名闸，同上随 1.6.0 发布）：
 //     本机目录改名成只差大小写的别名，且在别名父目录下新建文件 → 整树被
 //     目录层的 local-rename-evidence-conflict 延后行扣住，可执行动作全部
 //     押后（A1-乙的目的地父拼写闸在别名形状下不发射）；断言：零上传、
@@ -283,6 +283,30 @@ describe("S5 shape sequence test bench (dual-device)", () => {
     expect(rowTypology(a)).toEqual(["Albums:unanchored-shared-folder"]);
     expect(a.lastResult!.errors).toBe(0);
     expect(b.lastResult!.errors).toBe(0);
+  });
+
+  it("F24 harness fidelity: same-path rebuild recreates empty and ancestor folders with live identities", async () => {
+    const world = createShapeWorld({
+      files: {
+        "Albums/2024/cover.png": "PIXELDATA",
+        "Albums/info.md": "caption",
+      },
+      folders: ["Albums", "Albums/2024", "Albums/empty"],
+    });
+    const { a } = await addConvergedPair(world);
+
+    world.recreateRemoteFolderAt("Albums");
+
+    // 整棵目录树（含空子目录与中间祖先）都以新身份重建。
+    expect(world.snapshot().folders).toEqual(expect.arrayContaining([
+      "Albums",
+      "Albums/2024",
+      "Albums/empty",
+    ]));
+    // 下一轮带 token 的 delta 要能解释整棵树：旧夹具只把文件直接父目录登记进
+    // byId，祖先/空目录会在这里抛 "shape world delta lost identity"。
+    const round = await a.runRound();
+    expect(round.errors).toBe(0);
   });
 
   it("F29 slice1: cloud subtree reorganization defers the folder move instead of a doomed receipt", async () => {

@@ -32,9 +32,9 @@ export interface CommunityPluginAutoUpdateCandidate {
 
 interface CommunityPluginUpdateFactsInput {
   /**
-   * Per-file completion records of one finished sync round, successful and
-   * failed rows alike. A failed bundle-member download is an update that did
-   * not happen; it must never be announced as a success.
+   * The retained completion rows of one finished sync round (successful and
+   * failed rows alike). The successful list is display-capped, so a very
+   * large round may have dropped older successful plugin-member rows.
    */
   files: readonly Pick<FileProgress, "path" | "actionType" | "status">[];
   /** Vault config dir passed through to parseCommunityPluginBundlePath. */

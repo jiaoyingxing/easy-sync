@@ -99,6 +99,28 @@ export function isUpdateReminderSuppressed(
   return now < snooze.until;
 }
 
+/**
+ * Reminder gate over the two version facts a device can hold at once:
+ * `current` is the running bundle's manifest version (frozen until reload),
+ * `installed` is the copy on disk (advances as soon as the update lands).
+ *
+ * A newer release only matters while the installed copy is still behind it.
+ * After a file-level update the host has nothing left to offer, so the row
+ * would send users to a plugin page that already shows the latest version
+ * while the running instance still reports the old one. An unreadable
+ * installed version never suppresses: keeping the prompt is the safe side.
+ */
+export function shouldShowUpdateReminder(input: {
+  latest: string;
+  current: string;
+  installed: string | null;
+}): boolean {
+  if (!isNewerVersion(input.latest, input.current)) return false;
+  if (input.installed === null) return true;
+  if (!isStableVersion(input.installed)) return true;
+  return isNewerVersion(input.latest, input.installed);
+}
+
 interface UpdateCheckResponse {
   status: number;
   text: string;

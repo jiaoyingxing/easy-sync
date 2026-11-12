@@ -88,7 +88,7 @@ import {
   makeStaleTreeCommitProbe,
 } from "./helpers/sync-safety-harness";
 
-describe("Cloud baseline bootstrap safety", () => {
+describe("Cloud baseline bootstrap and download write safety", () => {
   it("accepts a V1 cloud baseline only when exact content or its bound remote version matches", () => {
     const executor = new SyncExecutor(
       makeMockOneDrive(),

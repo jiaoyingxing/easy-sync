@@ -68,12 +68,20 @@ describe("OneDriveClient.downloadFile", () => {
     expect(secondOutcome.message).toMatch(/Network error/);
     expect(secondOutcome.message).not.toMatch(/Content endpoint unavailable/);
 
-    const contentCallsFor = (id: string) => requestSpy.mock.calls.filter(([r]) =>
-      String(r.url).includes("/content") && String(r.url).includes(id)).length;
-    // Both /content tiers attempted for each file (Obsidian requestUrl does
-    // not retry this path — one attempt per tier per file).
-    expect(contentCallsFor("id-a")).toBeGreaterThanOrEqual(2);
-    expect(contentCallsFor("id-b")).toBeGreaterThanOrEqual(2);
+    const contentCalls = requestSpy.mock.calls
+      .map(([request]) => String(request.url))
+      .filter((url) => url.includes("/content"));
+    // Both /content tiers are attempted for each file: the path-form URL
+    // carries the file name, the item-ID form carries the drive item id.
+    // (Attempt count per tier is not asserted.)
+    const contentTiersTried = (id: string, path: string) => ({
+      byId: contentCalls.some((url) => url.includes(id)),
+      byPath: contentCalls.some((url) => url.includes(path)),
+    });
+    expect(contentTiersTried("id-a", "a.bin"))
+      .toEqual({ byId: true, byPath: true });
+    expect(contentTiersTried("id-b", "b.bin"))
+      .toEqual({ byId: true, byPath: true });
     process.off("unhandledRejection", __uh);
   });
 
@@ -365,9 +373,10 @@ describe("OneDriveClient.downloadFile", () => {
   it("downloadUrl uses file-size budget instead of 8s cap", async () => {
     vi.useFakeTimers();
     const requestSpy = vi.spyOn(obsidian, "requestUrl");
-    // CDN responds in 15s. Primary budget for 5MB = 20s, plus 30% failure reserve.
-    // Old: Math.min(8s, 20s) = 8s timeout → downloadUrl killed before 15s response
-    // New: total window = 26s → downloadUrl succeeds at 15s without using fallback.
+    // CDN responds in 15s. Primary budget for 5MB = 90s (30s base + 12s/MiB),
+    // plus a 50% failure reserve (45s) → total window 135s.
+    // Old: Math.min(8s, 90s) = 8s timeout → downloadUrl killed before 15s response
+    // New: total window = 135s → downloadUrl succeeds at 15s without using fallback.
     const content = new Uint8Array([1, 2, 3]).buffer;
     requestSpy.mockImplementationOnce(() => {
       return new Promise((resolve) => {
@@ -2803,6 +2812,9 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
     /** Window that lands exactly half of itself on its first attempt and
      *  nothing afterwards — the "about 60% landed" shape. */
     halfLandedWindow: number | null;
+    /** Node's transport teardown can arrive with `name: "AbortError"` while the
+     *  message/code still mark it as a connection fault. */
+    abortNamed?: boolean;
   }
 
   interface LadderRequest {
@@ -2841,9 +2853,14 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
           const served = isPartialLanding
             ? body.subarray(0, Math.ceil(body.byteLength / 2))
             : body;
-          const transportError = Object.assign(new Error("aborted"), {
-            code: "ECONNRESET",
-          });
+          const transportError = options.abortNamed
+            ? Object.assign(new Error("aborted"), {
+              name: "AbortError",
+              code: "ECONNRESET",
+            })
+            : Object.assign(new Error("aborted"), {
+              code: "ECONNRESET",
+            });
           const node = {
             statusCode: 206,
             headers: {
@@ -3048,6 +3065,45 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
       expect(logs.some((message) => message.includes(
         `(206, Content-Range not exposed)`,
       ))).toBe(true);
+      expect(result.byteLength).toBe(RANGE_FILE_BYTES);
+      expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
+    } finally {
+      restore();
+    }
+  });
+
+  it("A3: falls back to the single-stream resume when the transport reports a bare AbortError", async () => {
+    const source = rangeSource();
+    const server = makeLadderServer(source, {
+      intactWindows: 9,
+      halfLandedWindow: 9,
+      abortNamed: true,
+    });
+    const resumed = makeResumeFetch(source, "honor");
+    const { diag, warnings } = makeDiagSpy();
+    const restore = withWindowFetch(resumed.fetchSpy);
+    try {
+      const client = makeRangeClient(server.https, diag, 16);
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        RANGE_FILE_BYTES,
+      );
+
+      // The AbortError name alone must not look like a user cancel: the range
+      // failure is diagnosed and the single stream resumes at the first hole.
+      const landedBytes = 9 * RANGE_WINDOW_BYTES + RANGE_WINDOW_BYTES / 2;
+      expect(warnings.some((message) => message.includes(
+        `multi-range download failed, falling back to single stream (resume at byte ${landedBytes}`,
+      ))).toBe(true);
+      expect(resumed.fetchSpy).toHaveBeenCalledTimes(1);
+      expect(resumed.calls[0]).toEqual({
+        range: `bytes=${landedBytes}-`,
+        status: 206,
+        served: RANGE_FILE_BYTES - landedBytes,
+      });
       expect(result.byteLength).toBe(RANGE_FILE_BYTES);
       expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
     } finally {

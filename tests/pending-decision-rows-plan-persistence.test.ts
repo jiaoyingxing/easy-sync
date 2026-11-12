@@ -1,7 +1,8 @@
 // 计划派生的**决策行**（冲突行／删除确认行）与共享状态提交解耦（2026-10-18）。
 //
 // 家族背景（设计单 §J-1／第二刀日志 §未覆盖；唯一详细承接位＝
-// docs/dev-logs/2026-10/20261016-205048 …／20261016-213000 …）：
+// docs/dev-logs/2026-10/20261016-205048 …／20261016-213000 …；
+// 直接实施日志＝docs/dev-logs/2026-10/20261018-025435 …）：
 // 用户可见待办（冲突行／删除确认／问题行）原先只在 `executePlan` 末尾落库一次，
 // 而那一块的最后一步才是**共享状态提交闸门**——账本里还剩未结清记录、且它与轮首
 // 的隔离保护集不同即 throw，拒绝发布共同状态。本轮收集到的行一律留在内存里，
@@ -543,11 +544,12 @@ describe("planner-derived decision rows land with the plan", () => {
 
   it("never rewrites an existing decision row's non-token state (the row carries other owners' state)", async () => {
     // 已存在的行不是纯计划派生状态：自动合并走 `state.pendingConflicts` 读回行上
-    // 缓存的 `textMergeEvidence`（sync-executor 20794 起）——规划步若按路径覆写
+    // 缓存的 `textMergeEvidence`（sync-executor 的自动合并段）——规划步若按路径覆写
     // 它，这条缓存就会被抹掉、下一轮重算（并多一次内容下载）。因此本通道只补缺
-    // 口：计划里有、状态里还没有的行才落地；已存在的行只在「token 已属本库、本机／
-    // 云端事实未变、仅 ancestor 变了」时原位换 token（另有用例钉住），其余交给
-    // 轮末 owner 刷新。
+    // 口：计划里有、状态里还没有的行才落地；已存在的行有两种规划步写入：
+    // ①无 token 的遗留行（本机/云端事实已记录）由 missing-token→bookkeeping 分支
+    // upsert 补 token（727 行用例钉住）；②token 已属本库、事实未变、仅 ancestor
+    // 变化时原位换 token。其余交给轮末 owner 刷新。
     const existingConflict = {
       ...conflictItem,
       textMergeEvidence: { version: 1, marker: "kept" },

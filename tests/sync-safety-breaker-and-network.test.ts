@@ -35,6 +35,7 @@ import type {
 } from "../src/sync/types";
 import { SyncExecutor } from "../src/sync/sync-executor";
 import type { SyncResult } from "../src/sync/sync-executor";
+import { AuthError, AuthErrorType } from "../src/auth/types";
 import { OneDriveClient, ResponseByteBudgetError } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
 import type { LocalScanner } from "../src/sync/local-scanner";
@@ -853,6 +854,33 @@ describe("network-class transfer failure marking (2026-10-16)", () => {
     expect(result.success).toBe(false);
     expect(result.message).toBe("同步失败：网络请求失败");
   });
+
+  it("marks a run-level transient auth refresh network failure as network-class", async () => {
+    // 2026-11-11 现场：设备休眠唤醒时访问令牌刷新遇到
+    // `net::ERR_NETWORK_IO_SUSPENDED`，整轮在 Graph 准备前失败。它属于环境
+    // 瞬态（凭据仍有效、登录态保留），必须计入网络类豁免族；否则暂停门会
+    // 按「run 级意外异常」停掉整库自动同步，等用户手动点一次同步。
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        initVaultScope: vi.fn().mockRejectedValue(
+          new AuthError(
+            AuthErrorType.NetworkError,
+            "认证网络错误：net::ERR_NETWORK_IO_SUSPENDED",
+          ),
+        ),
+      }),
+      emptyScanner(),
+      await makeMemoryState(),
+      "testVault",
+    );
+
+    const result = await executor.run("auto", {});
+
+    expect(result.success).toBe(false);
+    expect(result.authExpired).toBe(false);
+    expect(result.errors).toBe(1);
+    expect(result.networkFailureErrors).toBe(1);
+  });
 });
 
 describe("plan-layer identity deferral exempt family (2026-10-18)", () => {
@@ -1444,8 +1472,6 @@ describe("M19 anti-downgrade guard version comparison (finding ③)", () => {
     expect(skipped).toBe(items.length);
   });
 });
-
-// ---- Recovery observation reviewed-cursor preservation (plan re-pause loop) ----
 
 describe("connection-speed in-flight overlay", () => {
   const sleep = (ms: number) =>

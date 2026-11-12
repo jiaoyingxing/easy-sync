@@ -295,7 +295,7 @@ describe("writeRecoveryCopyV1", () => {
       tmpDir: TMP_DIR,
     });
 
-    // 运行期走过的每个写／改名动作都只在运行时临时目录里（库内路径不进临时文件）。
+    // writeBinary 只写运行时临时目录；rename 的目标是库内路径（见下方断言）。
     expect(vault.writeTargets).toEqual([STAGE_PATH]);
     expect(vault.writeTargets.every((target) =>
       target.startsWith(`${TMP_DIR}/`))).toBe(true);

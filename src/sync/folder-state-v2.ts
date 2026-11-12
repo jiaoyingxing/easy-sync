@@ -324,6 +324,14 @@ export function planFolderStateFromViewV2(
   const inferredLocalByRemoteId = new Map<string, string>();
   const localEvidenceConflicts = new Set<string>();
   const localScopeCrossings = new Map<string, string>();
+  /** Identity keys the undecided anchors freeze: anchor paths, their rename
+   *  suspects (byte-overlap evidence) and the undecidable empty shells from
+   *  the missing-local branch. Seeded empty — an undecided anchor with no
+   *  suspect evidence freezes only its own path. */
+  const frozenLocalKeys = new Set<string>();
+  /** Identity keys the missing-remote branch froze (the anchor's own path and
+   *  its inferred local destination). */
+  const frozenRemoteKeys = new Set<string>();
   /** Anchored folders whose local move evidence lands inside the vault trash:
    *  the trash move is a deletion gesture, mirrored as delete-remote below. */
   const localTrashDeletes = new Map<string, string>();
@@ -374,6 +382,8 @@ export function planFolderStateFromViewV2(
     unclaimedLocalFolders,
     unclaimedFileCounts,
     unclaimedRenameSuspects,
+    frozenLocalKeys,
+    frozenRemoteKeys,
     candidates,
     consumedLocalPaths,
   });
@@ -390,6 +400,7 @@ export function planFolderStateFromViewV2(
     remoteFilesByIdentity,
     anchoredRemoteIds,
     unresolvedLocalIdentity,
+    renameAmbiguityKeys: frozenLocalKeys,
     remotePathById,
     candidates,
   });
@@ -403,6 +414,7 @@ export function planFolderStateFromViewV2(
     localFoldersByIdentity,
     localFilesByIdentity,
     unresolvedRemoteIdentity,
+    remoteAmbiguityKeys: frozenRemoteKeys,
     remotePathById,
     candidates,
   });
@@ -530,6 +542,11 @@ interface UnanchoredLocalFolderPlanInputV2 {
   remoteFilesByIdentity: ReadonlyMap<string, { id: string; path: string }>;
   anchoredRemoteIds: ReadonlySet<string>;
   unresolvedLocalIdentity: boolean;
+  /** Identity keys of the folders an undecided anchor might have been renamed
+   *  into (byte-level content overlap with its descendants). Only these (and
+   *  only while some anchor is actually undecided) keep the fail-closed freeze;
+   *  unrelated one-sided folders create normally (2026-11-11 freeze scope). */
+  renameAmbiguityKeys: ReadonlySet<string>;
   remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
   candidates: PlannedCandidate[];
 }
@@ -544,7 +561,7 @@ interface UnanchoredLocalFolderPlanInputV2 {
 function planUnanchoredLocalFolderCandidatesV2({
   input, preserveFolderPath, includeFolderPath, consumedLocalPaths, anchoredLastPaths,
   remoteFoldersByIdentity, remoteFilesByIdentity, anchoredRemoteIds,
-  unresolvedLocalIdentity, remotePathById, candidates,
+  unresolvedLocalIdentity, renameAmbiguityKeys, remotePathById, candidates,
 }: UnanchoredLocalFolderPlanInputV2): void {
   for (const folder of input.localFolders) {
     if (preserveFolderPath(folder.path)) continue;
@@ -577,7 +594,13 @@ function planUnanchoredLocalFolderCandidatesV2({
         ));
       }
     } else {
-      if (unresolvedLocalIdentity) continue;
+      // The identity freeze covers only folders an undecided anchor might
+      // have been renamed into. Unrelated local-only folders used to be
+      // globally suppressed here (1.6.9 field report 20261111: deferrals
+      // 42→106 across eight rounds because every fresh folder waited on one
+      // stale ambiguity); they now create normally while the suspect keeps
+      // its review conflict.
+      if (unresolvedLocalIdentity && renameAmbiguityKeys.has(key)) continue;
       candidates.push(actionCandidate(
         "create-remote",
         folder.path,
@@ -601,6 +624,10 @@ interface UnanchoredRemoteFolderPlanInputV2 {
   localFoldersByIdentity: ReadonlyMap<string, string>;
   localFilesByIdentity: ReadonlyMap<string, LocalFileEntry>;
   unresolvedRemoteIdentity: boolean;
+  /** Identity keys of the local folders an undecided remote-missing anchor
+   *  may have moved to. Only these keep the fail-closed freeze (2026-11-11
+   *  freeze scope, mirror direction). */
+  remoteAmbiguityKeys: ReadonlySet<string>;
   remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
   candidates: PlannedCandidate[];
 }
@@ -613,7 +640,8 @@ interface UnanchoredRemoteFolderPlanInputV2 {
  */
 function planUnanchoredRemoteFolderCandidatesV2({
   input, preserveFolderPath, includeFolderPath, anchoredRemoteIds, remoteFoldersByIdentity,
-  localFoldersByIdentity, localFilesByIdentity, unresolvedRemoteIdentity, remotePathById,
+  localFoldersByIdentity, localFilesByIdentity, unresolvedRemoteIdentity,
+  remoteAmbiguityKeys, remotePathById,
   candidates,
 }: UnanchoredRemoteFolderPlanInputV2): void {
   for (const [key, remoteFolder] of remoteFoldersByIdentity) {
@@ -631,7 +659,10 @@ function planUnanchoredRemoteFolderCandidatesV2({
         remotePathById,
       ));
     } else {
-      if (unresolvedRemoteIdentity) continue;
+      // Mirror of the local-side freeze scope: only the folders the missing
+      // remote anchor may have been renamed into keep waiting; unrelated
+      // remote-only folders download normally.
+      if (unresolvedRemoteIdentity && remoteAmbiguityKeys.has(key)) continue;
       candidates.push(actionCandidate(
         "create-local",
         remoteFolder.path,
@@ -764,6 +795,10 @@ function planAnchoredFolderCandidatesV2(args: {
   unclaimedLocalFolders: readonly LocalFolderEntry[];
   unclaimedFileCounts: ReadonlyMap<string, number>;
   unclaimedRenameSuspects: (anchor: FolderAnchorV2) => string[];
+  /** Receives the local-side freeze scope (missing-local branch). */
+  frozenLocalKeys: Set<string>;
+  /** Receives the remote-side freeze scope (missing-remote branch). */
+  frozenRemoteKeys: Set<string>;
   candidates: PlannedCandidate[];
   consumedLocalPaths: Set<string>;
 }): {
@@ -789,6 +824,8 @@ function planAnchoredFolderCandidatesV2(args: {
     unclaimedLocalFolders,
     unclaimedFileCounts,
     unclaimedRenameSuspects,
+    frozenLocalKeys,
+    frozenRemoteKeys,
     candidates,
     consumedLocalPaths,
   } = args;
@@ -836,6 +873,7 @@ function planAnchoredFolderCandidatesV2(args: {
 
     if (localEvidenceConflicts.has(anchor.remoteId)) {
       unresolvedLocalIdentity = true;
+      frozenLocalKeys.add(identityPath(anchor.lastPath));
       candidates.push(conflictCandidate(
         anchor.lastPath,
         "local-rename-evidence-conflict",
@@ -851,7 +889,7 @@ function planAnchoredFolderCandidatesV2(args: {
     }
 
     if (!remotePath) {
-      unresolvedRemoteIdentity = planAnchoredFolderMissingRemoteV2({
+      const missingRemote = planAnchoredFolderMissingRemoteV2({
         anchor,
         inferredLocalPath,
         includeFolderPath,
@@ -861,7 +899,14 @@ function planAnchoredFolderCandidatesV2(args: {
         remotePathById,
         unresolvedRemoteIdentity,
         candidates,
-      }).unresolvedRemoteIdentity;
+      });
+      unresolvedRemoteIdentity = missingRemote.unresolvedRemoteIdentity;
+      if (unresolvedRemoteIdentity) {
+        frozenRemoteKeys.add(identityPath(anchor.lastPath));
+        if (inferredLocalPath) {
+          frozenRemoteKeys.add(identityPath(inferredLocalPath));
+        }
+      }
       continue;
     }
     if (!inferredLocalPath) {
@@ -877,6 +922,7 @@ function planAnchoredFolderCandidatesV2(args: {
         unclaimedLocalFolders,
         unclaimedFileCounts,
         unresolvedLocalIdentity,
+        frozenLocalKeys,
       });
       unresolvedLocalIdentity = missingLocal.unresolvedLocalIdentity;
       continue;
@@ -987,15 +1033,6 @@ function planAnchoredFolderCandidatesV2(args: {
   return { unresolvedLocalIdentity, unresolvedRemoteIdentity };
 }
 
-/**
- * Plan the candidates for one anchor whose remote folder still exists but
- * whose local identity stayed unresolved: the scope-crossing conflict, the
- * deletion-gesture mirrored delete-remote, the rename-ambiguity conflict over
- * unclaimed local folders, or the fail-closed retirement. Every outcome ends
- * this anchor for the current pass, so the caller always continues to the
- * next anchor; the returned flag carries the local-identity verdict back to
- * the shared fail-closed flags.
- */
 interface AnchoredFolderLocalMoveInputV2 {
   anchor: FolderAnchorV2;
   inferredLocalPath: string;
@@ -1262,8 +1299,9 @@ function planAnchoredFolderTrashDeleteV2({
     // Local folder was moved into the vault trash == local deletion.
     // Mirror it on the remote like the file layer already does; the
     // deletion chain (If-Match → OneDrive recycle bin → read-back) is the
-    // established safety net. When the remote folder is gone too, fall
-    // through to the ordinary both-sides retirement path below.
+    // established safety net. The remote-gone case never reaches this
+    // function (the caller guards remotePath and continues), so there is no
+    // fall-through here.
     candidates.push(actionCandidate(
       "delete-remote",
       anchor.lastPath,
@@ -1380,6 +1418,15 @@ function planAnchoredFolderMissingRemoteV2({
   return { unresolvedRemoteIdentity };
 }
 
+/**
+ * Plan the candidates for one anchor whose remote folder still exists but
+ * whose local identity stayed unresolved: the scope-crossing conflict, the
+ * deletion-gesture mirrored delete-remote, the rename-ambiguity conflict over
+ * unclaimed local folders, or the fail-closed retirement. Every outcome ends
+ * this anchor for the current pass, so the caller always continues to the
+ * next anchor; the returned flag carries the local-identity verdict back to
+ * the shared fail-closed flags.
+ */
 function planAnchoredFolderMissingLocalV2(args: {
   anchor: FolderAnchorV2;
   remotePath: string;
@@ -1392,6 +1439,10 @@ function planAnchoredFolderMissingLocalV2(args: {
   unclaimedLocalFolders: readonly LocalFolderEntry[];
   unclaimedFileCounts: ReadonlyMap<string, number>;
   unresolvedLocalIdentity: boolean;
+  /** Collects the identity keys of folders this ambiguity freezes, so the
+   *  unanchored pass can scope its fail-closed suppression to them
+   *  (2026-11-11 freeze scope). */
+  frozenLocalKeys?: Set<string>;
 }): { unresolvedLocalIdentity: boolean } {
   const {
     anchor,
@@ -1455,6 +1506,13 @@ function planAnchoredFolderMissingLocalV2(args: {
     : [];
   if (renameSuspects.length > 0 || undecidableEmpty.length > 0) {
     unresolvedLocalIdentity = true;
+    args.frozenLocalKeys?.add(identityPath(anchor.lastPath));
+    for (const folder of renameSuspects) {
+      args.frozenLocalKeys?.add(identityPath(folder));
+    }
+    for (const folder of undecidableEmpty) {
+      args.frozenLocalKeys?.add(identityPath(folder.path));
+    }
     candidates.push(conflictCandidate(
       anchor.lastPath,
       "anchored-folder-missing-local",

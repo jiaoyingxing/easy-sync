@@ -5,8 +5,8 @@ import { I18n } from "../src/i18n";
 
 /**
  * 2026-10-31 confirmation-copy round: multi-action / multi-rule bodies use a
- * native ordered list, single actions stay one sentence, and zero-file actions
- * stay paragraphs. No DOM harness exists in this repo, so the render slot is
+ * native ordered list, single actions stay one sentence. (Zero-file actions are
+ * not covered here.) No DOM harness exists in this repo, so the render slot is
  * pinned by source shape and the copy by locale values.
  */
 describe("confirm modal numbered steps (2026-10-31)", () => {

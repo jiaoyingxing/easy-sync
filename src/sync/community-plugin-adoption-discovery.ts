@@ -104,7 +104,8 @@ interface CommunityPluginPlatformFact {
  * Resolves one trusted platform fact per complete catalog entry from
  * source-bound manifest observations (mirrors the inventory's remote facts
  * rules; an observation that no longer matches the current member is not
- * evidence). Returns null when a plugin has no manifest observation.
+ * evidence). A plugin with no manifest observation keeps a Map entry whose
+ * name/desktopOnly fields are null (callers treat null as unknown).
  */
 export async function resolveCommunityPluginPlatformFacts(
   scope: Readonly<SyncScope>,

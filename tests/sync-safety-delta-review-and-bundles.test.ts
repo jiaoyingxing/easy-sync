@@ -150,15 +150,16 @@ describe("Persistent remote delta state", () => {
         throw new Error("decision-token binding must not materialize the whole base snapshot");
       });
 
+    let row: SyncPlanItem | null = null;
     try {
-      (executor as unknown as {
-        bindPendingDecisionTokens(plan: SyncPlan): void;
-      }).bindPendingDecisionTokens(plan);
+      row = (executor as unknown as {
+        decisionRowForPlanItem(item: SyncPlanItem): SyncPlanItem | null;
+      }).decisionRowForPlanItem(plan.items[0]);
     } finally {
       baseSnapshotMaterialization.mockRestore();
     }
 
-    expect(plan.items[0].decisionToken?.ancestorHash).toBe("bb".repeat(32));
+    expect(row?.decisionToken?.ancestorHash).toBe("bb".repeat(32));
   });
 
   it("reopens review for a stale manual resolution and replaces it with a fresh choice", async () => {
@@ -1320,12 +1321,12 @@ describe("Persistent remote delta state", () => {
       bytes: new TextEncoder().encode("cloud rewrote everything").buffer,
     });
 
-    // The user picks keep-remote from the stale (now outdated) cached
+    // The user picks keep-local from the stale (now outdated) cached
     // snapshot. The resolve chain re-checks current facts → digest mismatch
     // → zero writes, and the stale review is not attached.
     const resolved = await harness.executor.resolveMutationRecovery(
       reopen!,
-      "keep-remote",
+      "keep-local",
     );
     expect(resolved).toBe(false);
     expect(harness.uploadFile).not.toHaveBeenCalled();
@@ -2371,6 +2372,91 @@ describe("Persistent remote delta state", () => {
     expect(composite.remoteFiles.has("old.md")).toBe(true);
     expect(composite.remoteFiles.has("new.md")).toBe(false);
     expect(composite.state.mutationLedger).toEqual([]);
+  });
+
+  it("settles a move record that converged on one path with diverged content by choosing a version", async () => {
+    // 2026-11-11 field report (user upgraded 1.3.8 -> 1.6.9): an interrupted
+    // moveLocalFile left the source path gone on both sides while the target
+    // path holds a copy on each side with different bytes. The path move is
+    // complete, so there is no location decision and no second copy to retire
+    // — the only executable outcome is the ordinary "which version wins"
+    // choice, settled by an upload (keep-local) or a download (keep-remote) at
+    // the surviving path. Before this shape was covered the review had no
+    // action at all and the record blocked recovery forever.
+    const keepLocal = await makeManualResolutionHarness({
+      sourcePath: "old.md",
+      path: "new.md",
+      action: "moveLocal",
+      local: { "new.md": "local-version" },
+      remote: { "new.md": "cloud-version" },
+    });
+    const localReview = await keepLocal.executor
+      .getMutationRecoveryResolutionSnapshot();
+    expect(localReview).toMatchObject({
+      previousAction: "moveLocal",
+      sourcePath: "old.md",
+      path: "new.md",
+      keepLocal: { available: true, deletesOtherSide: false },
+      keepRemote: { available: true, deletesOtherSide: false },
+    });
+    expect(localReview?.local.filter((fact) => fact.exists)).toHaveLength(1);
+    expect(localReview?.remote.filter((fact) => fact.exists)).toHaveLength(1);
+
+    expect(await keepLocal.executor.resolveMutationRecovery(
+      localReview!,
+      "keep-local",
+    )).toBe(true);
+    expect(new TextDecoder().decode(
+      keepLocal.remoteFiles.get("new.md")!.bytes,
+    )).toBe("local-version");
+    expect(new TextDecoder().decode(keepLocal.localBytes.get("new.md"))).toBe(
+      "local-version",
+    );
+    // No path move and no deletion: both record paths already agree on where
+    // the file lives.
+    expect(keepLocal.moveItemById).not.toHaveBeenCalled();
+    expect(keepLocal.deleteItem).not.toHaveBeenCalled();
+    expect(keepLocal.state.mutationLedger).toEqual([]);
+    const localAttach = vi.mocked(keepLocal.state.attachManualMutationResolution);
+    expect(localAttach).toHaveBeenCalledTimes(1);
+    const localResolution = localAttach.mock.calls[0][1] as ManualMutationResolutionV1;
+    expect(localResolution.externalMutation).toBe(true);
+    expect(localResolution.intent.action).toBe("upload");
+    expect(localResolution.intent.path).toBe("new.md");
+    // The overwrite keeps the single-path semantic gate: no sourcePath on the
+    // resolution intent (the old path is already gone on both sides).
+    expect("sourcePath" in localResolution.intent).toBe(false);
+
+    const keepRemote = await makeManualResolutionHarness({
+      sourcePath: "old.md",
+      path: "new.md",
+      action: "moveLocal",
+      local: { "new.md": "local-version" },
+      remote: { "new.md": "cloud-version" },
+    });
+    const remoteReview = await keepRemote.executor
+      .getMutationRecoveryResolutionSnapshot();
+
+    expect(await keepRemote.executor.resolveMutationRecovery(
+      remoteReview!,
+      "keep-remote",
+    )).toBe(true);
+    expect(new TextDecoder().decode(keepRemote.localBytes.get("new.md"))).toBe(
+      "cloud-version",
+    );
+    expect(new TextDecoder().decode(
+      keepRemote.remoteFiles.get("new.md")!.bytes,
+    )).toBe("cloud-version");
+    expect(keepRemote.moveItemById).not.toHaveBeenCalled();
+    expect(keepRemote.deleteItem).not.toHaveBeenCalled();
+    expect(keepRemote.state.mutationLedger).toEqual([]);
+    const remoteAttach = vi.mocked(keepRemote.state.attachManualMutationResolution);
+    expect(remoteAttach).toHaveBeenCalledTimes(1);
+    const remoteResolution = remoteAttach.mock.calls[0][1] as ManualMutationResolutionV1;
+    expect(remoteResolution.externalMutation).toBe(true);
+    expect(remoteResolution.intent.action).toBe("download");
+    expect(remoteResolution.intent.path).toBe("new.md");
+    expect("sourcePath" in remoteResolution.intent).toBe(false);
   });
 
   it("recovers a receipted rename target-anchor collision by creating the reviewed local target", async () => {

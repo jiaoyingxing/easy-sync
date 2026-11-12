@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "policy": {
-    "currentPublicRelease": "1.5.9",
-    "directUpgradeBaseline": "1.5.9",
+    "currentPublicRelease": "1.6.9",
+    "directUpgradeBaseline": "1.6.9",
     "currentRuntimeProfile": "v2-with-local-layout-v2",
     "historicalMigrationFloor": "1.1.3",
     "unpublishedBuildsArePermanentInputs": false,

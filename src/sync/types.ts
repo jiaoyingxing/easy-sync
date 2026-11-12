@@ -844,7 +844,7 @@ export type SyncFileErrorTierV1 = (typeof SYNC_FILE_ERROR_TIERS)[number];
  * tier died, and how many attempts the retry loop spent.
  *
  * HARD BOUNDARY — these fields are never inputs to any decision. They must not
- * reach `isNetworkClassTransferFailure`, the M17 circuit breaker, the
+ * reach `isNetworkClassFailure`, the M17 circuit breaker, the
  * automatic-sync pause gate, planning, reconciliation or any retry budget. The
  * user-visible `reason` / `outcome` text and every existing classification stay
  * exactly as they were; this object only rides along as evidence. Adding a

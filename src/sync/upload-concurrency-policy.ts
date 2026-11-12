@@ -8,9 +8,10 @@ const DESKTOP_INITIAL_CONCURRENCY = 2;
 const MOBILE_INITIAL_CONCURRENCY = 1;
 const MIN_CONCURRENCY = 1;
 
-/** Successful files per AIMD window. Smaller than the desktop persistence
- *  batch (8) on purpose: one batch then spans two decision windows, so the
- *  pool can still step inside a batch instead of only between batches. */
+/** Successful files per AIMD window. Desktop: smaller than the persistence
+ *  batch (16) on purpose, so one batch spans several decision windows and the
+ *  pool can still step inside a batch; mobile batches are 4, i.e. exactly one
+ *  window. */
 const RAMP_WINDOW_FILES = 4;
 /** Samples behind the "recent median" reference: the two previous windows. */
 const REFERENCE_SAMPLES = 8;

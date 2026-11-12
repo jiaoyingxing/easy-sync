@@ -317,7 +317,7 @@ describe("public release 1.1.3 upgrade boundary", () => {
     }));
   });
 
-  it("keeps the complete public source digest stable across Main's migration pause lifecycle", async () => {
+  it("keeps the public source digest stable once read across Main's migration pause lifecycle", async () => {
     const { fixture } = readRelease113Fixture();
     const pluginData = structuredClone(fixture.pluginData);
     pluginData["auto-sync-paused"] = false;

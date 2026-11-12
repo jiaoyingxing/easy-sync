@@ -1,10 +1,11 @@
 /**
  * SyncProgressStore — Lightweight mutable progress state for the sync view.
  *
- * The SyncExecutor already computes per-file progress (current, total, path),
- * but main.ts currently discards the parameters. This store bridges the gap:
- * main.ts writes progress data in onProgress/onFileComplete callbacks, and
- * sync-view.ts reads it during render() to show real-time sync status.
+ * The SyncExecutor writes progress directly through setPhase/setProgress;
+ * main.ts's onProgress/onFileComplete callbacks discard their parameters and
+ * only refresh the view. This store is the shared mutable state: the executor
+ * writes it, and sync-view.ts reads it during render() to show real-time sync
+ * status.
  *
  * No event bus, no subscriptions — just a plain mutable object that the
  * render loop reads each time it fires.
@@ -95,7 +96,7 @@ export interface SyncProgressState {
   currentActionType?: SyncActionType;
   /** True after the user requests cancellation and before the run settles */
   cancelRequested: boolean;
-  /** Recently completed files (newest last, capped at 50 to avoid unbounded growth) */
+  /** Recently completed files (newest last, capped at 100 to avoid unbounded growth) */
   completedFiles: FileProgress[];
   /** True number of completed file actions this run; the retained list above is capped for display. */
   completedCount: number;

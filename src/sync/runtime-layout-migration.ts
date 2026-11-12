@@ -435,7 +435,10 @@ export async function ensureEasySyncRuntimeLayoutMigration(
   // still incomplete, each run has to keep looking for newly appeared sidecars,
   // because an interrupted migration or a downgraded run writes the old layout
   // again and would otherwise strand them there for good. A `completed` marker
-  // recorded an empty discovery, so this early return skips no such re-look.
+  // recorded an empty discovery at that moment; a later downgraded run can
+  // still write the old layout, and this early return deliberately accepts
+  // that residual instead of re-scanning on every run (registered as an
+  // intentional P3 boundary, archive C8 F3).
   if (storedMarker?.completed === true) {
     return { migrated: [], legacyFiles: [], conflicts: [] };
   }

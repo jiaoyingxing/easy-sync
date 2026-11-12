@@ -87,7 +87,7 @@ describe("local-only ignore memory", () => {
     expect(isLocalOnlyPathIgnored(ignored, copyPath)).toBe(true);
     expect(isLocalOnlyPathIgnored(ignored, "/notes/other.md")).toBe(false);
 
-    // 移除 API（本片不接界面，供后续拍板后的界面使用）。
+    // 移除 API 现由设置页「放回同步面板」批量清空消费。
     const cleared = reduceLocalOnlyIgnoreMemory(ignored, {
       type: "clear-ignore",
       path: copyPath,

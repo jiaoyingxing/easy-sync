@@ -391,9 +391,24 @@ export class StateEnvelopeV2Store {
     // replacement candidate can also be rolled back here: the journal and the
     // exact previous sequence prove which readable slot still owns state, and
     // the durable mutation receipt remains available for replay.
+    //
+    // A readable committed slot only proves the old commit when it is the
+    // previous envelope itself (DECISIONS 2026-07-27: "committed / previous
+    // 明确等于 previous"). Same sequence with different content is a
+    // write-channel substitution that slipped through the slot move: restore
+    // the journal-bound previous instead of letting the substituted bytes own
+    // state, and let this round fail while the channel still refuses.
+    const committedClaimsOldSeq =
+      committed?.meta.commitSeq === recovery.previousCommitSeq;
+    const committedIsPrevious = committed !== null
+      && previous !== null
+      && sameEnvelope(committed, previous);
     if (
-      committedRead.status !== "valid"
-      && previous?.meta.commitSeq === recovery.previousCommitSeq
+      previous?.meta.commitSeq === recovery.previousCommitSeq
+      && (
+        committedRead.status !== "valid"
+        || (committedClaimsOldSeq && !committedIsPrevious)
+      )
     ) {
       await this.restorePrevious();
       committed = previous;

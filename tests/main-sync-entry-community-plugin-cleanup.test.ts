@@ -480,7 +480,7 @@ describe("main sync entry guards", () => {
     );
   });
 
-  it("keeps the marker when the fresh catalog only lists the plugin as partial", () => {
+  it("keeps the marker when the fresh catalog has no complete bundle for the plugin", () => {
     const plugin = makePlugin();
     plugin.state = {
       isV2StateActive: true,
@@ -497,21 +497,8 @@ describe("main sync entry guards", () => {
     plugin.app.saveLocalStorage = saveLocalStorage as never;
     const show = vi.fn();
     plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
-    const catalog = {
-      version: 1,
-      complete: true,
-      stale: false,
-      revision: 5,
-      observedAt: 1,
-      sourceDigest: "a".repeat(64),
-      scope: {},
-      entries: [{
-        pluginId: "calendar",
-        bundleState: "partial",
-        bundleDigest: "b".repeat(64),
-        members: [],
-      }],
-    };
+    // 调用方只把 bundleState=complete 的条目当作复现证据（main.ts 的
+    // refresh 路径）；partial-only 目录在这里等价于空列表。
     (plugin as never as {
       sweepCommunityPluginCloudCleanupMarkers(
         reappearedPluginIds: readonly string[],

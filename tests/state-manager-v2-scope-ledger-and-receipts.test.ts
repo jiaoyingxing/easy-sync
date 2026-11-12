@@ -923,7 +923,8 @@ describe("StateManager V2 production controller", () => {
     // The W4 probe reports one canonicalization per commit. An upload batch
     // used to pay two whole-envelope canonicalizations (committed side and
     // candidate side); the builder now proves the change from the reducer
-    // results, so the skipped flag is the per-commit count: zero.
+    // results, so `wholeEnvelopeComparisonSkipped` is a boolean: true means
+    // this commit skipped the whole-envelope comparison entirely.
     const probes = log.mock.calls.filter(
       (call) => call[1] === "V2 content-facts canonicalization",
     );

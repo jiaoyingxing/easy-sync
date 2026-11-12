@@ -110,7 +110,9 @@ type EnsureCanonicalSharedSyncProtocolResultV2 =
  * Join or create the shared V2 migration generation.
  *
  * A missing record may be created only after the current device explicitly
- * acknowledges the migration risk. The persisted compatibility timestamp
+ * acknowledges the migration risk, except when the caller proves the same
+ * generation's recovered scope via `expectedBinding` (a recovered scope does
+ * not ask for a second confirmation). The persisted compatibility timestamp
  * does not attest to the state of other devices.
  * The record is immutable: create races are resolved by rereading and
  * adopting the compatible winner, never by overwriting it.

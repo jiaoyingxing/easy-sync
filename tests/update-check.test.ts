@@ -11,6 +11,7 @@ import {
   resolveNextUpdateCheckDelay,
   saveUpdateCheckState,
   seedUpdateCheckStateFromLegacyPluginData,
+  shouldShowUpdateReminder,
   SNOOZE_DURATION_MS,
   UPDATE_CHECK_INTERVAL_MS,
   UPDATE_CHECK_RETRY_INTERVAL_MS,
@@ -124,6 +125,63 @@ describe("update reminder suppression", () => {
   it("treats a snooze for an older version as expired", () => {
     const snooze = { version: "1.4.6", until: now + SNOOZE_DURATION_MS };
     expect(isUpdateReminderSuppressed("1.4.8", snooze, now)).toBe(false);
+  });
+});
+
+describe("shouldShowUpdateReminder", () => {
+  it("shows while the installed copy is behind the published release", () => {
+    expect(
+      shouldShowUpdateReminder({
+        latest: "1.6.9",
+        current: "1.6.8",
+        installed: "1.6.8",
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowUpdateReminder({
+        latest: "1.6.9",
+        current: "1.6.8",
+        installed: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("retires once the installed copy already carries the latest", () => {
+    expect(
+      shouldShowUpdateReminder({
+        latest: "1.6.9",
+        current: "1.6.8",
+        installed: "1.6.9",
+      }),
+    ).toBe(false);
+    // A local build ahead of the published release has nothing to update either.
+    expect(
+      shouldShowUpdateReminder({
+        latest: "1.6.9",
+        current: "1.6.8",
+        installed: "1.7.0",
+      }),
+    ).toBe(false);
+  });
+
+  it("never prompts when the running version already matches", () => {
+    expect(
+      shouldShowUpdateReminder({
+        latest: "1.6.9",
+        current: "1.6.9",
+        installed: "1.6.9",
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps prompting when the installed version is unreadable", () => {
+    expect(
+      shouldShowUpdateReminder({
+        latest: "1.6.9",
+        current: "1.6.8",
+        installed: "not-a-version",
+      }),
+    ).toBe(true);
   });
 });
 

@@ -1,12 +1,16 @@
 /**
  * StateManager — Sync state persistence and recovery
  *
- * Manages the three snapshots (local, remote, base) and pending
- * conflict/delete lists. Uses Obsidian plugin data API for persistence.
+ * Owns this device's sync authority: one V2 envelope (committed through the
+ * active IndexedDB store and mirrored by the manifest), the mutation receipt
+ * and checkpoint ledgers, and the pending conflict/delete lists. PluginData
+ * carries the settings-domain and plan-review projections.
  *
- * Key design: Per-file immediate persistence.
- * After each file operation succeeds, update baseSnapshot immediately.
- * On interruption, the next sync round naturally handles remaining diffs.
+ * Key design: unresolved mutation evidence blocks the operations that would
+ * build on unproven facts (planning recovers the ledger first, and
+ * remote-scope recovery refuses to start while the ledger is non-empty). A
+ * settled round commits its checkpoint, and the next round starts from the
+ * committed envelope.
  */
 
 import type { DataAdapter } from "obsidian";
@@ -1935,6 +1939,9 @@ export class StateManager {
     }
     this.data = {
       [KEY_BASE_SNAPSHOT]: saved[KEY_BASE_SNAPSHOT] ?? {},
+      [KEY_SIZE_EXCLUSION_BASELINE]: normalizeSizeExclusionBaseline(
+        saved[KEY_SIZE_EXCLUSION_BASELINE],
+      ),
       [KEY_PENDING_CONFLICTS]: saved[KEY_PENDING_CONFLICTS] ?? [],
       [KEY_PENDING_DELETES]: saved[KEY_PENDING_DELETES] ?? [],
       [KEY_PENDING_ISSUES]: Array.isArray(saved[KEY_PENDING_ISSUES])
@@ -2786,8 +2793,19 @@ export class StateManager {
       this.data[KEY_PENDING_DELETES].filter((item) => item.path !== path);
     this.data[KEY_PENDING_ISSUES] =
       this.data[KEY_PENDING_ISSUES].filter((item) => item.path !== path);
+    // This retirement runs during load(), before the commit queue has
+    // anything to serialize against, so the direct write is intentional. The
+    // in-memory revision must mirror the +1 the callback just persisted: a
+    // later full save would otherwise roll the monotonic CAS sequence back.
     if (this.data[KEY_PLAN_REVIEW_ITEMS].some((item) => item.path === path)) {
-      this.data = clearPlanReviewData(this.data);
+      const retiredRevision =
+        Number.isSafeInteger(this.data[KEY_PLAN_REVIEW_REVISION])
+          ? this.data[KEY_PLAN_REVIEW_REVISION] + 1
+          : 1;
+      this.data = {
+        ...clearPlanReviewData(this.data),
+        [KEY_PLAN_REVIEW_REVISION]: retiredRevision,
+      };
     }
   }
 
@@ -6910,7 +6928,12 @@ export class StateManager {
     return ancestorHashes;
   }
 
-  /** Commit exact-content evidence and retire its false conflict in one data write. */
+  /**
+   * Commit exact-content evidence, retire its false conflict, and drop the
+   * now-stale plan review. The V2 state commit and the PluginData projection
+   * are two separate persistence writes: a crash between them leaves the
+   * committed evidence with the conflict row still pending.
+   */
   async reconcileIdenticalConflict(entry: BaseFileEntry): Promise<void> {
     if (!this.v2Envelope) {
       throw new Error("Conflict reconciliation requires an active V2 state controller");
@@ -8387,10 +8410,14 @@ export class StateManager {
       && Boolean(item.local)
       && Boolean(item.remote),
     );
+    // One normal verification batch's download budget: more than one batch of
+    // `newFileBothSides` conflicts is the multi-batch cohort this gate exists
+    // for.
+    const MULTI_BATCH_CONFLICTS = 10;
     // Keep the stable active-V2 hot path free of even local recovery-journal
     // probes. Only a durable continuation or a multi-batch legacy cohort can
     // enter the reconstruction safety gate.
-    if (!active && relevantConflicts.length <= 10) {
+    if (!active && relevantConflicts.length <= MULTI_BATCH_CONFLICTS) {
       return { status: "none", roots: [] };
     }
     if (await this.confirmedDescendantEvidenceBlocked(input.scope)) {
@@ -8417,7 +8444,7 @@ export class StateManager {
       return { status: "none", roots: [] };
     }
 
-    if (relevantConflicts.length <= 10 || !envelope.folderAnchors) {
+    if (!envelope.folderAnchors) {
       return { status: "none", roots: [] };
     }
     const cohorts = new Map<number, FolderAnchorV2[]>();
@@ -8439,7 +8466,7 @@ export class StateManager {
         if (
           relevantConflicts.filter((item) =>
             isSameOrDescendantPath(item.path, root.lastPath),
-          ).length <= 10
+          ).length <= MULTI_BATCH_CONFLICTS
         ) continue;
         inferredRoots.push({
           path: root.lastPath,
@@ -10717,8 +10744,7 @@ export class StateManager {
     return this.v2Store ? this.v2Store.hasRecoveryJournal() : false;
   }
 
-  /** Bind the vault to an account. Once bound, only this account can sync.
-   *  Returns true if binding changed (needs save). */
+  /** Bind the vault to an account. Once bound, only this account can sync. */
   async bindAccount(accountId: string): Promise<void> {
     if (this.v2StateLoadBlock) {
       throw new Error("Cannot bind account while V2 load recovery is unresolved");
@@ -11668,12 +11694,14 @@ export class StateManager {
 
   /**
    * Remove regenerable state directories without letting one locked entry
-   * abort the remaining cleanup. The manifest and the selected database are
-   * already gone by the time directory cleanup runs, so a cloud client
-   * holding handles inside its sync root (Windows EPERM) must not strand the
-   * reset half-done: the recovery journal left behind would permanently block
-   * every fresh activation with stale future records. Surviving directories
-   * are recorded for user-facing disclosure and stay retryable by hand.
+   * abort the remaining cleanup. On the full-reset path the manifest and the
+   * selected database are already gone by the time directory cleanup runs; a
+   * conservative reset keeps them and re-reads the manifest for its authority
+   * check afterwards. Either way a cloud client holding handles inside its
+   * sync root (Windows EPERM) must not strand the cleanup half-done: the
+   * recovery journal left behind would permanently block every fresh
+   * activation with stale future records. Surviving directories are recorded
+   * for user-facing disclosure and stay retryable by hand.
    */
   private async removeStateDirectoriesIgnoringLocks(
     directories: readonly string[],
@@ -12482,10 +12510,12 @@ function isCommunityPluginBundleSettlementEntry(
   const conflictPaths = new Set<string>();
   const conflictRecords = conflictDecisions as Array<Record<string, unknown>>;
   for (const conflict of conflictRecords) {
+    // Check the element shape before reading any field: a persisted `null`
+    // (or primitive) must degrade to a rejected ledger, not a TypeError.
+    if (!isRecord(conflict)) return false;
     const decisionToken: unknown = conflict.decisionToken;
     if (
-      !isRecord(conflict)
-      || typeof conflict.path !== "string"
+      typeof conflict.path !== "string"
       || !memberPaths.has(conflict.path)
       || conflictPaths.has(conflict.path)
       || !isSyncDecisionToken(decisionToken)

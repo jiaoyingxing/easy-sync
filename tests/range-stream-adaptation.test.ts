@@ -75,9 +75,9 @@ function makeLink(capBytesPerSecond = Number.POSITIVE_INFINITY): FakeLink {
 /** Plan one file at the controller's tier, feed the link model's throughput
  *  back as one clean sample, and return what the file observed. The actual
  *  stream count mirrors `planRangeDownloadWindows`: the per-stream 1 MiB floor
- *  caps a plan that is larger than the file, so a 20 MiB file plans 24 but
- *  runs 20 windows. The controller is told the same size, so it never commits
- *  a probe to a rung this file cannot fund. */
+ *  caps a plan larger than the file — only when the current tier is already 24
+ *  does a 20 MiB file plan 24 but run 20 windows. The controller is told the
+ *  same size, so it never commits a probe to a rung this file cannot fund. */
 function observeFile(
   adaptation: RangeStreamAdaptation,
   link: FakeLink,

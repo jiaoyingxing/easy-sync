@@ -197,7 +197,8 @@ describe("sync mode disable view", () => {
 
 describe("sync mode transition counts", () => {
   it("counts the files that will become copies", () => {
-    // 有基线且本机改过／无基线但云端同名＝切换后会留副本的那些。
+    // 有基线且本机改过／无基线但云端同名＝计数口径；其中「本机改过而云端已删」
+    // 与「无基线同名但内容相同」两类会计入却不生成副本（见模块文档）。
     expect(countLocalOnlyEditedFacts({
       localEntries: [
         { path: "edited.md", hash: "b".repeat(64), size: 10, mtime: 1, binary: false },

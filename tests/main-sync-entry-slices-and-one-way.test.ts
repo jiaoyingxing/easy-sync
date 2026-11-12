@@ -583,8 +583,8 @@ describe("sync mode switch transaction (片⑥)", () => {
     const syncViewRender = vi.fn();
     const refreshSyncState = vi.fn();
     plugin.state = state as never;
-    // syncView 是 getter（main.ts:1515），settingsTab 是私有字段：分别用 getter
-    // spy 与直接赋值替换，观察切换后的两处刷新。
+    // syncView 是 getter（main.ts 的 syncView 访问器），settingsTab 是私有字段：
+    // 分别用 getter spy 与直接赋值替换，观察切换后的两处刷新。
     vi.spyOn(plugin, "syncView", "get").mockReturnValue({
       render: syncViewRender,
     } as never);
@@ -738,8 +738,8 @@ describe("sync mode switch transaction (片⑥)", () => {
   it("rejects the switch on a corrupt mutation ledger, same criterion as the settings commit", async () => {
     const plugin = makePlugin();
     const harness = attachSyncModeHarness(plugin);
-    // 同口径来源 state-manager.ts:5954-5963：损坏/隔离/载入阻塞与"台账非空"
-    // 同属"恢复未完成"，同样拒绝（台账本身为空）。
+    // 同口径来源 main.ts 的 hasUnsettledMutationRecovery 判据：损坏/隔离/载入
+    // 阻塞与"台账非空"同属"恢复未完成"，同样拒绝（台账本身为空）。
     (plugin.state as never as { hasMutationLedgerCorruption: boolean })
       .hasMutationLedgerCorruption = true;
 

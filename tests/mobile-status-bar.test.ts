@@ -118,7 +118,8 @@ describe("mobile status bar", () => {
     );
 
     // Arm the retry by hand: a disable must drop it even when no retry is
-    // currently scheduled, so a later layout-ready callback cannot re-show.
+    // currently scheduled. (The later layout-ready callback is actually stopped
+    // by its own `this.mobileStatusBar` check; this test only pins the flag.)
     (plugin as never as { mobileStatusBarLayoutRetryArmed: boolean })
       .mobileStatusBarLayoutRetryArmed = true;
     plugin.mobileStatusBar = false;

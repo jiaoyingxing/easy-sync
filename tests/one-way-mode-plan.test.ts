@@ -610,7 +610,8 @@ describe("one-way plan suppression", () => {
       .toEqual([SyncActionType.DeleteLocal]);
     expect(oneWay.items[0].decisionToken).toBeUndefined();
 
-    // The explicit two-way policy keeps today's confirmation row.
+    // The explicit two-way forced-follow policy also deletes without a
+    // confirmation row.
     const twoWayForced = await finalizeCanonicalPlan({
       candidate,
       envelope: state,
@@ -1028,9 +1029,7 @@ describe("one-way plan suppression", () => {
     expect(oneWay.items[0].remote).toBeUndefined();
     // No automatic copy/restore for this shape, in either direction.
     const twoWay = await finalizeCanonicalPlan({ candidate, envelope: state });
-    expect(itemKeys(twoWay.items)).toEqual(
-      itemKeys(oneWay.items).map((key) => key.replace("Conflict", "Conflict")),
-    );
+    expect(itemKeys(twoWay.items)).toEqual(itemKeys(oneWay.items));
     expect(oneWay.items[0].localOnlyCopyKind).toBeUndefined();
     expect(twoWay.items[0].localOnlyCopyKind).toBeUndefined();
   });
@@ -1462,7 +1461,7 @@ describe("activation review wiring", () => {
     );
     expect(stateManager).toContain("items: input.plan.items,");
 
-    // 投影只做字段搬运，不新增类型、不过滤（单向模式下因此不会冒出上传行）。
+    // 投影只做字段搬运，不新增类型、不过滤（不改变单向计划里既有的 .obsidian 上传行）。
     const holdStore = read("../src/sync/migration-hold-v2.ts");
     expect(holdStore).toContain("items: projectReviewItems(input.items),");
     expect(holdStore).toContain("function projectReviewItems(");
@@ -1518,11 +1517,17 @@ describe("one-way local-only pipeline wiring", () => {
       new URL("../src/sync/sync-executor.ts", import.meta.url),
       "utf8",
     );
-    // 快照必须在 finalize 之前取：改写与抑制之后计划里就没有这个事实了。
+    // 快照必须在两处 finalize 改写之前取：sealer 落计划与
+    // finalizeCanonicalContentVerification 的 finalizedCanonicalPlan 都会
+    // 改写 plan.items，之后这个事实就没了。
     const snapshotAt = executor.indexOf("collectOneWayLocalOnlyPaths(plan.items");
     const sealAt = executor.indexOf("plan.items = sealed.items;");
+    const finalizedAt = executor.indexOf(
+      "plan.items = finalizedCanonicalPlan.items;",
+    );
     expect(snapshotAt).toBeGreaterThanOrEqual(0);
     expect(sealAt).toBeGreaterThan(snapshotAt);
+    expect(finalizedAt).toBeGreaterThan(snapshotAt);
     expect(executor).toContain('this.syncDirection === "one-way"');
     expect(executor).toContain(
       "reconcileLocalOnlyEntries(localOnlyPathsForReview)",

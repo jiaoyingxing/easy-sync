@@ -119,7 +119,7 @@ describe("settings i18n and mount contract gate", () => {
           continue;
         }
         const names = inlineParamNames(source, m.index + m[0].length);
-        if (names === null) continue; // 变量／展开实参：由类型与其它门承接
+        if (names === null) continue; // 变量／展开实参：本门跳过（不校验占位符名）
         checked++;
         const missing = [...tpl].filter((p) => !names.has(p));
         const unused = [...names].filter((p) => !tpl.has(p));
@@ -133,8 +133,8 @@ describe("settings i18n and mount contract gate", () => {
       }
     }
 
-    // 包装入口：`confirmExperimentalPluginData("<key>", { ... })` 的键与
-    // 插值形参不在同一条 `t(...)` 上，按调用表达式单独对账。包装器内部的
+    // 包装入口：`confirmExperimentalPluginData({ messageKey, params })` /
+    // `{ steps }` 的键与插值形参不在同一条 `t(...)` 上，按调用表达式单独对账。包装器内部的
     // `t(messageKey, params)` 是变量实参，由上面的 `names === null` 分支跳过；
     // 这里只收字面键，包装器定义本身（`messageKey`）没有字面键，也不会入账。
     let wrapperChecked = 0;

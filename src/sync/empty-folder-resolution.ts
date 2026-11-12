@@ -19,7 +19,8 @@ export interface EmptyFolderResolutionSnapshotV1 {
   path: string;
   remoteId: string;
   remoteETag: string;
-  /** Descendant-sensitive Graph tag. Required before direct cloud deletion. */
+  /** Descendant-sensitive Graph tag. Preferred before direct cloud deletion;
+   *  Personal returns no folder cTag, so the verified eTag is the fallback. */
   remoteCTag?: string;
   parentRemoteId: string;
   parentPath: string;

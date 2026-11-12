@@ -855,7 +855,7 @@ export function makeHarness(input?: {
           ? new TFile(path)
           : null),
       // 真实宿主总是自带的写入面：有它才会走「原地写」而不是改名交换
-      // （`DECISIONS` 2026-09-23 第 9 点）。
+      // （`DECISIONS` 2026-09-23 第 1 点）。
       modify: vi.fn(async (file: TFile, data: string) => {
         hostWrites.push(data);
         await commitLocalBytes(file.path, new TextEncoder().encode(data).buffer);

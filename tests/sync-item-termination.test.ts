@@ -1,6 +1,6 @@
 // S4 终止判据接线——逐项事实指纹＋「这一项是不是空转」＋一次明确结局。
 //
-// 合同：docs/2026-10-16 §五 D3／§六 S4 行（三类终点：自动完成／用户一次裁决／
+// 合同：docs/archive/2026-11/20261016-151934 同步引擎第一性原理复校准 §五 D3／§六 S4 行（三类终点：自动完成／用户一次裁决／
 //   明确不可重试诊断；同一事实指纹连续两轮相同且无明确外部依赖 ⇒ 离开「暂时」
 //   态，禁止继续展示不会改变结论的重试入口；只展示一次）＋归档口径
 //   docs/archive/2026-08/20260814-1155（分类合同五类、重检资格、事实指纹绑定面）。
@@ -793,7 +793,7 @@ describe("S4 termination criterion (executor wiring)", () => {
     expect(state.mutationLedger[0].receipt?.completedAt).toBe(2);
   });
 
-  it("zero coupling: a round with a concluded verdict keeps every round dimension of an unobserved twin", async () => {
+  it("zero coupling: a round with a concluded verdict keeps the ledger and upload surface of an unobserved twin", async () => {
     const observed = await makeStuckFolderRecordFixture();
     const twin = await makeStuckFolderRecordFixture();
     for (let round = 0; round < 3; round++) {

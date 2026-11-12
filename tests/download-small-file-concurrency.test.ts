@@ -1,6 +1,6 @@
 // 小文件下载档 (2026-10-27): 18 B–200 KiB 的文件没有带宽证据，旧策略因此
 // 整轮串行（桌面实测 2.79 秒/文件）。这里锁住两条行为：
-// 1. 连续完成的真实传输让上限 1 → 2 → 3，验证请求按批合并而不是逐文件；
+// 1. 连续完成的真实传输让上限 1 → 2 → 4，验证请求按批合并而不是逐文件；
 // 2. 一旦某个小文件批次失败，方向立刻退回串行——提速不能越过失败闸。
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Platform } from "obsidian";
@@ -97,7 +97,7 @@ describe("small-file download concurrency (2026-10-27)", () => {
     Platform.isMobile = previousMobile;
   });
 
-  it("ramps completed 18-byte transfers to three and batches the version checks", async () => {
+  it("ramps completed 18-byte transfers to four and batches the version checks", async () => {
     Platform.isMobile = false;
     const entries = makeEntries(30);
     let active = 0;
@@ -156,7 +156,7 @@ describe("small-file download concurrency (2026-10-27)", () => {
     expect(state.mutationLedger).toEqual([]);
   });
 
-  it("a failed small-file batch still drops the direction back to serial", async () => {
+  it("a failed small-file batch still commits the successful members", async () => {
     Platform.isMobile = false;
     const entries = makeEntries(10);
     const failingPath = entries[0].path;
@@ -190,9 +190,11 @@ describe("small-file download concurrency (2026-10-27)", () => {
     const verifySizes = getDriveItemMetadataByIds.mock.calls
       .filter((call) => call[1] === "downloadVersionVerify")
       .map((call) => call[0].length);
-    // The failed transfer locks the direction to serial; the first verify
+    // The failed transfer is excluded from the commit groups: the first verify
     // group carries the seven successful members, and the tail group carries
-    // the two files transferred after the failure.
+    // the two files transferred after the failure. (The round does not
+    // hard-lock to serial at the instant of failure; in-flight members finish
+    // first, so peak can stay above one.)
     expect(verifySizes).toEqual([7, 2]);
     expect(peak).toBeLessThanOrEqual(4);
   });

@@ -1980,14 +1980,15 @@ describe("Persistent remote delta state", () => {
   });
 
   // --- renameRemote auto-close (mirrors moveLocal A2, 2026-09-06) ---
-  // Gap: classifyUnreceiptedMutation renameRemote branch (sync-executor.ts:13871)
+  // Gap: classifyUnreceiptedMutation renameRemote branch (sync-executor 的
+  // unreceipted 分类段)
   // unconditionally returns null when target.driveId !== expectedRemote.driveId,
-  // unlike the upload branch (13810–13816) which checks whether the expected ID
+  // unlike the upload branch which checks whether the expected ID
   // is dead (byId 404) before giving up.  When the remote source is gone, the
   // target exists with a drifted driveId, the expected id is 404, and the target
   // content matches the local file, the rename is provably complete — converge.
 
-  it("abandons a proven not-applied renameRemote intent when the remote source is gone, target exists with drifted identity, and the expected remote identity is dead", async () => {
+  it("converges a provably-complete renameRemote intent when the remote source is gone, target exists with drifted identity, and the expected remote identity is dead", async () => {
     // renameRemote mirror of moveLocal A2 "three-missing-one": the remote
     // source is absent (the rename moved the item away), the target exists
     // with a new driveId, and the old expected driveId is gone (404).  The
@@ -2078,7 +2079,8 @@ describe("Persistent remote delta state", () => {
     const result = await executor.run("manual", {});
 
     // The provably completed renameRemote is auto-settled: the ledger is
-    // cleared with a checkpoint that updates the base to the new driveId.
+    // cleared and no recovery row survives. (The checkpoint's anchor update is
+    // not observable through this fake, so only the settlement is asserted.)
     expect(getDriveItemMetadataById).toHaveBeenCalledWith(expectedDriveId);
     expect(result.mutationRecovery).toBeUndefined();
     expect(state.mutationLedger).toEqual([]);

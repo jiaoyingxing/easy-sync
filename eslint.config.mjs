@@ -22,6 +22,9 @@ export default defineConfig([
       // 本轮临时产物区（见 AGENTS.md「临时产物」）：不提交，也不是产品代码；
       // 其他会话留在其中的仓库副本不应让发布前 lint 假红。
       ".tmp/**",
+      // Agent 会话工具自身的工作区（git-ignored，见 .gitignore 登记）：工作流草稿
+      // 与运行记录不在 tsconfig project service 内，与 outputs/** 同理由族。
+      ".zcode/**",
       // 登记保留的临时探针／夹具目录（各保留理由见对应开发日志），非产品代码：
       // 独立 .mjs 不在 tsconfig project service 内，纳入会产生解析错误类假告警。
       "outputs/**",

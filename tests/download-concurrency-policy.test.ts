@@ -17,7 +17,7 @@ function healthyBatch(files = 1, elapsedMs = 100, transferMs = 100) {
 }
 
 describe("DownloadConcurrencyPolicy", () => {
-  it("starts at one and only rises to two/three after repeated healthy batches", () => {
+  it("starts at one and only rises to two/four after repeated healthy batches", () => {
     const policy = new DownloadConcurrencyPolicy();
 
     expect(policy.limit).toBe(1);
@@ -31,7 +31,7 @@ describe("DownloadConcurrencyPolicy", () => {
     expect(policy.limit).toBe(4);
   });
 
-  it("caps a mobile-bound policy at two (A2) while desktop still reaches three", () => {
+  it("caps a mobile-bound policy at two (A2) while desktop still reaches four", () => {
     const mobile = new DownloadConcurrencyPolicy(
       MOBILE_DOWNLOAD_MAX_CONCURRENCY,
     );
@@ -105,7 +105,7 @@ describe("DownloadConcurrencyPolicy — 小文件档 (2026-10-27)", () => {
     };
   }
 
-  it("降档：18 字节批次没有带宽证据，但连续完成的传输让上限 1→2→3", () => {
+  it("降档：18 字节批次没有带宽证据，但连续完成的传输让上限 1→2→4", () => {
     const policy = new DownloadConcurrencyPolicy();
 
     expect(policy.limit).toBe(1);
@@ -149,8 +149,9 @@ describe("DownloadConcurrencyPolicy — 小文件档 (2026-10-27)", () => {
   });
 
   it("keeps one file at a time when the small transfer itself is slow", () => {
-    // 32 KiB over one second is 32 KiB/s: far below the 512 KiB/s bandwidth
-    // floor, so it is not healthy small-file evidence even though it finished.
+    // 32 KiB over one second is 32 KiB/s: below the 64 KiB/s small-file floor
+    // (the 512 KiB/s gate is not read for this tier), so it is not healthy
+    // small-file evidence even though it finished.
     const policy = new DownloadConcurrencyPolicy();
     for (let index = 0; index < 6; index++) {
       policy.observeBatch(noteBatch({ bytes: 32 * 1024, transferMs: 1_000 }));

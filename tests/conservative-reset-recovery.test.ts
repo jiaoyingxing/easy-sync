@@ -785,12 +785,26 @@ describe("conservative reset ordinary-file recovery contract", () => {
   });
 
   it("rejects a current-ID path collision and an indirect anchor claim", () => {
-    const first = record("download", { path: "X.md" });
-    const second = record("download", { path: "Y.md" });
+    // Distinct operation ids and remote ids: with the shared defaults the
+    // predicate returned false at the duplicate-operationId gate before the
+    // path map or anchors were ever consulted.
+    const first = record("download", {
+      operationId: "op-first",
+      path: "X.md",
+      expectedRemote: remote("id-first"),
+    });
+    const second = record("download", {
+      operationId: "op-second",
+      path: "Y.md",
+      expectedRemote: remote("id-second"),
+    });
     const secondId = (second.intent.expectedRemote as Extract<
       MutationRemoteExpectation,
       { exists: true }
     >).driveId;
+    // Control: without the collision the pair is independent, so the false
+    // below can only come from the path map / anchor claim.
+    expect(areIndependentConservativeResetRecords([first, second])).toBe(true);
     expect(areIndependentConservativeResetRecords(
       [first, second],
       new Map([[secondId, "X.md"]]),

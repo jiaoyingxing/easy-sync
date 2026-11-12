@@ -3,7 +3,8 @@ import en from "../src/i18n/en";
 
 /** 2026-10-20 en 文案收口（用户授权 AI 定稿）：en 用户可见面统一用 "cloud"
  *  指云端（"remote" 从展示文案退役）；引号/撇号一律弯号。error.present.* 是
- *  稳定错误码层（en 直通契约，见 i18n 规范 §4.2），不属本轮展示文案，豁免。 */
+ *  稳定错误码层（en 直通契约，见 i18n 规范 §4.2），只豁免 remote→cloud 用词，
+ *  不豁免直引号禁令（第二个用例仍检查全部 en 值）。 */
 const VALUES = Object.entries(en as unknown as Record<string, string>);
 
 describe("en copy contracts", () => {

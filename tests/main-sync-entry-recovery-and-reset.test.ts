@@ -266,6 +266,74 @@ describe("main sync entry guards", () => {
     );
   });
 
+  it("fails closed with the normal notice path when the settings read never succeeded", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    const reset = vi.fn().mockResolvedValue(undefined);
+    plugin.noticeCenter = { show, dispose: vi.fn() } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded")
+      .mockRejectedValue(new Error("settings load failed"));
+    vi.spyOn(plugin as never, "ensureSettingsLoaded")
+      .mockRejectedValue(new Error("settings load failed"));
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasActivityInFlight: false,
+      invalidateLifecycle: vi.fn(),
+    } as never;
+    plugin.state = { reset } as never;
+
+    await expect(plugin.resetSyncState()).resolves.toBeUndefined();
+
+    expect(reset).not.toHaveBeenCalled();
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "reset-failed",
+    }));
+    expect(plugin.diag.error).toHaveBeenCalledWith(
+      "state",
+      "local sync state reset failed",
+      "Error: settings load failed",
+    );
+  });
+
+  it("proceeds with the reset when only the state read failed", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    const reset = vi.fn().mockResolvedValue(undefined);
+    const clearScanCache = vi.fn().mockResolvedValue(undefined);
+    plugin.noticeCenter = { show, dispose: vi.fn() } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded")
+      .mockRejectedValue(new Error("corrupt state"));
+    vi.spyOn(plugin as never, "ensureSettingsLoaded")
+      .mockResolvedValue(undefined);
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasActivityInFlight: false,
+      invalidateLifecycle: vi.fn(),
+    } as never;
+    plugin.state = {
+      mutationLedger: [],
+      mutationRecoveryQuarantine: [],
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      hasV2StateLoadRecoveryBlock: false,
+      reset,
+    } as never;
+    plugin.scanner = { clearScanCache } as never;
+    vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+
+    await expect(plugin.resetSyncState()).resolves.toBeUndefined();
+
+    expect(reset).toHaveBeenCalledOnce();
+    expect(plugin.diag.warn).toHaveBeenCalledWith(
+      "state",
+      "reset proceeding after the local state load failed",
+      "Error: corrupt state",
+    );
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "reset-complete",
+    }));
+  });
+
   it("settles readable mutation recovery under the reset lock before clearing local sync state", async () => {
     const plugin = makePlugin();
     const {
@@ -1276,7 +1344,7 @@ describe("main sync entry guards", () => {
   it("keeps pausing when exempt counters over-count the round's errors", async () => {
     // 反假绿控制项：豁免族的和必须与 errors 严格相等。这里延后项在轮内没走到
     // 执行（错误没被计入），网络族单独看又恰好等于 errors——旧判据会把它当成
-    // "只剩网络族"而放过整轮，新判据按和比对，和（4）大于 errors（1），仍暂停。
+    // "只剩网络族"而放过整轮，新判据按和比对，和（3）大于 errors（1），仍暂停。
     const plugin = new EasySyncPlugin();
     plugin.autoSyncPaused = false;
     plugin.state = { planReviewActive: false } as never;

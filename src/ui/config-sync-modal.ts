@@ -150,8 +150,9 @@ export class ConfigSyncModal extends EasySyncModal {
   private keyboardDismissDisposer: (() => void) | null = null;
   /**
    * Set when the remote catalog refresh was skipped because a sync round was
-   * in flight at manager open time. Cleared once a follow-up refresh succeeds
-   * (retried from the next inventory revision, i.e. after that sync ends).
+   * in flight at manager open time. The next inventory revision retries once;
+   * the marker is cleared before that retry, so a failed retry is not
+   * re-queued (reopening the manager or a later round-end rebuild recovers).
    */
   private catalogRefreshSkippedWhileSyncing = false;
 
@@ -169,7 +170,8 @@ export class ConfigSyncModal extends EasySyncModal {
     }
   }
 
-  /** One scope/manager modal at a time: same view rejected, another replaces. */
+  /** One modal per view: reopening the same view is rejected; a different
+   *  view keeps its own instance (the scope → manager layering depends on it). */
   override open(): void {
     if (!this.takeOverSingleInstance(this.initialView)) return;
     super.open();
@@ -1146,9 +1148,11 @@ export class ConfigSyncModal extends EasySyncModal {
         this.getRowKey("data", item.id),
         true,
         async () => {
-          // One idle window for both writes: the files switch and the data
-          // patch must land together, or a sync round starting between them
-          // leaves the switch saying "included" while the policy does not.
+          // Both writes share one idle-window attempt: the files switch is
+          // committed first, then the data patch. The helper does not hold
+          // the operation lock for the whole callback, so a sync round
+          // starting between them can still fail the second write and leave
+          // the switch committed without the policy (the caller reports it).
           await this.plugin.runSettingsMutationWhenSyncIdle(async () => {
             await this.plugin.updateCommunityPluginFilesSelection(
               item.id,

@@ -8,8 +8,9 @@ import type EasySyncPlugin from "../src/main";
 
 // The mock element's createEl/createDiv record nothing and append nowhere;
 // these local stubs mirror real DOM semantics (apply cls/text, append to the
-// caller) so the house-structure assertions below can read the tree, the same
-// approach as auto-sync-modal.test.ts's local createEl wrapper.
+// caller) so the house-structure assertions below can read the tree; the same
+// approach as the local createEl wrappers in recovery-modal.test.ts /
+// vault-join-modal.test.ts (auto-sync-modal.test.ts was deleted).
 type RecordedEl = HTMLElement & {
   classList: { contains(token: string): boolean };
   textContent: string;

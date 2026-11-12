@@ -2144,6 +2144,51 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     });
   });
 
+  it("keeps a batch keepLocal resolution silent on success when both sides exist", async () => {
+    const path = "batch-keep-local.md";
+    const content = new Uint8Array([4, 2]).buffer;
+    const hash = await sha256Hex(content);
+    const local: LocalFileEntry = {
+      path, hash, size: content.byteLength, mtime: 1, binary: false,
+    };
+    const notice = makeNoticeRecorder();
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "remote-id",
+      eTag: "etag-uploaded",
+    });
+    const commitMutationCheckpoint = vi.fn().mockResolvedValue(undefined);
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path,
+        local,
+        remote: {
+          path, driveId: "remote-id", size: content.byteLength, mtime: 1,
+          eTag: "etag-reviewed", cTag: "",
+        },
+      }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      adapterOverrides: { readBinary: vi.fn().mockResolvedValue(content) },
+      uploadFile,
+      stateOverrides: { commitMutationCheckpoint },
+      noticeCenter: notice.center,
+    });
+
+    await executor.resolveConflictKeepLocal(path, false);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // The both-sides branch really ran: the reviewed local content was
+    // uploaded once and its checkpoint committed, so the silence assertion
+    // below is not shielding an early return.
+    expect(uploadFile).toHaveBeenCalledOnce();
+    expect(uploadFile.mock.calls[0]?.[1]).toBe(path);
+    expect(commitMutationCheckpoint).toHaveBeenCalledOnce();
+    // Batch callers report only failures per item (method contract), so the
+    // both-sides branch must honor `showSuccessNotice = false` like every
+    // other keepLocal/keepRemote success exit.
+    expect(notice.messages).not.toContain("notice.conflict.keptLocal");
+  });
+
   it("abandons a proven not-applied keepRemote intent in the same side action", async () => {
     const path = "network-failed.md";
     const localBytes = new Uint8Array([1]).buffer;
@@ -4059,6 +4104,172 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       expect.objectContaining({ path: "b.md", status: "delete" }),
     ]);
     expect(notice.messages).not.toContain("notice.delete.confirmed");
+  });
+
+  it("queues every confirmed path when the batch's first path is already queued", async () => {
+    const localByPath = new Map<string, LocalFileEntry>([
+      ["a.md", { path: "a.md", hash: "aa".repeat(32), size: 1, mtime: 1, binary: false }],
+      ["b.md", { path: "b.md", hash: "bb".repeat(32), size: 1, mtime: 1, binary: false }],
+    ]);
+    let releaseFirstDelete: (() => void) | null = null;
+    let firstDeleteStarted = false;
+    const remove = vi.fn().mockImplementation((path: string) => {
+      if (path !== "a.md" || firstDeleteStarted) return Promise.resolve();
+      firstDeleteStarted = true;
+      return new Promise<void>((resolve) => {
+        releaseFirstDelete = resolve;
+      });
+    });
+    // Model the real checkpoint: the erased rows' pending decisions are
+    // retired at commit, so by the time a later batch runs they are gone.
+    let pendingRemoteDeletesRef: Array<{ path: string }> | null = null;
+    const retireRemovedPendingRows = () => {
+      if (!pendingRemoteDeletesRef) return;
+      const removed = new Set(remove.mock.calls.map(([path]) => path));
+      pendingRemoteDeletesRef.splice(
+        0,
+        pendingRemoteDeletesRef.length,
+        ...pendingRemoteDeletesRef.filter((item) => !removed.has(item.path)),
+      );
+    };
+    const commitMutationCheckpoint = vi.fn(async () => retireRemovedPendingRows());
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      noticeCenter: notice.center,
+      pendingRemoteDeletes: [...localByPath.values()].map((local) => ({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: local.path,
+        local,
+      })),
+      inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+        status: "present",
+        entry: localByPath.get(path),
+      })),
+      adapterOverrides: { remove },
+      stateOverrides: {
+        commitMutationCheckpoint,
+        commitMutationCheckpoints: commitMutationCheckpoint,
+      },
+    });
+    pendingRemoteDeletesRef = (executor as unknown as {
+      state: { pendingRemoteDeletes: Array<{ path: string }> };
+    }).state.pendingRemoteDeletes;
+
+    // The per-item confirmation for `a.md` owns the queue while the batch
+    // arrives; `a.md` is therefore already a registered queue key.
+    const first = executor.confirmRemoteDeletes(["a.md"]);
+    await waitUntil(() => expect(remove).toHaveBeenCalledWith("a.md"));
+    const batch = executor.confirmRemoteDeletes(["a.md", "b.md"]);
+    try {
+      await waitUntil(() => {
+        expect(executor.isSideActionQueued("b.md")).toBe(true);
+      });
+    } finally {
+      releaseFirstDelete?.();
+      await Promise.all([first, batch]);
+    }
+
+    // The batch leaves the already-owned `a.md` to its own queue entry (so it
+    // is erased once and never reported as a failed repeat) and still runs
+    // `b.md` instead of silently dropping the whole confirmation.
+    expect(remove.mock.calls.filter(([path]) => path === "a.md")).toHaveLength(1);
+    expect(remove.mock.calls.map(([path]) => path)).toContain("b.md");
+    expect(notice.messages).not.toContain("notice.delete.failed");
+  });
+
+  it("records success for a row a per-item entry settled before the batch arrived", async () => {
+    const localByPath = new Map<string, LocalFileEntry>([
+      ["a.md", { path: "a.md", hash: "aa".repeat(32), size: 1, mtime: 1, binary: false }],
+      ["b.md", { path: "b.md", hash: "bb".repeat(32), size: 1, mtime: 1, binary: false }],
+    ]);
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    let pendingRef: Array<{ path: string }> | null = null;
+    const retireRemovedPendingRows = () => {
+      if (!pendingRef) return;
+      const removed = new Set(remove.mock.calls.map(([path]) => path));
+      pendingRef.splice(
+        0,
+        pendingRef.length,
+        ...pendingRef.filter((item) => !removed.has(item.path)),
+      );
+    };
+    const commitMutationCheckpoint = vi.fn(async () => retireRemovedPendingRows());
+    const executor = makeProgressAwareExecutor({
+      noticeCenter: notice.center,
+      pendingRemoteDeletes: [...localByPath.values()].map((local) => ({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: local.path,
+        local,
+      })),
+      inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+        status: "present",
+        entry: localByPath.get(path),
+      })),
+      adapterOverrides: { remove },
+      stateOverrides: {
+        commitMutationCheckpoint,
+        commitMutationCheckpoints: commitMutationCheckpoint,
+      },
+    });
+    pendingRef = (executor as unknown as {
+      state: { pendingRemoteDeletes: Array<{ path: string }> };
+    }).state.pendingRemoteDeletes;
+
+    // The per-item confirmation for `a.md` settles first and its checkpoint
+    // retires the pending row; a stale panel snapshot then confirms both rows.
+    await executor.confirmRemoteDelete("a.md");
+    expect(pendingRef?.map((item) => item.path)).toEqual(["b.md"]);
+
+    await executor.confirmRemoteDeletes(["a.md", "b.md"]);
+
+    // `a.md` is recorded as done instead of being re-run into a false failure;
+    // `b.md` is still deleted.
+    expect(remove.mock.calls.filter(([path]) => path === "a.md")).toHaveLength(1);
+    expect(remove.mock.calls.map(([path]) => path)).toContain("b.md");
+    expect(notice.messages).not.toContain("notice.delete.failed");
+  });
+
+  it("reports an already-queued confirmed batch instead of dropping it silently", async () => {
+    const localByPath = new Map<string, LocalFileEntry>([
+      ["a.md", { path: "a.md", hash: "aa".repeat(32), size: 1, mtime: 1, binary: false }],
+      ["b.md", { path: "b.md", hash: "bb".repeat(32), size: 1, mtime: 1, binary: false }],
+    ]);
+    let releaseFirstDelete: (() => void) | null = null;
+    let firstDeleteStarted = false;
+    const remove = vi.fn().mockImplementation((path: string) => {
+      if (path !== "a.md" || firstDeleteStarted) return Promise.resolve();
+      firstDeleteStarted = true;
+      return new Promise<void>((resolve) => {
+        releaseFirstDelete = resolve;
+      });
+    });
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      noticeCenter: notice.center,
+      pendingRemoteDeletes: [...localByPath.values()].map((local) => ({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: local.path,
+        local,
+      })),
+      inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+        status: "present",
+        entry: localByPath.get(path),
+      })),
+      adapterOverrides: { remove },
+    });
+
+    const first = executor.confirmRemoteDeletes(["a.md", "b.md"]);
+    await waitUntil(() => expect(remove).toHaveBeenCalledWith("a.md"));
+    await executor.confirmRemoteDeletes(["a.md", "b.md"]);
+
+    // Every path already has its own queue entry: say the work is queued
+    // without dressing the redundant confirmation up as a failure.
+    expect(notice.messages).toContain("notice.delete.queueing");
+    expect(notice.messages).not.toContain("notice.delete.failed");
+
+    releaseFirstDelete?.();
+    await first;
   });
 
   it("flips the wave's shown delete rows when its shared checkpoint cannot commit", async () => {

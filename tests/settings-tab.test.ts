@@ -290,8 +290,8 @@ describe("settings tab", () => {
     expect(source).toMatch(
       /setting\.nameEl\.createSpan\(\s*"easy-sync-plugin-selection-chip"/,
     );
-    // 2026-10-30：「实验性」chip 已停止渲染（样式与 i18n key 保留），
-    // 两处挂点都必须缺席。
+    // 2026-10-30：「实验性」chip 已停止渲染；对应 i18n key 与样式类已删除
+    // （4e46a01d），两处挂点都必须缺席。
     expect(scopeSetting).not.toContain("appendExperimentalPluginDataChip(");
     expect(manager).not.toContain("appendExperimentalPluginDataChip(");
     expect(manager).toContain("this.titleEl");
@@ -360,7 +360,8 @@ describe("settings tab", () => {
   });
 
   it("mounts the settings-page community scope rows with the modal chip layout", () => {
-    // 1.13+ 页面行与弹框同口径（settings-page-rows 模块头 S1 双轨）：
+    // 1.13+ 页面行与弹框同口径（settings-page-rows 模块头：单一实现，
+    // <1.13 弹框轨道已随 minAppVersion 1.13.4 退场）：
     // ① 行类触发 nameEl 的 flex+gap（styles.css），缺了 chip 会紧贴行名；
     // ② chip 挂点必须在最后一次 setName 之后——setName 会重写 nameEl 内容，
     //    先挂上去的 chip 会被冲掉（真机 1.13：同步 chip 消失）。

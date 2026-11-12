@@ -574,6 +574,68 @@ describe("StateManager batch persistence", () => {
     expect(state.pendingRemoteDeletes).toEqual([pendingDelete("note.md")]);
   });
 
+  it("degrades a persisted bundle settlement whose conflict list holds null", async () => {
+    const pluginRoot = ".obsidian/plugins/some-plugin";
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "bundle-outer",
+      planRevision: 1,
+      scope: TEST_SCOPE,
+      action: "upload",
+      path: pluginRoot,
+      stateEffect: "settlement-only",
+      expectedLocal: { exists: false },
+      expectedRemote: { exists: false },
+      createdAt: 1,
+    };
+    const member = (path: string, operationId: string) => ({
+      intent: {
+        version: 1,
+        operationId,
+        planRevision: 1,
+        scope: TEST_SCOPE,
+        action: "upload",
+        path,
+        stateEffect: "bundle-settlement",
+        expectedLocal: { exists: true, hash: "aa".repeat(32), size: 1 },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      } as MutationIntentV1,
+      receipt: null,
+    });
+    const { state, plugin } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-mutation-ledger": [{
+        intent,
+        receipt: null,
+        manualResolution: {
+          version: 2,
+          kind: "community-plugin-bundle-settlement",
+          choice: "keep-local",
+          factsDigest: "cc".repeat(32),
+          selectedAt: 2,
+          externalMutation: true,
+          intent,
+          receipt: null,
+          pluginId: "some-plugin",
+          pluginRoot,
+          predecessorOperationIds: [],
+          conflictDecisions: [null],
+          members: [
+            member(`${pluginRoot}/main.js`, "member-main"),
+            member(`${pluginRoot}/manifest.json`, "member-manifest"),
+          ],
+        },
+      }],
+    });
+
+    // A null conflict element is malformed, not a reason to throw: the whole
+    // ledger copy degrades to the (absent) checksummed backup.
+    await expect(state.load()).resolves.toBeUndefined();
+    expect(state.hasMutationLedgerCorruption).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+  });
+
   it("loads only merge intents with an exact target version", async () => {
     const intent: MutationIntentV1 = {
       version: 1,
@@ -996,6 +1058,21 @@ describe("StateManager batch persistence", () => {
     await state.commitSizeExclusionBaseline(["b.md"]);
     expect(saveData.mock.calls.length).toBe(writesAfterFirst + 1);
     expect(state.getSizeExclusionBaseline()).toEqual(["b.md"]);
+  });
+
+  it("restores the persisted size-exclusion baseline across load", async () => {
+    // The baseline is a persisted mirror (2026-09-16 方案单 §十二): reloading
+    // the plugin must not re-render the previous round's settled skip rows,
+    // and the W8 unchanged-set short-circuit has to see the old value on the
+    // first round after a reload.
+    const { state, plugin } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-size-exclusion-baseline": ["large-video.mp4"],
+    });
+
+    await state.load();
+
+    expect(state.getSizeExclusionBaseline()).toEqual(["large-video.mp4"]);
   });
 
   it("does not append preview content to the public ancestor cache", async () => {
@@ -1771,10 +1848,6 @@ describe("StateManager reset generation contract", () => {
     await state.load();
 
     // Simulate existing state: generation 7
-    const gen7data = {};
-    (state as unknown as Record<string, unknown>).incrementGen = async function () {
-      for (let i = 0; i < 7; i++) await state.incrementRemoteGeneration();
-    };
     for (let i = 0; i < 7; i++) {
       await state.incrementRemoteGeneration();
     }

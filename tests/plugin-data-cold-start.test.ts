@@ -130,7 +130,7 @@ function makeCommunityPluginScopeSwitchHarness(
   };
 }
 
-describe("plugin data cold-start cache", () => {
+describe("plugin data persistence and cold-start cache", () => {
   it("refreshes the remote plugin catalog and light-reads manifests for display facts", async () => {
     const plugin = new EasySyncPlugin();
     let catalog: RemoteCommunityPluginCatalogV1 | null = null;

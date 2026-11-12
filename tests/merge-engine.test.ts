@@ -92,7 +92,7 @@ describe("threeWayMerge", () => {
     if (fixture.expectedMerged !== undefined) expect(result.merged).toBe(fixture.expectedMerged);
   });
 
-  it("clean merge: both sides append different lines", () => {
+  it("conflict: both sides append different lines at the same position", () => {
     const base = "line1\nline2";
     const local = "line1\nline2\nlocal-addition";
     const remote = "line1\nline2\nremote-addition";

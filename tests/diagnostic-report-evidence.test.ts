@@ -470,9 +470,6 @@ describe("diagnostic report failure notice", () => {
   });
 });
 
-/** Issue #18 round (P3-b4): the report must show which plugin data keys were
- *  recently written (names + time only, never values) so a mid-activation
- *  digest drift can be attributed on the device itself. */
 describe("diagnostic report reset capture and reader note", () => {
   it("pins the reset dialog report copy verbatim in both locales", () => {
     const zh = new I18n("zh-cn");
@@ -542,6 +539,9 @@ describe("diagnostic report reset capture and reader note", () => {
   });
 });
 
+/** Issue #18 round (P3-b4): the report must show which plugin data keys were
+ *  recently written (names + time only, never values) so a mid-activation
+ *  digest drift can be attributed on the device itself. */
 describe("recent plugin data write evidence", () => {
   it("reports exactly the keys whose values changed, in stable order", () => {
     const before = {

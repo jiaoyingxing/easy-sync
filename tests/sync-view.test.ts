@@ -8,6 +8,7 @@ import {
   buildSyncPlanMeasuredVirtualOffsets,
   buildSyncPlanVirtualOffsets,
   buildSyncPlanVirtualWindow,
+  expandSyncPlanVirtualWindow,
   buildSyncPendingDisplayRows,
   buildSyncViewContentKey,
   buildWindowedPathPlan,
@@ -483,7 +484,9 @@ describe("shared sidebar detail controls", () => {
     expect(section).toContain("buildSyncPendingDisplayRows(");
     expect(section).toContain("easy-sync-plan-virtual-list");
     expect(section).toContain("buildSyncPlanVirtualWindow(");
-    expect(section).toContain("planDecisionRowsInFlight.has(row.key)");
+    // 在飞行行钉进窗口（不是冻结整窗）：整屏重建后首次挂载也要含这一行。
+    expect(section).toContain("expandSyncPlanVirtualWindow(");
+    expect(section).toContain("pinnedKeys: this.planDecisionRowsInFlight");
     expect(section).toContain("this.planVirtualRenderers.add(renderPendingWindow)");
     expect(section).toContain("applyPlanRowExpansionIn(visible, this.renderedBatchedRows)");
     expect(section).toContain("isBatchedDeleteSet(rows.map((row) => row.key))");
@@ -3237,6 +3240,41 @@ describe("buildSyncViewContentKey", () => {
     expect(window.totalHeight).toBe(offsets[offsets.length - 1]);
   });
 
+  it("pins an in-flight decision row into the window instead of freezing the whole list", () => {
+    const offsets = [0, 10, 20, 30, 40, 50];
+    const rowKeys = ["a", "b", "c", "d", "e"];
+    const expand = (window: { start: number; end: number; offset: number }, pinned: string[]) =>
+      expandSyncPlanVirtualWindow({
+        window,
+        rowKeys,
+        pinnedKeys: new Set(pinned),
+        offsets,
+      });
+
+    // 没有在飞行行：窗口原样返回。
+    expect(expand({ start: 1, end: 3, offset: 10 }, []))
+      .toEqual({ start: 1, end: 3, offset: 10 });
+    // 视口已滚过在飞行行：起点扩回该行（钉住，不被换窗带走）。
+    expect(expand({ start: 3, end: 5, offset: 30 }, ["a"]))
+      .toEqual({ start: 0, end: 5, offset: 0 });
+    // 在飞行行在窗口下方：终点扩到该行。
+    expect(expand({ start: 0, end: 1, offset: 0 }, ["d"]))
+      .toEqual({ start: 0, end: 4, offset: 0 });
+    // 列表整屏滚出视口（空窗口）：只挂钉住的行，不从 0 铺到该行。
+    expect(expand({ start: 2, end: 2, offset: 20 }, ["d"]))
+      .toEqual({ start: 3, end: 4, offset: 30 });
+    // 钉住的 key 不在本列表（已被 isSideActionQueued 过滤）：窗口原样。
+    expect(expand({ start: 1, end: 2, offset: 10 }, ["batch-delete"]))
+      .toEqual({ start: 1, end: 2, offset: 10 });
+    // 整屏重建：新建列表、窗口为空，在飞行行仍要随首次挂载出现。
+    expect(expandSyncPlanVirtualWindow({
+      window: { start: 0, end: 0, offset: 0 },
+      rowKeys: ["batch-delete", "delete:a.md", "delete:b.md"],
+      pinnedKeys: new Set(["batch-delete"]),
+      offsets: [0, 10, 20, 30],
+    })).toEqual({ start: 0, end: 1, offset: 0 });
+  });
+
   it("automatically rebuilds only a legacy plan that has counts but no details", () => {
     const counts = {
       uploads: 1,
@@ -4250,7 +4288,10 @@ describe("buildSyncViewContentKey", () => {
     expect(section).toContain(
       "this.plugin.syncExecutor?.hasSideActionsInFlight",
     );
-    expect(section).toContain("SyncActionType.ConfirmLocalDelete");
+    // 批量删除以 DeleteRemote（文件波）/ DeleteLocalFolder（文件夹壳）上报；
+    // ConfirmLocalDelete 是逐条入口的类型，不能作为批量加载态的判据。
+    expect(section).toContain("SyncActionType.DeleteRemote");
+    expect(section).toContain("SyncActionType.DeleteLocalFolder");
     // 加载态只数批量删除自己的那一块（本机独有批量行也有加载态，同族但另一件）。
     const batchSlice = source.slice(
       source.indexOf("private renderBatchDeleteRow("),

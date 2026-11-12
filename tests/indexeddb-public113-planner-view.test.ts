@@ -31,6 +31,9 @@ describe("public 1.1.3 IndexedDB canonical planner view", () => {
       await store.close();
 
       const reopened = new IndexedDbPublic113StateStore(databaseName);
+      // 前向守卫：实现当前不调用 loadPreparedCandidate；这条断言防的是以后把
+      // 整包 hydrate 接进视图路径，不证明当前路径已避免 hydrate（那由下面的
+      // view.state 形状与耗时断言承担）。
       const envelopeHydration = vi.spyOn(
         reopened,
         "loadPreparedCandidate",

@@ -388,7 +388,6 @@ function makeState(
       anchors: {},
       pending: [],
     }),
-    setCommunityPluginEnablementState: vi.fn().mockResolvedValue(undefined),
     getCommunityPluginManifestObservations: vi.fn(
       () => structuredClone(manifestObservations),
     ),
@@ -907,7 +906,7 @@ describe("community plugin enablement runtime", () => {
     expect(memory.binary.get(mainPath)).toEqual(changedLocalMain);
   });
 
-  it("keeps cloud plugin code when this device exits participation", async () => {
+  it("keeps cloud plugin code when the selected plugin's two sides already match", async () => {
     const mainPath = ".obsidian/plugins/calendar/main.js";
     const manifestPath = ".obsidian/plugins/calendar/manifest.json";
     const main = bytes("cloud-main");
@@ -922,20 +921,6 @@ describe("community plugin enablement runtime", () => {
         sharedBaseEntry(localMain, remoteMain),
         sharedBaseEntry(localManifest, remoteManifest),
       ],
-      {
-        getCommunityPluginParticipation: vi.fn().mockReturnValue({
-          schemaVersion: 1,
-          kind: "device-community-plugin-participation",
-          scopeEnabled: false,
-          pluginsById: {
-            calendar: {
-              pluginId: "calendar",
-              phase: "excluded",
-              joinedGeneration: 1,
-            },
-          },
-        }),
-      },
     );
     const memory = makeMemoryAdapter({
       [mainPath]: main,
@@ -4052,7 +4037,6 @@ describe("community plugin enablement runtime", () => {
     expect(oneDrive.uploadFile).not.toHaveBeenCalled();
     expect(downloadFile).not.toHaveBeenCalled();
     expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
-    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
     expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH))).toBe(
       new TextDecoder().decode(localContent),
     );
@@ -4104,7 +4088,6 @@ describe("community plugin enablement runtime", () => {
     expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH))).toBe(
       new TextDecoder().decode(localContent),
     );
-    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
   });
 
   it("keeps an explicitly requested partial bundle actionable so preflight still fails closed", async () => {
@@ -4245,10 +4228,9 @@ describe("community plugin enablement runtime", () => {
     expect(uploadedByPath.get(mainPath)).toBe("plugin");
     expect(uploadedByPath.get(manifestPath)).toBe(aliasManifestText);
     expect(uploadedByPath.has(COMMUNITY_PATH)).toBe(false);
-    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
   });
 
-  it("materializes preflighted bundle content for the mobile streamed commit (>= 8 MiB selected plugin)", async () => {
+  it("materializes preflighted bundle content for the mobile streamed commit (>= 2 MiB selected plugin)", async () => {
     const previousMobile = Platform.isMobile;
     const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
@@ -4837,8 +4819,8 @@ describe("community plugin enablement runtime", () => {
       deferred: 0,
       errors: 0,
     });
-    // 退役合同：云端即使残留封存代 control，恢复也只走普通 V2 固定路径，
-    // 不读 lifecycle control、不碰内容命名空间。
+    // 方法名级退役守卫：恢复路径不再调用两个已删除的 lifecycle 读取方法。
+    // （云端残留 control 与内容命名空间没有对应的前提或断言。）
     expect(readLifecycle).not.toHaveBeenCalled();
     expect(readLifecycleById).not.toHaveBeenCalled();
     expect(downloadFile.mock.calls.map((call) => call[3])).toEqual(

@@ -1199,11 +1199,5 @@ describe("reviewed decisions rebuilt from current local facts (P3)", () => {
   });
 });
 
-/**
- * 片① 出站抑制（仅接收／单向同步）——真实执行器轮次证据。
- *
- * 计划层断言在 `tests/one-way-mode-plan.test.ts`；这里用现役状态夹具观测：
- * ①被拦掉的动作不写基线（无基线本机独有文件连续两轮无 Upload、无待确认删除、
- * 该路径基线保持为空），②方向=单向下用户主动动作（冲突行「保留本机」的上传链）
- * 与双向行为一致。
- */
+// 片① 出站抑制（仅接收／单向同步）的执行器轮次证据已迁到
+// tests/sync-safety-one-way.test.ts；计划层断言在 tests/one-way-mode-plan.test.ts。

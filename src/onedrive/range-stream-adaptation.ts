@@ -58,14 +58,15 @@
  *  - a step at or above the line clears the pending suspicion.
  *
  *  The comparison baseline is the freshest clean sample at the rung the probe
- *  stepped from (one map entry per observed stream count), not the previous
- *  sample overall. Two reasons: a step is A→B, so a sample from a third rung
- *  (a small file that the 1 MiB per-stream floor capped, or a tier a
- *  downgrade passed through) would mix two different steps; and after a knee
- *  the settled rung is re-measured by every held file, so the one re-probe is
- *  judged against a reading taken immediately before it — the only
- *  "same-period" pair this strictly sequential pipeline can produce without
- *  running two tiers at once.
+ *  stepped from (one map entry per observed stream count). When that rung has
+ *  no sample yet, the latest clean sample from any rung is used and the step
+ *  is computed with that sample's stream count. The rung-local preference
+ *  keeps a step A→B from mixing in a sample from a third rung (a small file
+ *  that the 1 MiB per-stream floor capped, or a tier a downgrade passed
+ *  through); after a knee the settled rung is re-measured by every held file,
+ *  so the one re-probe is judged against a reading taken immediately before
+ *  it — the only "same-period" pair this strictly sequential pipeline can
+ *  produce without running two tiers at once.
  *
  *  Re-probe after a knee: a freeze is not the end of the round. After
  *  `RANGE_STREAM_KNEE_RETRY_CLEAN_SAMPLES` (3) clean transfers at the settled

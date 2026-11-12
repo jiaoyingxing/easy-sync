@@ -932,8 +932,10 @@ describe("production V1 to V2 migration", () => {
       hash: "cc".repeat(32),
     }];
     // Simulate an untyped/stale caller attempting to leak the candidate-only
-    // relaxation into the publication API. Runtime publication must still
-    // force the strict zero-state anchor rule.
+    // relaxation into the publication API. The helper pins
+    // allowChangedAnchors:false, so the injected true never reaches the
+    // candidate; what this case actually proves is the reviewed commit path's
+    // fail-closed authority check below.
     (changed as StateV2MigrationInput & {
       allowChangedAnchors: boolean;
     }).allowChangedAnchors = true;

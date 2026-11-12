@@ -1,6 +1,7 @@
 /**
- * Minimal Obsidian API mock for unit testing.
- * Only exports what the sync module imports at runtime.
+ * Obsidian API mock for unit testing: the sync runtime surface plus the modal,
+ * settings-component and DOM stubs the UI tests need. Not a minimal mock — the
+ * original sync-only description is obsolete.
  */
 
 import { vi } from "vitest";
@@ -315,8 +316,9 @@ export class PluginSettingTab {
 
 /**
  * Attach the Obsidian-style element helpers that production code calls on
- * HTMLElement (addClass / toggleClass / …) onto a real DOM node, so modal
- * structure tests run against real DOM without jsdom. Existing helper
+ * HTMLElement (addClass / toggleClass / …) onto a real DOM node, when the test
+ * environment provides one. The Node test environment has no DOM; there the
+ * callers fall back to the bare element stub below. Existing helper
  * implementations (real Obsidian host) are left untouched.
  */
 function augmentRealElement(el: HTMLElement): HTMLElement {
@@ -449,12 +451,12 @@ export class ButtonComponent {
     this.buttonEl.classList.add("mod-warning");
     return this;
   }
-  // NOTE: `setDestructive` exists only on Obsidian 1.13.0+ hosts. This mock
-  // exposes it unconditionally, so any test that calls it directly would pass
-  // here but throw on 1.11.4–1.12.x. Production code must go through
-  // `applyDestructiveButton` (src/ui/destructive-button.ts), which gates on
-  // the runtime capability and falls back to `mod-warning` — never call
-  // `button.setDestructive()` directly.
+  // NOTE: `setDestructive` exists on Obsidian 1.13.0+ hosts; minAppVersion
+  // is 1.13.4, so production may rely on it unconditionally. Production
+  // code must still go through `applyDestructiveButton`
+  // (src/ui/destructive-button.ts) rather than calling
+  // `button.setDestructive()` directly, so the destructive style stays in
+  // one place.
   setDestructive(): this {
     this.buttonEl.classList.add("mod-warning");
     return this;

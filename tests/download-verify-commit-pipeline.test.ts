@@ -3,8 +3,8 @@
 // 目标行为（而非实现细节）：
 // 1. 传输批仍按 `downloadPolicy.limit` 形成；准备好的 payload 先进入提交组，
 //    组满 8（桌面）/ 4（手机）或字节上限才交给组车道；
-// 2. 组 N 的 `$batch` 复核与本地提交在组 N+1 的内容传输进行中完成——两组时间线
-//    交错，而不是「下载一组 → 核对完 → 再下载下一组」；
+// 2. 组 N 的 `$batch` 复核在组 N+1 的内容传输进行中完成——两组时间线交错，
+//    而不是「下载一组 → 核对完 → 再下载下一组」（本地提交的时序不在此断言）；
 // 3. 逐文件完成反馈仍在本地写入 + 回执 sink 落地后立刻发出，不等组检查点；
 // 4. SC-15 顺序不变：整组 intent 先于本组第一次本地写，整组回执先于组检查点，
 //    组检查点严格按组序提交、不交错；eTag 漂移仍按原路失败关闭；
@@ -354,9 +354,11 @@ describe("download group verify/commit pipeline (2026-11-08)", () => {
       if (entry.path === failedPath) continue;
       expect(localStore.files.has(entry.path)).toBe(true);
     }
-    expect(fixture.stateLog).not.toContain(`intent:${failedPath}`);
-    expect(fixture.stateLog).not.toContain(`receipt:${failedPath}`);
-    expect(fixture.stateLog).not.toContain(`checkpoint:${failedPath}`);
+    // 逐路径写入标记只落在 log 里（stateLog 只有组级计数）：查错对象会让三条
+    // not.toContain 恒真，失败成员被漏进 intent/receipt/checkpoint 也不会红。
+    expect(fixture.log).not.toContain(`intent:${failedPath}`);
+    expect(fixture.log).not.toContain(`receipt:${failedPath}`);
+    expect(fixture.log).not.toContain(`checkpoint:${failedPath}`);
     expect(state.baseSnapshot).toHaveLength(entries.length - 1);
     expect(state.mutationLedger).toEqual([]);
     expect(pendingIssueSink.find((issue) => issue.path === failedPath))

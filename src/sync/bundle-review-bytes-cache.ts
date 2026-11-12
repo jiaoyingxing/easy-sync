@@ -2,11 +2,15 @@
  * Session-scoped bytes fetched while building a community-plugin bundle
  * review snapshot. Keyed by pluginId → path → bytes + content identity.
  *
- * This is a pure display/staging cache: it never feeds `factsDigest`, never
- * authorizes a mutation, and is discarded when the executor or vault
- * changes. It lets the bundle sub-dialog ("查看差异") reuse content the
- * snapshot already downloaded instead of re-downloading it, and lets a
- * re-opened review re-render without re-fetching unchanged bytes.
+ * This is a staging cache for display and bundle review. It never authorizes
+ * a mutation by itself and is discarded when the executor or vault changes.
+ * Note that cached bytes are not display-only: the cached hash becomes the
+ * remote fact hash and the parsed manifest feeds the bundle review facts, and
+ * both enter `factsDigest` — so a cache hit must stay content-bound (keyed by
+ * the reviewed content identity), never a stale free pass. It lets the bundle
+ * sub-dialog ("查看差异") reuse content the snapshot already downloaded instead
+ * of re-downloading it, and lets a re-opened review re-render without
+ * re-fetching unchanged bytes.
  */
 export class BundleReviewBytesCache {
   /** Global bytes-cache cap across all plugin bundles (LRU evicts whole plugin sets). */

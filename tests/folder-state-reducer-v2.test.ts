@@ -382,10 +382,11 @@ describe("V2 folder-create reducer", () => {
   });
 
   // A1（2026-10-16 复核）：这是**现役行为**的钉子，必须绿——它记录归约层的逐字节
-  // 父路径断言本身（folder-state-reducer-v2.ts:1065-1066），也是文件夹层
-  // 「目的父目录拼写别名」缺闸的停机条件：执行器把回执路径写成本机拼写
-  // （sync-executor.ts:22024），而索引里父身份仍按规范拼写投影 ⇒ 结构上无法提交。
-  // 全仓此前对该错误串零测试引用；A1-甲 修复（乙）落地后本条**保持不动**。
+  // 父路径断言本身（folder-state-reducer-v2.ts 的 reviewed subtree 归约父路径检查），
+  // 也是文件夹层「目的父目录拼写别名」缺闸的停机条件：执行器把回执路径写成本机拼写
+  // （sync-executor.ts 的 folder move receipt 写入点），而索引里父身份仍按规范拼写
+  // 投影 ⇒ 结构上无法提交。全仓此前对该错误串零测试引用；A1-甲 修复（乙）落地后
+  // 本条**保持不动**。
   it("rejects a folder move receipt whose parent spelling differs from the committed index", () => {
     const current = envelope([
       {
@@ -774,6 +775,19 @@ function equalReadFileAnchor(remoteId: string, lastPath: string): SyncAnchorV2 {
   };
 }
 
+/** A file anchor that lost its remote identity: the path is still committed
+ *  as a file, but no remote id backs it any more. This shape is valid state. */
+function pathOnlyFileAnchor(lastPath: string): SyncAnchorV2 {
+  return {
+    anchorId: `file-path:${lastPath}`,
+    lastPath,
+    contentHash: hashA,
+    size: 10,
+    confirmedAt: 1,
+    confirmedBy: "equal-read",
+  };
+}
+
 const inboxLocalFiles: LocalFileEntry[] = [
   { path: "Inbox/note.md", hash: hashA, size: 10, mtime: 1, binary: false },
 ];
@@ -932,5 +946,65 @@ describe("F24 same-path folder identity replacement (provably retired anchor)", 
       reason: "folder-anchor-collision",
       accepted: 0,
     });
+  });
+});
+
+describe("V2 folder anchor acceptance vs same-path file anchors", () => {
+  it("rejects scope-expansion adoption while a remote-less file anchor owns the path", () => {
+    const current = identityEnvelope({
+      folders: [{ id: "inbox-new", name: "Inbox" }],
+      fileAnchors: [pathOnlyFileAnchor("Inbox")],
+    });
+
+    const reduced = acceptScopeExpansionFolderAnchorsV2({
+      envelope: current,
+      localFiles: [],
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      authorizedFolders: [{
+        path: "Inbox",
+        driveId: "inbox-new",
+        parentId: scope.filesRootId,
+        name: "Inbox",
+        eTag: "etag-inbox-new",
+      }],
+      confirmedAt: 5,
+    });
+
+    expect(reduced).toMatchObject({
+      status: "rejected",
+      reason: "folder-anchor-collision",
+      accepted: 0,
+    });
+    expect(reduced.envelope).toBe(current);
+  });
+
+  it("rejects descendant reconstruction while a remote-less file anchor owns the ancestor path", () => {
+    const current = identityEnvelope({
+      folders: [{ id: "inbox-new", name: "Inbox" }],
+      files: [{ id: "note-new", name: "note.md", parentId: "inbox-new" }],
+      fileAnchors: [
+        equalReadFileAnchor("note-new", "Inbox/note.md"),
+        pathOnlyFileAnchor("Inbox"),
+      ],
+    });
+
+    const reduced = acceptConfirmedDescendantFolderAnchorsV2({
+      envelope: current,
+      localFiles: inboxLocalFiles,
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      confirmedAt: 5,
+    });
+
+    expect(reduced).toMatchObject({
+      status: "rejected",
+      reason: "folder-anchor-collision",
+      accepted: 0,
+      evidenceFiles: 0,
+    });
+    expect(reduced.envelope).toBe(current);
   });
 });

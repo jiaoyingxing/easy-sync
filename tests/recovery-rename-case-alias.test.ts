@@ -24,7 +24,7 @@ import {
  * paths case-insensitively, so the pre-rename spelling still addresses the
  * moved object. The old read-back treated that alias as "the source still
  * exists", failed the move, and left an intent-only record that could not be
- * receipted or classified (the shared ordinary-file gate rejects
+ * receipted or classified (the shared ordinary-file gate at the time rejected
  * normalize-equal source/target paths) — the whole vault stopped.
  */
 
@@ -203,6 +203,256 @@ describe("case-only renameRemote", () => {
       driveId,
       eTag: "etag-after",
     }));
+  });
+
+  it("commits a receipted case-only rename when the old spelling is the moved object", async () => {
+    const hash = await sha256Hex(content);
+    const local: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: contentSize,
+      mtime: 2,
+      binary: false,
+    };
+    const remote: RemoteFileEntry = {
+      path: sourcePath,
+      driveId,
+      parentId: scope.filesRootId,
+      eTag: "etag-before",
+      cTag: "etag-before-ctag",
+      size: contentSize,
+      sha256Hash: hash,
+    };
+    const base: BaseFileEntry = {
+      path: sourcePath,
+      hash,
+      size: contentSize,
+      eTag: "etag-before",
+    };
+    const record = {
+      intent: {
+        version: 1 as const,
+        operationId: "op-case-alias-receipt",
+        planRevision: 1,
+        scope,
+        action: "renameRemote" as const,
+        path: targetPath,
+        sourcePath,
+        expectedLocal: { exists: true as const, hash, size: contentSize },
+        expectedRemote: {
+          exists: true as const,
+          driveId,
+          eTag: "etag-before",
+          size: contentSize,
+          sha256Hash: hash,
+        },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1 as const,
+        operationId: "op-case-alias-receipt",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: targetPath,
+            hash,
+            size: contentSize,
+            eTag: "etag-after",
+          }],
+          baseRemovals: [sourcePath],
+          remoteUpserts: [{
+            path: targetPath,
+            driveId,
+            parentId: scope.filesRootId,
+            size: contentSize,
+            mtime: 2,
+            eTag: "etag-after",
+            cTag: "etag-after-ctag",
+            sha256Hash: hash,
+          }],
+          remoteDeletes: [sourcePath],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const state = makeActiveV2State([remote], [base], {
+      mutationLedger: [record],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(
+      async (_vault: string, path: string) =>
+        path === sourcePath || path === targetPath
+          ? remoteMetadata({ path, driveId, eTag: "etag-after", hash })
+          : null,
+    );
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [driveItem(targetPath, hash, {
+        id: driveId,
+        eTag: "etag-after",
+        cTag: "etag-after-ctag",
+      })],
+      "@odata.deltaLink": "https://graph.example/delta-case-alias-receipt",
+    });
+    const executor = executorFor({
+      state,
+      localEntries: [local],
+      onedrive: { getFileMetadata, getDelta },
+      inspectFile: async (path) =>
+        path === targetPath
+          ? { status: "present", entry: local }
+          : { status: "missing" },
+    });
+
+    const result = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoveryOnly: true },
+    );
+
+    // The receipt was written but its checkpoint never committed. The old
+    // spelling is the same live object, so the receipt still matches: commit
+    // it instead of freezing the record as an unrecoverable outcome.
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.baseSnapshot).toContainEqual({
+      path: targetPath,
+      hash,
+      size: contentSize,
+      eTag: "etag-after",
+    });
+    expect(state.baseSnapshot.some((entry) => entry.path === sourcePath))
+      .toBe(false);
+    expect(state.remoteSnapshot.some((entry) => entry.path === sourcePath))
+      .toBe(false);
+    expect(state.remoteSnapshot).toContainEqual(expect.objectContaining({
+      path: targetPath,
+      driveId,
+      eTag: "etag-after",
+    }));
+  });
+
+  it("keeps a receipted case-alias rename blocked when the old spelling holds a different object", async () => {
+    const hash = await sha256Hex(content);
+    const local: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: contentSize,
+      mtime: 2,
+      binary: false,
+    };
+    const remote: RemoteFileEntry = {
+      path: sourcePath,
+      driveId,
+      parentId: scope.filesRootId,
+      eTag: "etag-before",
+      cTag: "etag-before-ctag",
+      size: contentSize,
+      sha256Hash: hash,
+    };
+    const base: BaseFileEntry = {
+      path: sourcePath,
+      hash,
+      size: contentSize,
+      eTag: "etag-before",
+    };
+    const record = {
+      intent: {
+        version: 1 as const,
+        operationId: "op-case-alias-receipt-blocked",
+        planRevision: 1,
+        scope,
+        action: "renameRemote" as const,
+        path: targetPath,
+        sourcePath,
+        expectedLocal: { exists: true as const, hash, size: contentSize },
+        expectedRemote: {
+          exists: true as const,
+          driveId,
+          eTag: "etag-before",
+          size: contentSize,
+          sha256Hash: hash,
+        },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1 as const,
+        operationId: "op-case-alias-receipt-blocked",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: targetPath,
+            hash,
+            size: contentSize,
+            eTag: "etag-after",
+          }],
+          baseRemovals: [sourcePath],
+          remoteUpserts: [{
+            path: targetPath,
+            driveId,
+            parentId: scope.filesRootId,
+            size: contentSize,
+            mtime: 2,
+            eTag: "etag-after",
+            cTag: "etag-after-ctag",
+            sha256Hash: hash,
+          }],
+          remoteDeletes: [sourcePath],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const state = makeActiveV2State([remote], [base], {
+      mutationLedger: [record],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(
+      async (_vault: string, path: string) =>
+        path === targetPath
+          ? remoteMetadata({ path, driveId, eTag: "etag-after", hash })
+          : path === sourcePath
+            ? remoteMetadata({
+                path,
+                driveId: "second-file-at-source",
+                eTag: "etag-second",
+                hash,
+              })
+            : null,
+    );
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [driveItem(targetPath, hash, {
+        id: driveId,
+        eTag: "etag-after",
+        cTag: "etag-after-ctag",
+      })],
+      "@odata.deltaLink":
+        "https://graph.example/delta-case-alias-receipt-blocked",
+    });
+    const executor = executorFor({
+      state,
+      localEntries: [local],
+      onedrive: { getFileMetadata, getDelta },
+      inspectFile: async (path) =>
+        path === targetPath
+          ? { status: "present", entry: local }
+          : { status: "missing" },
+    });
+
+    const result = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoveryOnly: true },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.mutationRecovery).toMatchObject({
+      state: "blocked",
+      remaining: 1,
+    });
+    expect(state.mutationLedger).toHaveLength(1);
   });
 
   it("keeps the rename fail-closed when the old spelling holds a different object", async () => {

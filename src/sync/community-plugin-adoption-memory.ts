@@ -1,5 +1,4 @@
 import { normalizePluginIds } from "./community-plugin-sync-policy";
-import { compareText } from "./compare-text";
 import { isRecord } from "../obsidian-compat";
 
 /**
@@ -91,8 +90,9 @@ export function reduceCommunityPluginAdoptionMemory(
       return {
         schemaVersion: 1,
         kind: "community-plugin-adoption-memory",
-        ignoredPluginIds: [...committed.ignoredPluginIds, pluginId].sort(
-          compareText,
+        ignoredPluginIds: normalizePluginIds(
+          [...committed.ignoredPluginIds, pluginId],
+          ownPluginId,
         ),
         pendingPluginIds: committed.pendingPluginIds.filter(
           (candidate) => candidate !== pluginId,

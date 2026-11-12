@@ -83,7 +83,7 @@ import {
   emptyScanner,
   makeManualResolutionHarness,
   makeNoticeRecorder,
-  BASE_UPSERT_GATES,
+  BASE_UPSERT_GATE_SHAPES,
   makeStaleTreeCommitProbe,
 } from "./helpers/sync-safety-harness";
 
@@ -2586,14 +2586,18 @@ describe("Persistent remote delta state", () => {
     );
   });
 
-  it.each(BASE_UPSERT_GATES.map((message) => ({ message })))(
-    "gives a stale committed tree one rebuild before keeping the record blocked ($message)",
-    async () => {
+  it.each(BASE_UPSERT_GATE_SHAPES.map((shape) => ({
+    message: `${shape.kind}: ${shape.detail}`,
+    shape,
+  })))(
+    "gives a stale committed tree one rebuild before settling the record ($message)",
+    async ({ shape }) => {
       // The recovery verified the receipt against live facts while the
       // committed index lagged; one full rebuild of that index is the
       // read-only repair the commit path may take (2026-10-13, residual §3).
       const probe = await makeStaleTreeCommitProbe(
         (attempt) => attempt === 1 ? "reject" : "succeed",
+        shape,
       );
       await expect((probe.executor as unknown as {
         recoverMutationLedger(scope: SyncScope): Promise<MutationRecoveryRunSummary>;
@@ -2789,7 +2793,7 @@ describe("Persistent remote delta state", () => {
   );
 
   /** The recovery reports any blocked record as this typed error; the round
-   *  level reads `.summary` off it (sync-executor.ts:17611-17616). */
+   *  level reads `.summary` off it. */
   const blockedSummary = async (
     probe: Awaited<ReturnType<typeof makeStaleTreeCommitProbe>>,
   ): Promise<MutationRecoveryRunSummary> => {

@@ -156,8 +156,10 @@ interface ReviewedStateV2MigrationInput {
  * Commit the exact candidate bound to a durable reviewed migration hold.
  *
  * The caller must re-create and compare both the candidate and sealed plan
- * before calling. This function validates that binding, writes only internal
- * state, and makes V2 authoritative by publishing the manifest last.
+ * before calling. This function checks the binding's shape (version, commit
+ * sequence, scope, non-empty digest) but does not re-hash the candidate;
+ * it writes only internal state and makes V2 authoritative by publishing the
+ * manifest last.
  */
 export async function commitReviewedStateV2MigrationCandidate(
   adapter: DataAdapter,
@@ -1099,8 +1101,10 @@ export function sameStateV2MigrationCandidate(
 /**
  * Diagnostic companion to sameStateV2MigrationCandidate: reports which
  * normalized section of a previously published hold candidate differs from
- * the freshly built one. It reuses the commit gate's exact normalization, so
- * the field report can never disagree with the reuse decision.
+ * the freshly built one. It reuses the commit gate's exact normalization for
+ * the four reported sections; the reuse decision also compares envelope meta
+ * (commitSeq / lifecycleEpoch / schemaVersion), so a meta-only drift reports
+ * every section equal while the decision says different.
  */
 export function describeStateV2MigrationCandidateDriftV1(
   committed: SyncStateEnvelopeV2,

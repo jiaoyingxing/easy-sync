@@ -43,7 +43,7 @@ function remote(
 }
 
 describe("public 1.1.3 anchored-file reentry behavior", () => {
-  it("binds the independent fixture to the exact public source", () => {
+  it("documents the public 1.1.3 provenance constants", () => {
     expect(PUBLIC_113_REENTRY_PROVENANCE).toEqual({
       sourceCommit: "01a4ac30936a89c53ddbf521e7ea9399d71e79c4",
       syncEngineSha256:

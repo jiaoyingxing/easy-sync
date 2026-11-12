@@ -24,6 +24,7 @@ import {
   sameVisibleText,
 } from "./diff-view-renderer";
 import {
+  conflictHasMissingLocalSide,
   shouldAutoLoadRemoteComparison,
   summarizeConflictDetail,
 } from "./conflict-detail-presentation";
@@ -161,21 +162,29 @@ export class ConflictDetailModal extends FileComparisonModal {
       setComparisonUnavailableOrReason,
     } = args;
 
-    // Read local file content
+    // Read local file content. A remote-only conflict (local deleted, remote
+    // modified) has no local bytes by definition: an empty local side is the
+    // honest comparison, and aborting here would hide the remote content the
+    // user opened this modal to see.
+    const localSideMissing = conflictHasMissingLocalSide(this.item);
     let localRaw: ArrayBuffer;
-    try {
-      localRaw = await this.plugin.app.vault.adapter.readBinary(
-        this.item.path,
-      );
-    } catch (e) {
-      setComparisonUnavailableOrReason();
-      this.plugin.diag.warn("execute", "Conflict detail local read unavailable", {
-        path: this.item.path,
-        errorKind: getErrorKind(e),
-      });
-      loadingEl.setText(t("conflictDetail.localReadUnavailable"));
-      this.renderActionButtons(t);
-      return { kind: "settled" };
+    if (localSideMissing) {
+      localRaw = new ArrayBuffer(0);
+    } else {
+      try {
+        localRaw = await this.plugin.app.vault.adapter.readBinary(
+          this.item.path,
+        );
+      } catch (e) {
+        setComparisonUnavailableOrReason();
+        this.plugin.diag.warn("execute", "Conflict detail local read unavailable", {
+          path: this.item.path,
+          errorKind: getErrorKind(e),
+        });
+        loadingEl.setText(t("conflictDetail.localReadUnavailable"));
+        this.renderActionButtons(t);
+        return { kind: "settled" };
+      }
     }
     const localWithinTextBudget = localRaw.byteLength <= MAX_TEXT_DIFF_BYTES_PER_SIDE;
     const localContent = localWithinTextBudget ? decodeUtf8(localRaw) : null;
@@ -197,6 +206,7 @@ export class ConflictDetailModal extends FileComparisonModal {
           reasonEl,
           localRaw,
           localContent,
+          localSideMissing,
           isBinary,
           remote: this.item.remote,
           setSummary,
@@ -218,6 +228,7 @@ export class ConflictDetailModal extends FileComparisonModal {
           reasonEl,
           localRaw,
           localContent,
+          localSideMissing,
           isBinary,
           remote: this.item.remote,
           setSummary,
@@ -294,6 +305,8 @@ export class ConflictDetailModal extends FileComparisonModal {
     reasonEl: HTMLElement;
     localRaw: ArrayBuffer;
     localContent: string | null;
+    /** The local side is known absent (remote-only conflict), not unreadable. */
+    localSideMissing?: boolean;
     isBinary: boolean | undefined;
     remote: NonNullable<SyncPlanItem["remote"]>;
     setSummary: (evidence: ConflictDetailSummaryEvidence) => void;
@@ -306,6 +319,7 @@ export class ConflictDetailModal extends FileComparisonModal {
       reasonEl,
       localRaw,
       localContent,
+      localSideMissing,
       isBinary,
       remote,
       setSummary,
@@ -322,7 +336,9 @@ export class ConflictDetailModal extends FileComparisonModal {
     );
     loadingEl.setText(t("conflictDetail.computingDiff"));
     const contentComparison = await compareContentBuffers(localRaw, remoteRaw);
-    if (contentComparison.status === "equal") {
+    // A missing local side is not equal to an empty remote file: "identical"
+    // would retire the conflict with a baseline the user never had.
+    if (!localSideMissing && contentComparison.status === "equal") {
       // The "comparing" summary above is stale once equality is proven:
       // leave only the identical conclusion, without a diff section.
       reasonEl.remove();
@@ -409,6 +425,8 @@ export class ConflictDetailModal extends FileComparisonModal {
     reasonEl: HTMLElement;
     localRaw: ArrayBuffer;
     localContent: string | null;
+    /** The local side is known absent (remote-only conflict), not unreadable. */
+    localSideMissing?: boolean;
     isBinary: boolean | undefined;
     remote: NonNullable<SyncPlanItem["remote"]>;
     setSummary: (evidence: ConflictDetailSummaryEvidence) => void;
@@ -421,6 +439,7 @@ export class ConflictDetailModal extends FileComparisonModal {
       reasonEl,
       localRaw,
       localContent,
+      localSideMissing,
       isBinary,
       remote,
       setSummary,
@@ -439,7 +458,7 @@ export class ConflictDetailModal extends FileComparisonModal {
       text: t("conflictDetail.checkContentEquality"),
     });
     const statusEl = deferredEl.createDiv();
-    if (localContent != null) {
+    if (!localSideMissing && localContent != null) {
       deferredEl.createEl("h4", { text: t("conflictDetail.localPreview") });
       this.renderTextPreview(deferredEl, localContent, t);
     }
@@ -462,6 +481,7 @@ export class ConflictDetailModal extends FileComparisonModal {
             reasonEl,
             localRaw,
             localContent,
+            localSideMissing,
             isBinary,
             remote,
             setSummary,

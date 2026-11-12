@@ -37,8 +37,9 @@ function makeDriveItem(id: string, name: string) {
   };
 }
 
-/** Standard empty-vault harness (mirrors the healthy-sync case in
- *  helpers/sync-safety-harness.ts) with an in-memory enumeration-checkpoint store. */
+/** Standard empty-vault harness (the healthy-sync case lives in the
+ *  sync-safety test files; the helper module only exports builders) with an
+ *  in-memory enumeration-checkpoint store. */
 function makeHarness(getDeltaImpl: (...args: never[]) => unknown) {
   const checkpointStore: { current: unknown } = { current: null };
   const state = makeActiveV2State([], []) as StateManager & {

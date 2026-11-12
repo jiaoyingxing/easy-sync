@@ -119,6 +119,10 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
   const localFiles = new Set(
     input.localFiles.map((file) => identityPath(file.path)),
   );
+  const fileAnchorPaths = new Set(
+    Object.values(input.envelope.anchors.byAnchorId).map((anchor) =>
+      identityPath(anchor.lastPath)),
+  );
   const remotePaths = projectRemoteIndexV2(input.envelope.remoteIndex);
   const currentAnchors = Object.values(
     input.envelope.folderAnchors.byAnchorId,
@@ -144,6 +148,10 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
       return reject("local-path-missing");
     }
     if (localFiles.has(pathKey)) return reject("local-type-conflict");
+    // A same-path file anchor (typically one that lost its remote identity)
+    // still owns this path: the envelope forbids file and folder anchors at
+    // one path, so reject here instead of throwing from the tail validation.
+    if (fileAnchorPaths.has(pathKey)) return reject("folder-anchor-collision");
 
     const node = input.envelope.remoteIndex.itemsById[authorized.driveId];
     if (
@@ -311,6 +319,10 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
   }
 
   const remotePaths = projectRemoteIndexV2(input.envelope.remoteIndex);
+  const fileAnchorPaths = new Set(
+    Object.values(input.envelope.anchors.byAnchorId).map((anchor) =>
+      identityPath(anchor.lastPath)),
+  );
   const currentAnchors = Object.values(
     input.envelope.folderAnchors.byAnchorId,
   );
@@ -327,6 +339,7 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
       localFiles,
       localFolders,
       remotePaths,
+      fileAnchorPaths,
       currentAnchors,
       includeFilePath,
       includeFolderPath,
@@ -412,6 +425,8 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
   localFiles: Map<string, LocalFileEntry>;
   localFolders: Map<string, LocalFolderEntry>;
   remotePaths: ReturnType<typeof projectRemoteIndexV2>;
+  /** identityPath of every committed file anchor (remote id or not). */
+  fileAnchorPaths: ReadonlySet<string>;
   currentAnchors: FolderAnchorV2[];
   includeFilePath: (path: string) => boolean;
   includeFolderPath: (path: string) => boolean;
@@ -431,6 +446,7 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
     localFiles,
     localFolders,
     remotePaths,
+    fileAnchorPaths,
     currentAnchors,
     includeFilePath,
     includeFolderPath,
@@ -482,6 +498,12 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
       && folderAnchor.parentRemoteId === parent.parentId
     );
     if (!exact) {
+      // A same-path file anchor (typically one that lost its remote identity)
+      // still owns this path: the envelope forbids file and folder anchors at
+      // one path, so reject here instead of throwing from the tail validation.
+      if (fileAnchorPaths.has(identityPath(expectedParentPath))) {
+        return { terminated: reject("folder-anchor-collision") };
+      }
       if (currentAnchors.some((folderAnchor) =>
         folderAnchor.remoteId === parent.id
       )) {
@@ -541,7 +563,10 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
 }
 
 /**
- * Apply one durable V2 folder-create receipt to the shared identity envelope.
+ * Apply one durable V2 folder receipt to the shared identity envelope: create
+ * receipts bind the remote folder identity in the current index to a
+ * same-generation folder anchor, while move and delete receipts dispatch to
+ * their own reducers (different transforms and checks).
  *
  * The reducer has no Vault, Adapter or Graph access. Both create directions
  * converge on the same result: the remote folder identity is present in the

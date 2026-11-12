@@ -113,9 +113,10 @@ type StaleIdentityRetirementV2 =
     };
 
 /**
- * Rebuild the production canonical candidate and expose a resolution only for
- * the two stable stale-lineage conflicts. No path match or content guess may
- * manufacture this authority.
+ * Rebuild the production canonical candidate and expose a resolution for the
+ * stable stale-lineage conflicts (the two file-path kinds and the
+ * folder-active-forget kind). No path match or content guess may manufacture
+ * this authority.
  */
 export function buildStaleIdentityResolutionSnapshotV1(
   path: string,

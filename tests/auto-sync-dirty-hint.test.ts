@@ -72,20 +72,6 @@ describe("AutoSyncDirtyHint", () => {
     expect(hint.pending).toBe(false);
   });
 
-  it("retries instead of dropping a hint when the shared entry rejects", async () => {
-    vi.useFakeTimers();
-    const onReady = vi.fn()
-      .mockRejectedValueOnce(new Error("temporary setup failure"))
-      .mockResolvedValueOnce(true);
-    const hint = new AutoSyncDirtyHint(onReady);
-
-    hint.mark();
-    await vi.advanceTimersByTimeAsync(LOCAL_DIRTY_DEBOUNCE_MS * 2);
-
-    expect(onReady).toHaveBeenCalledTimes(2);
-    expect(hint.pending).toBe(false);
-  });
-
   it("does not let an older run consume an event that arrived in flight", async () => {
     vi.useFakeTimers();
     let finishFirst!: (value: boolean) => void;

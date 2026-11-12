@@ -73,12 +73,14 @@ describe("SyncProgressStore retention", () => {
 
     progress.setPhase("executing");
     expect(progress.state.completedCount).toBe(0);
+    expect(progress.state.completedFiles).toEqual([]);
 
     progress.addCompletedFile({ path: "c.md", status: "upload" });
     expect(progress.state.completedCount).toBe(1);
 
     progress.markStarted();
     expect(progress.state.completedCount).toBe(0);
+    expect(progress.state.completedFiles).toEqual([]);
   });
 
   it("tracks the active action and cancellation until the run settles", () => {

@@ -6,7 +6,7 @@ import {
 } from "../src/sync/queue-wait-observation";
 
 describe("QueueWaitObservation", () => {
-  it("tracks live depth and never goes negative on a double release", () => {
+  it("tracks live maxDepth and keeps it stable on a double release", () => {
     const observation = new QueueWaitObservation();
     const releaseA = observation.enter("sideAction");
     const releaseB = observation.enter("sideAction");

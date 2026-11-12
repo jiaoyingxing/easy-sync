@@ -103,8 +103,8 @@ describe("public persistent-format compatibility policy", () => {
     expect(fixture.schemaVersion).toBe(1);
     expect(fixture.releases.map((entry) => entry.version)).toEqual(supportedReleases);
     expect(fixture.policy).toMatchObject({
-      currentPublicRelease: "1.5.9",
-      directUpgradeBaseline: "1.5.9",
+      currentPublicRelease: "1.6.9",
+      directUpgradeBaseline: "1.6.9",
       historicalMigrationFloor: "1.1.3",
       unpublishedBuildsArePermanentInputs: false,
       breakingChangesRequireAdjacentMigration: true,
@@ -181,11 +181,11 @@ describe("public persistent-format compatibility policy", () => {
     const newestFrozenProfile = fixture.profiles[newestFrozenRelease.profile]!;
 
     expect(packageJson.version).toBe(manifestJson.version);
-    // Since 2026-10-17 the published-baseline pointer (1.5.9) is aligned to the
-    // actual last public release while the frozen source-blob evidence ends at
-    // 1.2.7: releases after 1.2.7 kept the same persistent version vector, so
-    // the pointer may run ahead of the evidence list but must never regress
-    // behind it.
+    // Since 2026-10-17 the published-baseline pointer (now 1.6.9) is aligned
+    // to the actual last public release while the frozen source-blob evidence
+    // ends at 1.2.7: releases after 1.2.7 kept the same persistent version
+    // vector, so the pointer may run ahead of the evidence list but must never
+    // regress behind it.
     expect(isVersionAtLeast(
       fixture.policy.currentPublicRelease,
       newestFrozenRelease.version,

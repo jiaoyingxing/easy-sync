@@ -35,9 +35,8 @@ interface ReleaseMetadataFiles {
 const SEMVER = /^\d+\.\d+\.\d+$/;
 const MAX_DESCRIPTION_LENGTH = 250;
 
-/** Release baseline for fields the shape checks cannot protect. The values are
- *  the release facts registered in `docs/core/CURRENT_STATUS.md`; a deliberate
- *  change must update that register and the Release Notes in the same round
+/** Release baseline for fields the shape checks cannot protect. A deliberate
+ *  change must update this baseline and the Release Notes in the same round
  *  (the gate turns red here so the pair cannot drift apart silently). */
 const RELEASE_BASELINE = {
   minAppVersion: "1.13.4",

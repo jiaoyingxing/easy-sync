@@ -163,7 +163,7 @@ describe("small-upload two-batch pipeline (2026-11-08)", () => {
       log.push(`upload-start:${uploadCalls}:${path}`);
       if (uploadCalls === BATCH + 1) {
         expect(checkpointCalls).toBe(1);
-        log.push("upload-9-overlaps-checkpoint-1");
+        log.push("upload-17-overlaps-checkpoint-1");
       }
       await new Promise((resolve) => setTimeout(resolve, 2));
       originalCommit();
@@ -184,7 +184,7 @@ describe("small-upload two-batch pipeline (2026-11-08)", () => {
     await within(checkpointStarted.promise, "first checkpoint starts");
     await within(
       (async () => {
-        while (!log.includes("upload-9-overlaps-checkpoint-1")) {
+        while (!log.includes("upload-17-overlaps-checkpoint-1")) {
           await new Promise((resolve) => setTimeout(resolve, 2));
         }
       })(),
@@ -199,8 +199,12 @@ describe("small-upload two-batch pipeline (2026-11-08)", () => {
     expect(state.mutationLedger).toEqual([]);
 
     // The state lane order is intents(2) → checkpoint(1); batch 2's PUTs began
-    // before checkpoint 1 resolved (the overlap marker above).
-    expect(log.indexOf("intents-end:2")).toBeLessThan(
+    // before checkpoint 1 resolved (the overlap marker above). indexOf returns
+    // -1 for a missing marker and -1 is still "less than" any positive index,
+    // so the marker's existence must be asserted before the order.
+    const secondIntentsEnd = log.indexOf("intents-end:2");
+    expect(secondIntentsEnd).toBeGreaterThanOrEqual(0);
+    expect(secondIntentsEnd).toBeLessThan(
       log.findIndex((line) => line.startsWith("checkpoint-start:1:")),
     );
     expect(checkpointCalls).toBe(2);

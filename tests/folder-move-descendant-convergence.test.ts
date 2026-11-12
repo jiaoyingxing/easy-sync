@@ -20,13 +20,10 @@ import type { LocalFileEntry, LocalFolderEntry, SyncScope } from "../src/sync/ty
  * 同云目录两个 Vault、冷重载、连续稳定轮归零），只用来说明「结案之后用户会看到
  * 什么」——本文件测的是规划器输出，不是宿主行为。
  *
- * 与恢复链的关系（读码确认，决定了第二刀的重要性）：
- * - `isolatableOrdinaryFileRecovery`（`sync-executor.ts:4533`）第一行即排除文件夹
- *   意图（`conservative-reset-recovery.ts:241-242`）⇒ **文件夹记录永远无法被隔离**；
- * - `:11532-11533` 对「不可隔离且非网络受阻」**直接重抛** ⇒ 普通规划整段被跳过；
- * - ⇒ 一条受阻的文件夹记录会**一直冻结整库规划**，规划器根本不跑。零写入结案正是
- *   让该记录进入「已隔离」集合、从而让规划重新开始的那一步。
- * 本文件证明的是：**一旦规划能跑，这个形状不会无声卡住，而是给出带出口的冲突行。**
+ * 与恢复链的关系：受阻的文件夹记录现在走 S2 记录级隔离
+ * （`isolation-capsules.ts` 的 folder-bounded-receipt 等；只有第三 capsule
+ * 始终拒绝带内容的文件记录），不再永久冻结整库规划。本文件仍只证明：
+ * **一旦规划能跑，这个形状不会无声卡住，而是给出带出口的冲突行。**
  */
 
 const scope: SyncScope = {
@@ -194,7 +191,7 @@ describe("a folder move whose descendants were not reprojected (F29 post-settlem
 
     // 这些冲突行在侧栏要靠 `PendingIssue.issueCode` 找到出口；规划器把
     // `reason.folder.*` 映射成具体 code（`sync-executor.ts` 的 reason→issueCode 表），
-    // 而每个 code 在 `sync-view.ts:3233-3284` 都有对应 chip。
+    // 而每个 code 在 `sync-view.ts` 的待处理行 chip 渲染处都有对应 chip。
     // 这里只钉住「产生了行、且不是自动动作」；具体 code 的映射与 chip 由既有
     // 展现层测试与源码守卫承接，不在本文件重复。
     expect(report.items.every((item) => item.type === "conflict")).toBe(true);

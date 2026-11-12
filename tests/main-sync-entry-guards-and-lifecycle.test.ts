@@ -210,9 +210,9 @@ describe("main sync entry guards", () => {
     vi.useRealTimers();
   });
   it("re-applies the max-file-size threshold after the scanner is created", () => {
-    // 2026-09-16 真机取证：onload 第①步 loadSyncSettings() 里的 applyMaxFileSize()
-    // 跑在 scanner 创建之前，`this.scanner?.setConfig` 被可选链静默吞掉——
-    // 每次重载/重启阈值都悄悄回到默认值，只有当场改设置才生效。
+    // 历史现场（2026-09-16 真机取证）：applyMaxFileSize 曾跑在 scanner 创建之前，
+    // `this.scanner?.setConfig` 被可选链静默吞掉——每次重载/重启阈值都悄悄回到
+    // 默认值，只有当场改设置才生效。
     // 守卫：scanner 创建点必须像 applySyncPathSettings 一样补调 applyMaxFileSize。
     const source = readFileSync("src/main.ts", "utf8");
     const creationAt = source.indexOf("this.scanner = new LocalScanner(");

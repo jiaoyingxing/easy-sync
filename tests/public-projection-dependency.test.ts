@@ -19,12 +19,13 @@ import { describe, expect, it } from "vitest";
  * 因此本门只用"现存文件＋引用"判红，不反过来要求名单项必须存在（两仓都能跑）。
  */
 
-/** 会随公开仓投影出去的脚本（构建链四件；见 PROJECT_CONTEXT「构筑物构建与压缩」）。 */
+/** 会随公开仓投影出去的脚本（构建链五件；见 PROJECT_CONTEXT「构筑物构建与压缩」）。 */
 const PROJECTED_SCRIPTS = new Set([
   "scripts/build-bundle.mjs",
   "scripts/check-bundle-compat.cjs",
   "scripts/check-lockfile-ci.ps1",
   "scripts/minify-release-artifacts.mjs",
+  "scripts/release-minify-config.mjs",
 ]);
 
 /**
@@ -48,6 +49,12 @@ const NOT_PROJECTED_TESTS = new Set([
   "tests/graph-contract-fixtures.test.ts",
   "tests/dev-cli-wrapper.test.ts",
   "tests/release-projection.test.ts",
+  // 2026-11-12 补入：真宿主冒烟探针的回归守卫读 scripts/smoke/host-round.mjs
+  // （开发期只读冒烟脚本），该目录不投影。
+  "tests/smoke-host-round.test.ts",
+  // 2026-11-12 补入：提交门与文档工具链的行为测试直接跑 scripts/dev 与
+  // scripts/docs 下的开发脚本，这些目录不投影。
+  "tests/dev-gate-scripts.test.ts",
 ]);
 
 /** 引号里出现的 scripts 路径（够用的启发式：不走注释与正则误伤）。 */
@@ -58,7 +65,7 @@ function referencedScriptPaths(source: string): string[] {
 
 describe("public projection dependency gate", () => {
   // 超时分档（2026-10-17，B12 时基健康）：本条是**整仓扫描型**门——同步读遍
-  // `tests/` 下全部用例文件（实测 217 个 / 5.02 MiB）。耗时由仓库规模与磁盘／杀软
+  // `tests/` 下全部用例文件（2026-11-12 实测 265 个 / 6,289,910 B ≈ 6.0 MiB）。耗时由仓库规模与磁盘／杀软
   // 负载决定，不属判据；给 30s 余量（实测 58–126ms，余量 ≳238x）。
   it("keeps every test that reads a non-projected script on the not-projected list", () => {
     const offenders: Array<{ file: string; script: string }> = [];

@@ -250,7 +250,7 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
       "src/sync/folder-state-reducer-v2.ts",
       // S2 隔离通道（2026-10-17）：逐形状有界证据 capsule 只读记录本身的
       // 意图与收据形状（准入判定零写入、零第二状态源；见
-      // docs/temp/20261016-151934 §六 S2 行）。
+      // docs/archive/2026-11/20261016-151934 同步引擎第一性原理复校准 §六 S2 行）。
       "src/sync/isolation-capsules.ts",
       "src/sync/state-manager.ts",
       "src/sync/state-v2-migration.ts",
@@ -264,16 +264,15 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
 ];
 
 describe("file-sync V1 runtime freeze", () => {
-  // 超时分档（2026-10-17，B12 时基健康）：本组守卫每次都要走一遍全 `src` 目录并
-  // 读遍每个文件，属"整仓扫描型"。默认 5s 是给普通用例的时基，机器忙时（杀软／
-  // 磁盘排队／并行全量）纯 I/O 就能吃掉它 ⇒ 给 30s 余量（实测单条 4–83ms，见交付
-  // 报告普查清单）；判据、扫描面与期望值一个没动。
+  // 超时分档（2026-10-17，B12 时基健康；2026-11-12 校正）：本组守卫每次都要走一遍
+  // 全 `src` 目录并读遍每个文件，属"整仓扫描型"。vitest 全局 testTimeout 已是 60s；
+  // 这里显式 30s 比全局更紧（不是放宽），慢机器上仍可能假红 ⇒ 显式给 60s 与全局对齐。
   it.each(FILE_SYNC_V1_DEBT)(
     "allows $label debt only to shrink",
     ({ pattern, expected }) => {
       expect(countDebt(pattern)).toEqual(expected);
     },
-    30_000,
+    60_000,
   );
 
   // 反假绿（2026-10-16 检查体检轮）：上面那组门断言的是"某个模式一处都搜不到"，
@@ -402,7 +401,8 @@ describe("file-sync V1 runtime freeze", () => {
     expect(output).not.toContain("V2 receipt shadow");
     expect(output).not.toContain("V2 next-envelope shadow");
     // 超时分档（2026-10-17，B12 时基健康）：本条是**打包子门**——`esbuild` 真跑一次
-    // 整包构建。它是全仓唯一会拉起打包器／子进程的用例，等待时间由机器负载而非判据
+    // 整包构建。它是本文件唯一会拉起打包器／子进程的用例（全仓另有 dev-deploy-safety
+    // 的 powershell 与 release-projection 的 git 子进程），等待时间由机器负载而非判据
     // 决定（实测热态 0.19–0.23s，全量跑内 1.97s，并行全量负载下 1.78s，野外曾见 6–10s）
     // ⇒ 给 60s 余量（约 30x 最慢实测）。
   }, 60_000);

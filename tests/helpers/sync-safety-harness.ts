@@ -60,7 +60,6 @@ import {
 } from "../../src/sync/file-state-controller-v2";
 import type { SyncAnchorV2 } from "../../src/sync/state-envelope-v2";
 import { createFileStateShadowEnvelopeV2 } from "./file-state-shadow-v2";
-import { projectRemoteIndexV2 } from "../../src/sync/remote-index-v2";
 import {
   makePublic113InterruptedUploadBatch,
   PUBLIC_113_NETWORK_RECOVERY_INCIDENT,
@@ -220,7 +219,8 @@ export function remoteStateStub() {
     commitMutationCheckpoint: vi.fn().mockResolvedValue(undefined),
     commitMutationCheckpoints: vi.fn().mockResolvedValue(undefined),
     // 波级批量写（Step 4 清理波、确认删除波）：真实 StateManager 的方法总在场，
-    // 桩默认不落账。需要断言或需要真实归约的用例用 `makeActiveV2State` 覆盖。
+    // 桩默认不落账。桩上只有下面三个方法；recordMutationReceiptsAndCloudDeletions
+    // 不在桩上，需要它的用例用 `makeActiveV2State` 覆盖。
     beginMutationIntents: vi.fn().mockResolvedValue(undefined),
     recordMutationReceipts: vi.fn().mockResolvedValue(undefined),
     recordCloudDeletions: vi.fn().mockResolvedValue(undefined),
@@ -482,11 +482,12 @@ export function makeActiveV2State(
     // (the shadow seed re-binds anchors by current path, which would fake an
     // anchor that lost its identity after a remote move). The anchor keeps
     // its previous lastPath so identity-rename planning can detect the move.
-    const nextPathByRemoteId = projectRemoteIndexV2(envelope.remoteIndex);
+    // Production replaceRemoteStateEnvelopeV2 replaces only the remote index
+    // and carries anchors over unchanged — including anchors whose remote id
+    // is now absent (remote deletion) — so this fake must keep them too.
     const retained: Record<string, SyncAnchorV2> = {};
     for (const anchor of Object.values(previousEnvelope.anchors.byAnchorId)) {
       if (anchor.remoteId === undefined) continue;
-      if (!nextPathByRemoteId.has(anchor.remoteId)) continue;
       retained[anchor.anchorId] = { ...anchor };
     }
     if (Object.keys(retained).length > 0) {
@@ -1317,7 +1318,9 @@ export async function makeManualResolutionHarness(input: {
     operationId: "blocked-operation",
     planRevision: 1,
     scope,
-    action: input.sourcePath ? "renameRemote" : input.action ?? "upload",
+    // An explicit action wins even for a record with a source path, so the
+    // move-record shapes (moveLocal) can be driven through the same harness.
+    action: input.action ?? (input.sourcePath ? "renameRemote" : "upload"),
     path: input.path,
     ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
     expectedLocal: { exists: false },
@@ -1597,7 +1600,7 @@ export function makeNoticeRecorder(): {
  *  can hit, kept as typed kind/detail pairs so the probe can throw the same
  *  refusal the real reducer throws (刀 2: typed routing, message byte-identical
  *  to the historical `${kind}: ${detail}` texts that BASE_UPSERT_GATES keeps). */
-const BASE_UPSERT_GATE_SHAPES = [
+export const BASE_UPSERT_GATE_SHAPES = [
   { kind: "V2 base upsert has no remote file identity", detail: "note.md" },
   { kind: "V2 base upsert remote version mismatch", detail: "note.md" },
   { kind: "V2 base upsert would replace another anchor", detail: "note.md" },
@@ -1609,7 +1612,9 @@ export const BASE_UPSERT_GATES = BASE_UPSERT_GATE_SHAPES.map(
 
 export const makeStaleTreeCommitProbe = async (decide: (
   attempt: number,
-) => "reject" | "succeed") => {
+) => "reject" | "succeed",
+  gateShape: (typeof BASE_UPSERT_GATE_SHAPES)[number] = BASE_UPSERT_GATE_SHAPES[0],
+) => {
   const uploadedContent = new Uint8Array([1, 2, 3]).buffer;
   const uploadedHash = await sha256Hex(uploadedContent);
   const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
@@ -1667,8 +1672,8 @@ export const makeStaleTreeCommitProbe = async (decide: (
     attempts++;
     if (decide(attempts) === "reject") {
       throw new V2StateRefusalError(
-        BASE_UPSERT_GATE_SHAPES[0].kind,
-        BASE_UPSERT_GATE_SHAPES[0].detail,
+        gateShape.kind,
+        gateShape.detail,
       );
     }
     return realCommit(operationId);

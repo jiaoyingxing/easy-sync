@@ -456,6 +456,14 @@ describe("AncestorStoreV2 envelope linkage", () => {
     const missing = "b".repeat(64);
     const withoutVerifier = new StateEnvelopeV2Store(adapter, envelopePaths);
     await expect(withoutVerifier.publish(envelope(missing))).rejects.toThrow("not published");
+    // 生产形态是「有 verifier + 对象缺失」：verifier 明确返回 false 也必须拒绝。
+    const rejectingVerifier = new StateEnvelopeV2Store(
+      adapter,
+      envelopePaths,
+      () => false,
+    );
+    await expect(rejectingVerifier.publish(envelope(missing)))
+      .rejects.toThrow("not published");
 
     const hash = await ancestors.putText("base");
     const withVerifier = new StateEnvelopeV2Store(adapter, envelopePaths, (candidate) => ancestors.has(candidate));

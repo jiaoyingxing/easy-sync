@@ -324,6 +324,7 @@ describe("V1 to V2 controlled production activation", () => {
     releaseCreate!();
     await harness.executor.settleBackgroundTasks();
     expect(harness.cloudBootstrap.create).toHaveBeenCalledOnce();
+    expect(harness.cloudBootstrap.update).not.toHaveBeenCalled();
   });
 
   it("keeps a cold-started active V2 community-plugin round to one delta request", async () => {
@@ -880,7 +881,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(committedState.isV2StateActive).toBe(true);
   });
 
-  it("cancels a confirmed pre-manifest migration and removes only prepared artifacts", async () => {
+  it("rejects cancelling a confirmed pre-manifest migration and keeps manifest/envelope/V1 backup", async () => {
     const harness = makeHarness({
       localFolders: [{ path: "Notes" }, { path: "Empty" }],
     });

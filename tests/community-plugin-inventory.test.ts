@@ -195,7 +195,7 @@ describe("community plugin inventory", () => {
     ]);
   });
 
-  it("does not expose an empty remote plugin directory shell as an inventory row", async () => {
+  it("returns no inventory row when the remote listing is empty", async () => {
     const adapter = {
       exists: vi.fn(async () => false),
       list: vi.fn(async () => ({ files: [], folders: [] })),

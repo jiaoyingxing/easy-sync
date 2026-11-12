@@ -146,6 +146,37 @@ describe("S03 — state-neutral local recovery journal", () => {
     expect(files.has(journal.intentPath)).toBe(false);
   });
 
+  it("refuses a single-file prepare while another recovery intent is pending", async () => {
+    const firstPath = "note.md";
+    const secondPath = "other.md";
+    const firstOld = bytes(1, 2);
+    const secondOld = bytes(3, 4);
+    const downloaded = bytes(5, 6);
+    const { adapter, files } = makeMemoryAdapter({
+      [firstPath]: firstOld,
+      [secondPath]: secondOld,
+    });
+    const journal = new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp");
+
+    await journal.prepareCopiedOriginal(firstPath, await entry(firstPath, firstOld), firstOld, {
+      hash: await sha256Hex(downloaded),
+      size: downloaded.byteLength,
+    });
+    const firstIntent = files.get(journal.intentPath);
+
+    // 共享的 original.bin 与 intent.json 属于上一笔未完成事务，不能被静默覆盖。
+    await expect(journal.prepareCopiedOriginal(
+      secondPath,
+      await entry(secondPath, secondOld),
+      secondOld,
+      { hash: await sha256Hex(downloaded), size: downloaded.byteLength },
+    )).rejects.toThrow("Local recovery is already in progress");
+
+    expect(files.get(journal.intentPath)).toBe(firstIntent);
+    expect(new Uint8Array(files.get(journal.copiedOriginalPath) as ArrayBuffer))
+      .toEqual(new Uint8Array(firstOld));
+  });
+
   it("rolls back a partially written plugin bundle as one recovery unit", async () => {
     const root = ".obsidian/plugins/resojot";
     const mainPath = `${root}/main.js`;
@@ -317,8 +348,9 @@ describe("S03 — state-neutral local recovery journal", () => {
       createdAt: Date.now(),
     }));
 
-    // readIntent must recover the orphan .next → .json, then recover()
-    // runs normally (writes target file, restores, cleans up intent).
+    // readIntent must recover the orphan .next → .json, then recover() settles
+    // the intent (this fixture has no expected state and no target file; it
+    // returns restored).
     const recovered = await new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp")
       .recover();
     expect(recovered).toBe("restored");
@@ -342,9 +374,44 @@ describe("S03 — state-neutral local recovery journal", () => {
       size: downloaded.byteLength,
     });
 
-    // Fallback: .json must exist with correct content despite rename throwing.
+    // Fallback: .json must exist with the intended content despite rename throwing.
     expect(brokenRename).toHaveBeenCalled();
+    expect(JSON.parse(files.get(journal.intentPath)!)).toMatchObject({
+      version: 1,
+      targetPath: "note.md",
+      recoveryMode: "rename",
+    });
     expect(typeof files.get(journal.intentPath)).toBe("string");
+  });
+
+  it("keeps a direct-written intent when the .next staging file cannot be renamed", async () => {
+    const path = "note.md";
+    const oldContent = bytes(1, 2, 3);
+    const downloaded = bytes(4, 5, 6);
+    const recoveryPath = `${path}.easy-sync-recovery`;
+    const { adapter, files } = makeMemoryAdapter({ [path]: oldContent });
+    const hybridAdapter = {
+      ...adapter,
+      rename: vi.fn(async () => { throw new Error("rename unsupported"); }),
+    } as unknown as DataAdapter;
+    const journal = new LocalRecoveryJournal(hybridAdapter, ".obsidian/plugins/easy-sync/tmp");
+
+    await journal.prepareRenamedOriginal(path, await entry(path, oldContent), recoveryPath, {
+      hash: await sha256Hex(downloaded),
+      size: downloaded.byteLength,
+    });
+    // 直写兜底成功后 .next 仍留在盘上；下一次读取不能把两份一起抹掉。
+    expect(files.has(`${journal.intentPath}.next`)).toBe(true);
+    await adapter.rename(path, recoveryPath);
+    await adapter.writeBinary(path, downloaded);
+
+    expect(await journal.hasPendingRecovery()).toBe(true);
+    expect(await new LocalRecoveryJournal(hybridAdapter, ".obsidian/plugins/easy-sync/tmp")
+      .recover()).toBe("restored");
+    expect(new Uint8Array(files.get(path) as ArrayBuffer)).toEqual(new Uint8Array(oldContent));
+    expect(files.has(recoveryPath)).toBe(false);
+    expect(files.has(`${journal.intentPath}.next`)).toBe(false);
+    expect(files.has(journal.intentPath)).toBe(false);
   });
 
   it("cleanupOrphanCopies removes an orphaned copy when its target still exists", async () => {

@@ -69,6 +69,7 @@ import {
 } from "./download-stream-guards";
 import {
   createRangeStreamDownloader,
+  isRangeCancel,
   loadNodeHttps,
   readRangePartialDownload,
   type RangePartialDownload,
@@ -373,8 +374,10 @@ export class OneDriveClient {
    *  fail without a single attempt (2026-09-15 连坐切片). */
   private contentFailedThisRound = false;
   /** Set when the CDN downloadUrl fails for a file this round with a real
-   *  HTTP status. Subsequent files skip CDN entirely — saves budget for
-   *  /content. Transport-level failures never blacklist (连坐切片). */
+   *  HTTP status. The hint tier then skips CDN for the rest of the round
+   *  (saves budget for /content); the item-metadata tier still re-fetches a
+   *  downloadUrl, so it can touch the CDN again. Transport-level failures
+   *  never blacklist (连坐切片). */
   private cdnFailedThisRound = false;
   /** 连续传输级 CDN 失败熔断 (2026-10-27): `statusCode 0` must not blacklist
    *  the endpoint (a dead link is not a broken CDN), but nothing counted them
@@ -1032,8 +1035,8 @@ export class OneDriveClient {
    *
    * 不重试：恢复没有幂等保证，结果不明的重发可能把「已经恢复成功」读成第二次的
    * 404，从而误报失败。失败按既有 `OneDriveError` 分类抛出，由调用方如实呈现
-   * （不吞分类、不循环重试）。仍未实测：原路径已被占用时服务端的行为（可能失败或
-   * 自动改名）——不做猜测分支。
+   * （不吞分类、不循环重试）。原路径已被占用时的服务端行为已于 2026-10-28 探针
+   * 变体 B 实测：占位文件被自动改名让位（`probe(1).md`；日志 `20261028-150741`）。
    */
   async restoreDeletedDriveItemById(driveItemId: string): Promise<void> {
     const response = await this.request(
@@ -2228,7 +2231,10 @@ export class OneDriveClient {
             0,
             transferredBytesFromError(error),
           );
-          if (isAbortError(error)) throw error;
+          // Same cancel priority as the multi-range recovery: a transport
+          // AbortError with connection markers belongs to the fallback ladder,
+          // not to user cancellation.
+          if (isRangeCancel(error, this.abortSignal)) throw error;
           if (isResponseByteBudgetError(error)) throw error;
           let err = error;
           if (
@@ -2562,7 +2568,7 @@ export class OneDriveClient {
             });
             return { value: buffer, bytes: buffer.byteLength };
           } catch (error) {
-            if (isAbortError(error) || signal.aborted) throw error;
+            if (isRangeCancel(error, signal)) throw error;
             rangePartial = readRangePartialDownload(error);
             const resumeAt = rangePartial && rangePartial.landedOffset > 0
               ? rangePartial.landedOffset
@@ -4208,12 +4214,18 @@ export class OneDriveClient {
             `idempotent read timed out locally — retrying as transient method=${method}, endpoint=${endpoint}, attempt=${attempt}/${maxAttempts}`,
           );
         }
+        if (expectedNotFound) throw error;
+        // A 404 the caller did not expect may mean the resolved storage
+        // directory went away (vault recreated under another name), so the
+        // scope cache is dropped for re-resolution. An expected-absence probe
+        // is a normal answer: clearing here would drop a legacy
+        // percent-encoded name and silently retarget the rest of the round at
+        // the canonical directory.
         if (error.type === OneDriveErrorType.NotFound) {
           this.initializedVaults.clear();
           this.storageVaultNames.clear();
           this.vaultScopes.clear();
         }
-        if (expectedNotFound) throw error;
         if (
           method === "DELETE"
           && attempt > 1
@@ -5160,6 +5172,17 @@ function exactArrayBuffer(chunk: Uint8Array): ArrayBuffer {
   return chunk.slice().buffer;
 }
 
+/**
+ * Split a byte count's bit length into the two big-endian 32-bit words the
+ * SHA-256 padding stores (high word first). Exported for the boundary test:
+ * a stream of 2^32 bits (512 MiB) is the first size where the low word alone
+ * stops being enough.
+ */
+export function sha256BitLengthWords(totalBytes: number): [number, number] {
+  const totalBitLength = totalBytes * 8;
+  return [Math.floor(totalBitLength / 0x1_0000_0000), totalBitLength >>> 0];
+}
+
 class StreamingSha256 {
   private static readonly K = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
@@ -5221,10 +5244,16 @@ class StreamingSha256 {
       finalBlock.set(this.pending.subarray(0, this.pendingLength), 0);
     }
     finalBlock[this.pendingLength] = 0x80;
-    const totalBitLength = this.totalBytes * 8;
     const needsTwoBlocks = this.pendingLength >= 56;
     const lengthOffset = needsTwoBlocks ? 120 : 56;
-    const lo = totalBitLength >>> 0;
+    // SHA-256 pads with the message length in bits as one 64-bit big-endian
+    // value. Writing only the low word silently hashes the wrong length for
+    // streams of 2^32 bits (512 MiB) and larger.
+    const [hi, lo] = sha256BitLengthWords(this.totalBytes);
+    finalBlock[lengthOffset] = (hi >>> 24) & 0xff;
+    finalBlock[lengthOffset + 1] = (hi >>> 16) & 0xff;
+    finalBlock[lengthOffset + 2] = (hi >>> 8) & 0xff;
+    finalBlock[lengthOffset + 3] = hi & 0xff;
     finalBlock[lengthOffset + 4] = (lo >>> 24) & 0xff;
     finalBlock[lengthOffset + 5] = (lo >>> 16) & 0xff;
     finalBlock[lengthOffset + 6] = (lo >>> 8) & 0xff;

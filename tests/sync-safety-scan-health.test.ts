@@ -1,13 +1,8 @@
 // 本机扫描健康与只读预览
-// 由 tests/sync-safety.test.ts 按主题拆分而来（纯搬运，用例名与断言未改）。
-//
-// 原文件文件头（随 P0 用例一并留在本文件）：
-// Behavior tests for EasySync core sync safety (P0.1 / P0.2 / P0.3).
-// These tests are the minimum safety net for the three data-loss vectors
-// identified in the high-tier model review. Each test maps to a specific P0 fix commit.
-//   P0.1 (2776e59): Download always executes, even when local file exists
-//   P0.2 (efcae57): Scan failures block destructive delete actions
-//   P0.3 (72e19d6): Full SHA-256 catches modifications that quick hash missed
+// 由 tests/sync-safety.test.ts 按主题拆分而来（用例名与断言随拆分保留）。
+// 历史提示：原文件头记录 P0.1/P0.2/P0.3 三条数据丢失向量；P0.1 用例已不在
+// 本文件，其余用例也不都对应 P0 修复提交——按内容看，本文件是扫描健康与只读
+// 预览的回归集合。
 
 import {
   describe,

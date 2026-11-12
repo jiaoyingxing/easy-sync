@@ -348,10 +348,10 @@ describe("失败身份证据：只作证据，不回流进判据", () => {
   it("网络类分类函数不读任何证据字段", () => {
     const body = functionBody(
       readSourceFile("src/sync/sync-executor.ts"),
-      "function isNetworkClassTransferFailure(",
+      "function isNetworkClassFailure(",
     );
     for (const token of EVIDENCE_TOKENS) {
-      expect(body, `isNetworkClassTransferFailure 读了 ${token}`).not.toContain(token);
+      expect(body, `isNetworkClassFailure 读了 ${token}`).not.toContain(token);
     }
   });
 

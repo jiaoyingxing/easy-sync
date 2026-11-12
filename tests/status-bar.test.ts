@@ -6,7 +6,7 @@
  * 切片 2（2026-08-26）：
  *  - 图标着色弃用 `data-easy-sync-status` 属性选择器，改用与侧栏状态行同构的
  *    `.is-*` 类（is-loggedOut / is-cancelling / is-syncing / is-attention /
- *    is-success / is-ready）：先 removeClass 全套再 addClass 当前态；连接中
+ *    is-success / is-ready / is-offline）：先 removeClass 全套再 addClass 当前态；连接中
  *    不落任何 is-* 类（灰）；
  *  - 点击（onload 一次性 `onClickEvent`）改调私有 `handleRibbonClick()`，
  *    与 ribbon 同语义（未登录→打开设置 / ready→startManualSync / 其余→打开视图）。
@@ -289,7 +289,7 @@ describe("updateStatusBar item structure", () => {
     expect(el.classes.has("is-syncing")).toBe(false);
   });
 
-  it("maps attention branches (conflicts / deletes / plan review) to the attention group", async () => {
+  it("maps pending conflicts to the attention group", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { pendingConflicts: unknown[] }).pendingConflicts =

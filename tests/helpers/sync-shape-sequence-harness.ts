@@ -14,8 +14,9 @@
 //     并提供 D6 断言原语（零动作轮、双设备视图一致＋账本/待办清空）。
 //
 // 状态替身复用 tests/helpers/sync-safety-harness.ts 的 makeActiveV2State
-// （14 个 sync-safety 主题文件共用、已由整轮用例证明可跑）；本夹具不新增
-// 任何状态语义，只新增「第二台设备＋共同世界」的可表达性。
+// （16 个 sync-safety 主题文件共用、已由整轮用例证明可跑）；本夹具不新增同步
+// 语义，只新增「第二台设备＋共同世界」，并把待办 reconcile 换成内存实现
+// （与真实实现的差异见下方注释）。
 
 import { createHash } from "node:crypto";
 import { expect, vi } from "vitest";
@@ -55,8 +56,8 @@ export const sha256Sync = sha256Bytes;
 
 /**
  * 双设备世界共用的一份同步范围（同一个云端目录）。
- * accountId 与夹具替身 makeActiveV2State 内建范围一致（键盘注入的恢复记录
- * 要与已提交状态逐字段同范围，genus sameSyncScope gate）。
+ * accountId 与夹具替身 makeActiveV2State 内建范围一致：注入的恢复记录必须与
+ * 已提交状态逐字段同 scope（sameSyncScope 门）。
  */
 export const SHAPE_SCOPE: SyncScope = {
   ...TEST_SYNC_SCOPE,
@@ -341,19 +342,34 @@ export function createShapeWorld(input: {
     recreateRemoteFolderAt(path) {
       const contents = new Map<string, ArrayBuffer>();
       for (const file of [...facts.files.values()].filter((candidate) =>
-        candidate.path.startsWith(`${path}/`))) {
+        candidate.path === path || candidate.path.startsWith(`${path}/`))) {
         contents.set(file.path, file.bytes.slice(0));
       }
+      // Snapshot the whole folder tree before deleting it: empty subfolders
+      // and intermediate ancestors are part of the rebuild too. The previous
+      // version only recreated file parents and registered just those in
+      // byId, so a nested or empty folder made the next delta throw
+      // "lost identity".
+      const subtreeFolders = [...facts.folders.keys()]
+        .filter((folderPath) =>
+          folderPath === path || folderPath.startsWith(`${path}/`))
+        .sort((left, right) =>
+          left.split("/").length - right.split("/").length
+          || left.localeCompare(right));
       world.deleteRemoteFolder(path);
-      for (const [subPath] of contents) {
+      facts.revision += 1;
+      for (const folderPath of subtreeFolders) {
+        completeFolderChain(folderPath, facts.folders, facts.nextItemId);
+        const folder = facts.folders.get(folderPath)!;
+        folder.lastChange = facts.revision;
+        facts.byId.set(folder.id, folder);
+      }
+      for (const [subPath, bytes] of contents) {
         completeFolderChain(
           parentPathOf(subPath),
           facts.folders,
           facts.nextItemId,
         );
-      }
-      facts.revision += 1;
-      for (const [subPath, bytes] of contents) {
         const parentFolder = facts.folders.get(parentPathOf(subPath))!;
         parentFolder.lastChange = facts.revision;
         facts.byId.set(parentFolder.id, parentFolder);
@@ -580,8 +596,9 @@ export async function addShapeDevice(
     folderAnchors: folderAnchorSeeds,
   });
 
-  // 轮末待办落库：替身的 reconcile 换成与真实语义同形的内存实现
-  // （按路径替换、resolved 退休、FolderDeferred 行不累计失败）。
+  // 轮末待办落库：替身的 reconcile 换成内存实现（按路径替换、resolved 退休、
+  // FolderDeferred 行不累计失败）。与真实实现的差异：不合并 consecutiveFailures，
+  // 也不保全 RetryLater 的 updatedAt——基于本替身的熔断断言需自行补这两项。
   const pendingIssueStore = (state as unknown as {
     pendingIssues: PendingIssue[];
   }).pendingIssues;
@@ -767,7 +784,8 @@ export async function addShapeDevice(
     getName: vi.fn(() => name),
   };
 
-  // 真实扫描器只把「范围内文件的祖先链」当作候选目录（addParentFolderPaths），
+  // 真实扫描器的候选目录有两个来源：范围内文件的祖先链（addParentFolderPaths）
+  // 与 Vault 里所有已加载目录（local-scanner.ts 的 collectLoadedFolderPaths）；
   // 引擎自己的暂存目录（tmp/state/logs）按 isExcluded 出局；下载时 mkdir 的
   // `.obsidian` 父链壳在真实实现里也绝不会进入扫描面。按同语义建模。
   const folderScanCandidates = (): string[] => {

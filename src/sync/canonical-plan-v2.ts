@@ -232,7 +232,8 @@ export interface FinalizeCanonicalPlanInputV2 {
   /** Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): optional
    *  planner-stage downloadUrl refresh for the *exact* budgeted verification
    *  download set (conflict-candidate downloads below). The planner invokes it
-   *  at most once with those candidates before downloading; implementations
+   *  at most once per candidate set before downloading (the both-sides set
+   *  and the remote-only set each get one call); implementations
    *  fill `item.remote.downloadUrl` on the planner-owned clones (safe: the
    *  planner clones every candidate) only when returned metadata matched the
    *  planned remote id + eTag (mirror of the Step-3b universal-refresh
@@ -320,13 +321,6 @@ export function buildCanonicalPlanCandidateFromStateV2(
   });
 }
 
-/**
- * Compose already-prepared file actions with folder and identity actions.
- *
- * The input array is never mutated. This is the only V2 owner for protecting
- * folder subtrees, carrying file identities with folder moves, and ordering
- * file/folder actions into one candidate.
- */
 interface CanonicalCarriedFolderMovesInputV2 {
   folderPlan: ReturnType<typeof planFolderStateFromViewV2>;
   state: CanonicalActionCompositionFactsV2["state"];
@@ -510,6 +504,13 @@ function buildCanonicalPlanIndexesV2({
   };
 }
 
+/**
+ * Compose already-prepared file actions with folder and identity actions.
+ *
+ * The input array is never mutated. This is the only V2 owner for protecting
+ * folder subtrees, carrying file identities with folder moves, and ordering
+ * file/folder actions into one candidate.
+ */
 function composeCanonicalActionsV2(
   input: CanonicalActionCompositionFactsV2,
 ): CanonicalPlanCandidateV2 {
@@ -718,10 +719,10 @@ function composeCanonicalActionsV2(
  * Apply one planned folder action to the composed folder decision arrays.
  *
  * A create, move or delete either joins its action array or becomes a
- * per-action deferral; every decomposed item path additionally joins the
- * protected-root sets the later file filtering and descendant-evidence
- * steps consult. The caller's containers are threaded by reference and no
- * binding is reassigned, so a terminal per-item outcome is a plain return.
+ * per-action deferral. Move and deferred paths also join the protected-root
+ * sets the later file filtering and descendant-evidence steps consult. The
+ * caller's containers are threaded by reference and no binding is
+ * reassigned, so a terminal per-item outcome is a plain return.
  */
 type CanonicalFolderPlanItemV2 = Parameters<typeof applyFolderPlanItemV2>[0]["item"];
 
@@ -1757,10 +1758,11 @@ interface VerificationPrefetchInputV2 {
 /**
  * Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
  * downloadUrl refresh for exactly the budgeted verification download set.
- * Called at most once, before any content download below; fail-open — a
- * missing or throwing hook leaves every URL unset so the per-file waterfall
- * refresh behaves exactly as before batching. Extracted verbatim from
- * `finalizeCanonicalPlanCandidateV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ * Called at most once per candidate set, before any content download below;
+ * fail-open — a missing or throwing hook leaves every URL unset so the
+ * per-file waterfall refresh behaves exactly as before batching. Extracted
+ * verbatim from `finalizeCanonicalPlanCandidateV2`（2026-10-16 第二期类内分解，
+ * 逐 token 等价）。
  */
 async function refreshVerificationDownloadUrlsV2({
   downloadCandidates,

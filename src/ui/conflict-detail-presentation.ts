@@ -31,6 +31,21 @@ export function shouldAutoLoadRemoteComparison(
   return remoteSize <= limit;
 }
 
+/**
+ * Decide whether the conflict's local side is known absent.
+ *
+ * A conflict whose local side is already deleted has no local bytes to read:
+ * the comparison must start from an empty local side instead of treating the
+ * read failure as "local unreadable", which used to hide the remote content
+ * the user opened the detail modal to see. A conflict that still carries a
+ * local fact keeps the honest read-failure path.
+ */
+export function conflictHasMissingLocalSide(
+  item: { local?: unknown; remote?: unknown },
+): boolean {
+  return item.local === undefined && item.remote !== undefined;
+}
+
 export type ConflictDetailSummaryEvidence =
   | { kind: "comparison-unavailable" }
   | { kind: "reason" }

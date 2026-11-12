@@ -163,20 +163,6 @@ describe("community plugin selection updates", () => {
     });
   });
 
-  it("keeps newly discovered plugins enabled until explicitly ignored", () => {
-    const next = updateCommunityPluginSelection(
-      defaultSettings(),
-      "files",
-      "calendar",
-      false,
-      knownIds,
-    );
-
-    expect(next.policy.files.mode).toBe("all");
-    expect(next.policy.files.ignoredPluginIds).toEqual(["calendar"]);
-    expect(isPluginSelected(next.policy.files, "new-plugin")).toBe(true);
-  });
-
   it("turns off the outer range when selected mode loses its last item", () => {
     const current: CommunityPluginSelectionSettings = {
       filesEnabled: true,

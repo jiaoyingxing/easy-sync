@@ -1214,6 +1214,8 @@ describe("folder recovery settle-as-observed (zero-write manual exit)", () => {
     expect(state.manualMutationResolutionAudit).toHaveLength(0);
   });
 
+});
+
   it("retires a persisted completed v2 migration hold instead of blocking the upgrade", async () => {
     const items: SyncPlanItem[] = [{
       type: SyncActionType.Conflict,
@@ -1269,4 +1271,3 @@ describe("folder recovery settle-as-observed (zero-write manual exit)", () => {
       }),
     );
   });
-});

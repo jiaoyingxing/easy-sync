@@ -530,7 +530,7 @@ describe("production-capable IndexedDB active state owner", () => {
     }
   });
 
-  it("rebuilds a lost authority only into a fresh database identity", async () => {
+  it("rebuilds a lost authority into a separately created store after the old identity is missing", async () => {
     const source = createLargeV2Envelope(20);
     const next = nextEnvelope(source, "b".repeat(64), "etag-next");
     const harness = createHarness();
@@ -544,6 +544,8 @@ describe("production-capable IndexedDB active state owner", () => {
       });
 
       const rebuilt = await harness.store.rebuildRecoveryEnvelope();
+      // 新数据库 id 由调用方选取（重建本身不生成/强制身份）；旧库已 delete
+      // 并在上面报 missing，下面的 not.toBe 只证明这是另一个库。
       const replacementId = createStateV2ActiveIndexedDbDatabaseId();
       replacement = new StateV2IndexedDbActiveStore(
         replacementId,
