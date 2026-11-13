@@ -530,6 +530,7 @@ export function makeHarness(input?: {
   let loseNextLocalFileMoveResponse = false;
   let loseNextLocalFileDeleteResponse = false;
   let failNextTrash = false;
+  let failNextTrashSilently = false;
   let conflictNextFolderDelete = false;
   let conflictNextFolderMove = false;
   let changeNextParentVersion = false;
@@ -1299,6 +1300,10 @@ export function makeHarness(input?: {
         failNextTrash = false;
         throw new Error("trash failed");
       }
+      if (failNextTrashSilently) {
+        failNextTrashSilently = false;
+        return false;
+      }
       if (file instanceof TFolder) {
         localFolderPaths.delete(file.path);
         if (loseNextLocalFolderDeleteResponse) {
@@ -1394,6 +1399,7 @@ export function makeHarness(input?: {
     loseLocalFileMoveResponseOnce: () => { loseNextLocalFileMoveResponse = true; },
     loseLocalFileDeleteResponseOnce: () => { loseNextLocalFileDeleteResponse = true; },
     failTrashOnce: () => { failNextTrash = true; },
+    failTrashSilentlyOnce: () => { failNextTrashSilently = true; },
     conflictFolderDeleteOnce: () => { conflictNextFolderDelete = true; },
     conflictFolderMoveOnce: () => { conflictNextFolderMove = true; },
     changeParentVersionBeforeNextRead: () => { changeNextParentVersion = true; },

@@ -15023,7 +15023,7 @@ export class SyncExecutor {
           );
         }
       };
-      // Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
+      // Knife-1 (2026-09-08, carrier `20260908-1331`): planner-stage
       // downloadUrl refresh for the exact budgeted content-verification
       // download set. The canonical planner hands over the candidates it will
       // download; we fill a fresh URL on each planner-owned clone through one
@@ -18600,7 +18600,7 @@ export class SyncExecutor {
       // Sum of this batch's own content-transfer durations. The concurrency
       // controller's recovery signal reads only this: metadata refresh,
       // sha256 and the remote verification below are not link evidence (C2,
-      // docs/temp/20261026-1240).
+      // 20261026-1240).
       let batchTransferMs = 0;
       const prepared = await Promise.all(batch.map(async (item): Promise<PreparedDownload> => {
         metrics.fileTransfers.download.started++;
@@ -29402,7 +29402,6 @@ export class SyncExecutor {
     this.isolatedMutationRecoveryPathCache = null;
   }
 
-  /** Use persisted remote state for incremental delta, rebuilding on failure. */
   /**
    * Enumeration-checkpoint helpers (join 弱网「稍后重试」案C, 2026-09-19).
    * The checkpoint is pure regenerable cache: restore is fail-open (scope
@@ -31641,8 +31640,16 @@ export class SyncExecutor {
       if (this.fileManager) {
         // A failed trash operation must remain a failure. Falling back to a
         // permanent delete would silently defeat the user's recovery path.
+        // Obsidian 1.15.1+ resolves false when the system trash is unavailable;
+        // that is a real failure when the file is still here. Older hosts
+        // resolve undefined and keep their previous behavior.
         this.onSelfLocalDelete?.(path);
-        await this.fileManager.trashFile(tfile);
+        const trashed: unknown = await this.fileManager.trashFile(tfile);
+        if (trashed === false && this.scanner.vault.getFileByPath(path)) {
+          throw new MutationNotAppliedError(
+            new Error(`Local file cannot be moved to trash safely: ${path}`),
+          );
+        }
       } else {
         this.onSelfLocalDelete?.(path);
         await this.scanner.vault.adapter.remove(path);

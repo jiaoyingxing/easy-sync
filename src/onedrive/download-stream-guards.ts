@@ -198,7 +198,7 @@ export function createSlowConnectionGate(
  *  plus re-downloading the bytes a restart discards, assuming the next
  *  connection is no faster than the current one — conservative). Disabled
  *  while the size is unknown. Revisit the dropped-bytes term if range resume
- *  (甲路, docs/temp/20260915-2310) stops restarts from discarding bytes. */
+ *  (甲路, 20260915-2310) stops restarts from discarding bytes. */
 function isCompletionImminent(
   totalSize: number | undefined,
   receivedBytes: number,

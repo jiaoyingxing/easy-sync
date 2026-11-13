@@ -10,7 +10,7 @@
  *
  * 装饰是纯呈现：不动定义树、不动行文案、不承载语义（`aria-hidden`）。宿主改版
  * 导致类名/属性变化时静默退化为纯文字，不影响任何功能。
- * 方案、宿主事实与验收口径＝docs/temp/20261017-162313 设置页图标方案单…
+ * 方案、宿主事实与验收口径＝docs/archive/2026-11/20261017-162313 设置页图标方案单…
  */
 import { setIcon } from "obsidian";
 import type { I18nFn } from "./confirm-modal";

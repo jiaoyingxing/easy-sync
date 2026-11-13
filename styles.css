@@ -1834,6 +1834,18 @@ body:not(.is-mobile) .vertical-tabs-container:has(.vertical-tab-nav-item.is-acti
   color: #e62e43;
 }
 
+/* 手机端两键并排（2026-11-13 用户拍板）：宿主在手机弹框里把设置按钮撑成
+   整宽（`.is-phone .modal .setting-item-control button:not(.clickable-icon)
+   { width: 100% }`，specificity (0,4,1)），GitHub／小红书被挤成上下两行。
+   照 Resojot「手机端底栏两键并排」的写法改回同行等宽：等分、可收缩，文案
+   更长或屏幕更窄时仍由上面那条 `flex-wrap: wrap` 自然换行。选择器带
+   `body`＋`.modal`＋自家行类为 (0,5,1)，稳定压过宿主的整宽规则。 */
+body.is-phone .modal .easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+}
+
 /* 根页底部（2026-11-10 用户拍板）：三组导航之后是「支持 EasySync」入口组，
    再下面是页脚（四入口＋版权/许可）。支持组是导航组；页脚不是设置组：无卡片
    底色、无边框、无外侧标题、不进设置搜索；只放根页。布局＝设置页容器纵向 flex＋
@@ -1844,6 +1856,14 @@ body:not(.is-mobile) .vertical-tabs-container:has(.vertical-tab-nav-item.is-acti
   display: flex;
   flex-direction: column;
   padding-bottom: var(--size-4-5);
+}
+
+/* 桌面设置页的滚动条会挤掉内容区右侧 12px（1.15.1 实测：有滚动条时整块卡片与
+   页脚比无滚动条时左偏 6px，与 Resojot 并排差半档）。两侧都预留
+   `scrollbar-gutter`，有无滚动条时内容中心一致，也与 Resojot 同轴；手机设置是
+   覆盖式滚动、没有占位滚动条，不加槽。 */
+body:not(.is-mobile) .modal.mod-settings .easy-sync-settings-tab {
+  scrollbar-gutter: stable both-edges;
 }
 
 /* 组不压缩：内容超长时让页签滚动，而不是把设置组压扁。 */
@@ -1896,6 +1916,14 @@ body:not(.is-mobile) .vertical-tabs-container:has(.vertical-tab-nav-item.is-acti
   justify-content: center;
   flex-wrap: wrap;
   gap: 0;
+}
+
+/* Host setting rows give a child <nav> a 16px inline-end margin (1.15.1
+   measured: row 324 / nav 308 — the four links sat 8px left of the copyright
+   line). The footer nav has no sibling control to reserve that gap for, so
+   zero it and let the links share the copyright line's axis. */
+.easy-sync-settings-footer-row .easy-sync-settings-footer-links {
+  margin: 0;
 }
 
 .easy-sync-settings-footer-link {

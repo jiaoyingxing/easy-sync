@@ -376,6 +376,28 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBe("recovery");
   });
 
+  it("retries account verification on a pending session before refusing to start", async () => {
+    const plugin = makePlugin();
+    plugin.syncExecutor = { isRunning: false } as never;
+    plugin.state = { lastSyncTime: 1, planReviewActive: false } as never;
+    const verifyAccountNow = vi.fn().mockResolvedValue(false);
+    plugin.auth = {
+      authState: { isLoggedIn: true, accountId: "" },
+      isSessionPending: true,
+      verifyAccountNow,
+    } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+
+    await plugin.startManualSync();
+
+    expect(verifyAccountNow).toHaveBeenCalledWith({ allowBootstrap: true });
+    // The root cause is handled by the retry mechanism; no compensation
+    // notice or new status surface is added.
+    expect(show).not.toHaveBeenCalled();
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
   it("reads the entry as occupied for every lock holder, not only sync", () => {
     // 2026-10-28 真机：非 sync 持有者（参与核对/重置/登出/恢复/路径设置）
     // 同样让手动同步在入口弹回，入口忙事实若只认 sync，面板就在持锁期间

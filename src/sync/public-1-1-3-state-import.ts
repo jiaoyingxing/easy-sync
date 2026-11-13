@@ -172,12 +172,6 @@ export async function public113MigrationInputDigestV2(
 }
 
 /**
- * Record-vs-runtime comparison used by the authority guards: a recorded
- * digest matches either the semantic (V2) or the legacy (whole-pluginData)
- * digest of the runtime input — the latter keeps holds staged by an older
- * build verifiable across an upgrade.
- */
-/**
  * Backup-snapshot comparison for the pre-manifest V1 backup: identical to a
  * plain snapshot comparison except that the bookkeeping is masked on both
  * sides. A stored backup snapshots its staging-time source, so a later

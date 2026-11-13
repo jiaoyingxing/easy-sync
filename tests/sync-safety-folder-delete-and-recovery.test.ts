@@ -9,6 +9,7 @@ import {
 } from "vitest";
 import * as obsidian from "obsidian";
 import {
+  TFile,
   TFolder,
 } from "obsidian";
 import {
@@ -250,6 +251,8 @@ describe("confirm delete waves", () => {
     folderPath?: string;
     /** 这一条的本机删除抛错（adapter.remove）。 */
     failErasePath?: string;
+    /** 这一条走 trashFile 且宿主 resolve false（文件仍在），用于验证不提交删除。 */
+    silentTrashPath?: string;
     /** 本条删除成功后执行（用于在波中取消）。 */
     afterErase?: (path: string) => void;
     /** 批量缺席读取被调用时执行（参数为该次读取覆盖的路径）。 */
@@ -349,6 +352,7 @@ describe("confirm delete waves", () => {
       const path = (file as { path?: string }).path ?? "";
       trashed.push(path);
       events.push(`trash:${path}`);
+      if (path === input.silentTrashPath) return false;
     });
     const ledger: Array<{
       intent: MutationIntentV1;
@@ -460,7 +464,8 @@ describe("confirm delete waves", () => {
     const vault = {
       configDir: ".obsidian",
       adapter,
-      getFileByPath: vi.fn().mockReturnValue(null),
+      getFileByPath: vi.fn((path: string) =>
+        input.silentTrashPath === path ? new TFile(path) : null),
       getFiles: vi.fn().mockReturnValue([]),
       getName: vi.fn().mockReturnValue("testVault"),
       getAbstractFileByPath: vi.fn((path: string) =>
@@ -693,6 +698,44 @@ describe("confirm delete waves", () => {
     );
     // Same per-item exit: one failure notice for the one member that failed
     // (success notices stay off for a batch, as before this change).
+    expect(harness.notices).toEqual(["notice.delete.failed"]);
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+  });
+
+  it("keeps one silent trash false to its own item: the other seven settle in the shared checkpoint", async () => {
+    const paths = wavePaths();
+    const failedPath = paths[2];
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: paths,
+      silentTrashPath: failedPath,
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.trashed).toEqual([failedPath]);
+    expect(harness.removedPaths).toEqual(
+      paths.filter((path) => path !== failedPath),
+    );
+    // The failed member never enters the shared checkpoint …
+    expect(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).toHaveBeenCalledTimes(1);
+    const receipted = vi.mocked(
+      harness.state.recordMutationReceiptsAndCloudDeletions,
+    ).mock.calls[0][0] as Array<{ operationId: string }>;
+    expect(receipted).toHaveLength(WAVE - 1);
+    expect(vi.mocked(harness.state.commitMutationCheckpoints).mock.calls[0][0])
+      .toEqual(receipted.map((receipt) => receipt.operationId));
+    // … and keeps the per-item exit: false plus the file still being here means
+    // the erase was not applied, so its intent is abandoned and the row stays.
+    expect(harness.ledger).toHaveLength(0);
+    const failedIntent = vi.mocked(harness.state.beginMutationIntents)
+      .mock.calls[0][0]
+      .find((intent) => intent.path === failedPath);
+    expect(failedIntent).toBeDefined();
+    expect(harness.state.abandonMutationIntent).toHaveBeenCalledWith(
+      failedIntent!.operationId,
+    );
     expect(harness.notices).toEqual(["notice.delete.failed"]);
     expect(harness.executor.hasSideActionsInFlight).toBe(false);
   });

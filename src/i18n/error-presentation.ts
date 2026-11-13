@@ -113,6 +113,7 @@ const KNOWN_FILE_ERROR_PATTERNS: readonly KnownErrorPattern[] = [
   { key: "error.present.file.localIdentityBeforeMove", prefix: "Local file identity changed before move: " },
   { key: "error.present.file.localMoveReadback", prefix: "Local file move read-back failed: " },
   { key: "error.present.file.trashMove", prefix: "Local folder cannot be moved to trash safely: " },
+  { key: "error.present.file.trashMove", prefix: "Local file cannot be moved to trash safely: " },
   { key: "error.present.file.folderMissingRemoteIdentity", prefix: "Local folder create has no remote identity: " },
   { key: "error.present.file.localFolderDeleteReadback", prefix: "Local folder delete read-back failed: " },
   { key: "error.present.file.localFolderIdentityBeforeMove", prefix: "Local folder identity changed before move: " },

@@ -164,6 +164,28 @@ describe("settings tab", () => {
     expect(en["settings.hostRequirement.download"]).toBe("Visit official site");
   });
 
+  it("centers the footer link row on the copyright line's axis", () => {
+    // 1.15.1 measured the host's inline-end margin on a setting row's <nav>:
+    // row 324 / nav 308, putting the four links 8px left of the copyright
+    // line. The footer nav must cancel it.
+    const styles = readSourceFile("styles.css");
+    const rule = styles.match(
+      /\.easy-sync-settings-footer-row \.easy-sync-settings-footer-links\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    expect(rule).toContain("margin: 0");
+  });
+
+  it("keeps the footer axis stable when the settings page scrolls", () => {
+    // 1.15.1 measured the desktop scrollbar stealing 12px from the content box:
+    // the whole card block (and footer) sits 6px left of a non-scrolling tab.
+    // Reserving gutters on both edges keeps the axis stable and matches Resojot.
+    const styles = readSourceFile("styles.css");
+    const rule = styles.match(
+      /body:not\(\.is-mobile\) \.modal\.mod-settings \.easy-sync-settings-tab\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    expect(rule).toContain("scrollbar-gutter: stable both-edges");
+  });
+
   it("keeps desktop settings action buttons on one shared minimum width", () => {
     // The min-width equals the natural width of a four-CJK-char label at
     // native button metrics, so two-char buttons align with wider ones. The

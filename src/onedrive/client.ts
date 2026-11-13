@@ -51,6 +51,7 @@ import {
 } from "./upload-session-policy";
 import {
   fingerprintCdnDownloadFailure,
+  isPreSignedContentHost,
 } from "./cdn-download-failure";
 import type { SyncFileErrorTierV1 } from "../sync/types";
 import {
@@ -157,7 +158,7 @@ const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable c
 const DOWNLOAD_PER_MIB_TIMEOUT_MS = 12_000;
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
 const DOWNLOAD_FAILURE_RESERVE_RATIO = 0.5;  // 50% reserve for slow/stalled connections
-/** 预算阶梯 (2026-10-27, docs/temp/20261026-1240 T2): `ceil(size/1MiB)` priced
+/** 预算阶梯 (2026-10-27, 20261026-1240 T2): `ceil(size/1MiB)` priced
  *  an 18-byte note as one full MiB — 42 s of primary patience for a transfer a
  *  50 KiB/s field link finishes in under a second, and the first channel could
  *  hold the *whole* waterfall deadline (later channels then threw on
@@ -3447,6 +3448,34 @@ export class OneDriveClient {
         );
         throw error;
       }
+      // A pre-signed content host can reject its own URL (expired signature,
+      // provider incident) without the session token being invalid. Keep that
+      // as a retryable delivery failure: mapping it to AuthExpired pauses
+      // automatic sync and tells the user to log in again, which cannot help.
+      const httpStatus = typeof (error as { status?: unknown })?.status === "number"
+        ? (error as { status: number }).status
+        : typeof (error as { statusCode?: unknown })?.statusCode === "number"
+          ? (error as { statusCode: number }).statusCode
+          : 0;
+      if (
+        (httpStatus === 401 || httpStatus === 403)
+        && isPreSignedContentHost(downloadUrl)
+      ) {
+        this.diag?.warn(
+          "onedrive",
+          "shared protocol slot content host rejected the pre-signed URL; treating it as a transient delivery failure",
+          {
+            status: httpStatus,
+            stage: "http",
+            component,
+            elapsedMs: Date.now() - readStartedAt,
+          },
+        );
+        throw new OneDriveError(
+          OneDriveErrorType.NetworkError,
+          `Shared sync protocol content host rejected the signed URL (HTTP ${httpStatus})`,
+        );
+      }
       throw this.toRequestError(
         error,
         downloadUrl,
@@ -4664,7 +4693,7 @@ interface DownloadBudget {
  *    the first channel can no longer swallow the reserve.
  *
  *  The `ceil` is what made an 18-byte note cost 42 s in the first place
- *  (docs/temp/20261026-1240 T2); the ladder fixes the pricing for the two
+ *  (20261026-1240 T2); the ladder fixes the pricing for the two
  *  smallest size bands only, as decided. */
 export function downloadBudget(fileSize: number): DownloadBudget {
   const size = Number.isFinite(fileSize) ? Math.max(0, fileSize) : 0;

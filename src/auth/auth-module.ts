@@ -25,6 +25,7 @@ import {
   type RequestUrlResponse,
 } from "obsidian";
 import {
+  type AccountCredentialBindingV1,
   type AuthState,
   type DeviceCodeAttemptView,
   type DeviceCodeResponse,
@@ -35,6 +36,7 @@ import {
   AuthError,
   AuthErrorType,
   MS_AUTH_CONFIG,
+  SS_CREDENTIAL_ID,
   SS_REFRESH_TOKEN,
 } from "./types";
 import { generateCodeVerifier, generateCodeChallengeSync, generateState } from "./pkce";
@@ -57,6 +59,31 @@ class AuthRequestTimeoutError extends Error {
     this.name = "AuthRequestTimeoutError";
   }
 }
+
+/** How the last Graph /me verification failed. Only provider/network/timeout
+ *  are transient enough to continue through a credential binding; auth
+ *  rejections (401/403) and unknown shapes stay fail-closed. */
+type AccountVerificationFailureKind =
+  | "network"
+  | "timeout"
+  | "provider"
+  | "auth"
+  | "unknown";
+
+interface AccountVerificationFailure {
+  kind: AccountVerificationFailureKind;
+  status?: number;
+  /** Provider Retry-After translated to ms; the retry scheduler respects it. */
+  retryAfterMs?: number;
+  at: number;
+}
+
+/** Verified-account retry cadence while the session is present but unverified.
+ *  Starts after a short grace window and caps at five minutes; a focus/online
+ *  event restarts the chain immediately. */
+const ACCOUNT_VERIFY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+const ACCOUNT_VERIFY_RETRY_MAX_DELAY_MS = 300_000;
+const ACCOUNT_VERIFY_MIN_GAP_MS = 5_000;
 
 /** Race a request against a timeout timer so the await always settles.
  *  requestUrl cannot be aborted (official API), so a hung request stays in
@@ -115,6 +142,21 @@ export interface AuthPluginContext {
     set(profile: { displayName: string; accountId: string }): Promise<void>;
     clear(): Promise<void>;
   };
+  /** Vault-local persistence for the verified-account binding. The record
+   *  carries the account id and the credential-lineage id, never the token. */
+  accountBinding?: {
+    get(): Promise<AccountCredentialBindingV1 | null>;
+    set(binding: AccountCredentialBindingV1): Promise<void>;
+    /** Clear only when the stored binding still belongs to the given lineage;
+     *  a logout must not erase a newer login's binding. */
+    clear(expectedCredentialId?: string): Promise<void>;
+  };
+  /** Durable vault identity read from loaded sync state. Only consulted by the
+   *  one-time legacy bootstrap; empty values before state load keep it off. */
+  vaultIdentity?: {
+    getBoundAccountId(): string | null;
+    getBoundDriveId(): string | null;
+  };
   /** Diagnostic logger (optional) */
   diag?: DiagnosticLogger;
   /** Called when a fresh OAuth login completes (not session restore).
@@ -161,6 +203,27 @@ export class AuthModule {
     accessToken: string;
     promise: Promise<void>;
   } | null = null;
+
+  /** Local label for the current refresh-token lineage. A fresh login rotates
+   *  it; normal token rotation keeps it. The account binding records which
+   *  lineage was verified, so a different credential can never inherit it. */
+  private credentialId: string | null = null;
+  private credentialIdLoad: Promise<string> | null = null;
+
+  /** What the last /me attempt learned. Drives credential adoption, the retry
+   *  cadence and the honest "provider unavailable" presentation. */
+  private lastVerificationFailure: AccountVerificationFailure | null = null;
+
+  /** How accountId was established (diagnostics/tests only). */
+  private accountIdSource: "none" | "me" | "credential-binding" | "credential-bootstrap" = "none";
+
+  /** Foreground verification retry chain (one timer, one in-flight attempt). */
+  private verificationRetryTimer: TimeoutHandle | null = null;
+  private verificationRetryActive = false;
+  private verificationRetryAttempt = 0;
+  private verificationAttemptInFlight: Promise<boolean> | null = null;
+  private bootstrapInFlight: Promise<boolean> | null = null;
+  private lastVerificationAttemptAt = 0;
 
   /** Transient refresh-failure backoff (login-persistence contract): a
    *  network flake right after sleep/wake or an offline period must NOT log
@@ -318,6 +381,11 @@ export class AuthModule {
       && !this._initializing;
   }
 
+  /** How the current account id was established (diagnostics/tests only). */
+  get accountVerificationSource(): string {
+    return this.accountIdSource;
+  }
+
   /** Manual one-shot check: has the OAuth callback completed?
    *  Returns true if the user is now logged in. */
   checkAuthStatus(): boolean {
@@ -390,6 +458,14 @@ export class AuthModule {
       storedRefreshToken = await this.getStoredRefreshToken();
       this.assertGeneration(generation);
       if (storedRefreshToken) {
+        // Label the credential lineage before verification. Existing installs
+        // that predate the label get one lazily; a failure here only disables
+        // the binding fallback, it never blocks the normal /me path.
+        await this.ensureCredentialId().catch((error) => {
+          this.diag?.warn("auth", "failed to establish the local credential id", error);
+          return null;
+        });
+        this.assertGeneration(generation);
         // Refresh token exists — try to get a fresh access token
         await this.refreshAccessTokenForGeneration(storedRefreshToken, generation);
         this.assertGeneration(generation);
@@ -429,6 +505,9 @@ export class AuthModule {
     }
     if (generation === this.authGeneration) {
       this._initializing = false;
+      if (this.isSessionPending) {
+        this.scheduleVerificationRetry();
+      }
       this.notifyChange();
     } else {
       this._initializing = false;
@@ -897,8 +976,13 @@ export class AuthModule {
     tokenResponse: TokenResponse,
     generation: number,
   ): Promise<void> {
-    // Store refresh token in SecretStorage
+    // The new login starts a new credential lineage. Rotate the label before
+    // writing the token: a crash between the two writes leaves the old token
+    // with the new label, which can only fail closed (never inherit the old
+    // account binding).
     if (tokenResponse.refresh_token) {
+      await this.rotateCredentialId(generation);
+      this.assertGeneration(generation);
       const stored = await this.storeRefreshTokenIfCurrent(
         tokenResponse.refresh_token,
         generation,
@@ -1148,6 +1232,11 @@ export class AuthModule {
       if (!this.state.accountId) {
         await this.fetchUserProfile(generation, token);
       }
+      // A transient /me outage can be survived by the recorded binding, or by
+      // the one-time legacy bootstrap when the vault identity agrees.
+      if (!this.state.accountId) {
+        await this.tryBootstrapCredentialBinding();
+      }
     } catch (e) {
       if (e instanceof AuthOperationInvalidatedError) return;
       // CredentialsRevoked already performed logout and notified; transient
@@ -1194,10 +1283,21 @@ export class AuthModule {
     this.pendingGeneration = null;
     this.stopPolling();
     this.stopDevicePolling();
+    // Capture the lineage before any await: a later fresh login may rotate it,
+    // and this logout must never remove the new lineage's label or binding.
+    const credentialIdAtStart = this.credentialId;
     const refreshTokenRemoved = await this.enqueueSecretStorage(async () => {
       try {
         await this.ctx.secretStorage.remove(SS_REFRESH_TOKEN);
-        return (await this.ctx.secretStorage.get(SS_REFRESH_TOKEN)) === null;
+        const removed = (await this.ctx.secretStorage.get(SS_REFRESH_TOKEN)) === null;
+        if (removed && credentialIdAtStart) {
+          try {
+            await this.ctx.secretStorage.remove(SS_CREDENTIAL_ID);
+          } catch (error) {
+            this.diag?.warn("auth", "failed to remove the local credential id", error);
+          }
+        }
+        return removed;
       } catch (error) {
         this.diag?.error("auth", "failed to verify refresh token removal", error);
         return false;
@@ -1208,6 +1308,24 @@ export class AuthModule {
       this.diag?.warn("auth", "logout incomplete — refresh token removal was not confirmed");
       this.notifyChange();
       return false;
+    }
+
+    // End the credential lineage with the token. The label and the vault-local
+    // binding are best-effort: leaving either behind can only fail closed
+    // (a binding without its matching label is never adopted).
+    if (this.credentialId === credentialIdAtStart) {
+      this.credentialId = null;
+    }
+    this.clearVerificationFailure();
+    this.accountIdSource = "none";
+    if (credentialIdAtStart) {
+      try {
+        // Compare-and-clear: a newer login's binding must survive this logout.
+        await this.ctx.accountBinding?.clear(credentialIdAtStart);
+      } catch (error) {
+        this.diag?.warn("auth", "failed to clear the verified account binding", error);
+      }
+      if (generation !== this.authGeneration) return false;
     }
 
     // Clear cached user profile so next login fetches fresh data
@@ -1371,6 +1489,7 @@ export class AuthModule {
       this.diag?.log("auth", `profile display cache hit: ${cached.displayName}`);
     }
     this.state.accountId = "";
+    this.accountIdSource = "none";
     this.diag?.log("auth", "verifying current token account through Graph /me");
 
     try {
@@ -1381,6 +1500,7 @@ export class AuthModule {
           headers: {
             Authorization: `Bearer ${accessToken}`,
           },
+          throw: false,
         }),
         AUTH_REQUEST_TIMEOUT_MS,
       );
@@ -1401,12 +1521,21 @@ export class AuthModule {
         if (data.id) {
           const wasUnverified = this.state.accountId === "";
           this.state.accountId = data.id;
+          this.accountIdSource = "me";
+          this.clearVerificationFailure();
+          await this.persistAccountBinding(generation);
+          this.assertGeneration(generation);
           // Binding the account reopens sync authorization, so a surface still
           // showing the pending-session state must refresh. During
           // initialize() the tail notifyChange already covers this window.
           if (wasUnverified && !this._initializing) {
             this.notifyChange();
           }
+        } else {
+          // A 200 without an id cannot authorize anything; treat it as a
+          // provider anomaly so a matching binding can still carry the
+          // session while /me is unhealthy.
+          this.recordVerificationFailure("provider", response.status);
         }
         if (
           this.state.accountId
@@ -1425,13 +1554,409 @@ export class AuthModule {
           });
           this.assertGeneration(generation);
         }
+      } else {
+        this.diag?.warn("auth", "failed to verify current token account", {
+          status: response.status,
+        });
+        this.recordVerificationFailure(
+          classifyAccountVerificationStatus(response.status),
+          response.status,
+          parseRetryAfterMs(response.headers),
+        );
       }
     } catch (e) {
       if (e instanceof AuthOperationInvalidatedError) throw e;
-      // The refreshed token remains available, but sync authorization stays
-      // closed because accountId is empty until /me succeeds.
       this.diag?.warn("auth", "failed to verify current token account", e);
+      const failure = classifyAccountVerificationError(e);
+      this.recordVerificationFailure(
+        failure.kind,
+        failure.status,
+        failure.retryAfterMs,
+      );
     }
+
+    // /me could not confirm the account. The binding may still prove that the
+    // current credential lineage is the one verified for this vault; that is
+    // the only fallback, and it never applies to auth rejections.
+    await this.tryAdoptCredentialBinding(generation);
+  }
+
+  /** Persist the binding between the live-verified account and the current
+   *  credential lineage. Best effort: a failed write never blocks the bind. */
+  private async persistAccountBinding(generation: number): Promise<void> {
+    const bindingStore = this.ctx.accountBinding;
+    const accountId = this.state.accountId;
+    if (!bindingStore || !accountId) return;
+    let credentialId: string;
+    try {
+      credentialId = await this.ensureCredentialId();
+    } catch (error) {
+      this.diag?.warn("auth", "failed to read the local credential id for binding", error);
+      return;
+    }
+    if (generation !== this.authGeneration || this.state.accountId !== accountId) {
+      return;
+    }
+    try {
+      const existing = await bindingStore.get();
+      if (generation !== this.authGeneration || this.state.accountId !== accountId) {
+        return;
+      }
+      if (
+        existing
+        && existing.accountId === accountId
+        && existing.credentialId === credentialId
+      ) {
+        return;
+      }
+      await bindingStore.set({
+        version: 1,
+        accountId,
+        credentialId,
+        verifiedAt: Date.now(),
+      });
+    } catch (error) {
+      this.diag?.warn("auth", "failed to persist the verified account binding", error);
+    }
+  }
+
+  /** Continue a verified session when /me is temporarily unavailable, but only
+   *  when the credential lineage matches the one that was verified before. */
+  private async tryAdoptCredentialBinding(generation: number): Promise<boolean> {
+    if (this.state.accountId || !this.state.isLoggedIn) return false;
+    if (!this.isTransientVerificationFailure()) return false;
+    const bindingStore = this.ctx.accountBinding;
+    if (!bindingStore) return false;
+
+    let binding: AccountCredentialBindingV1 | null = null;
+    let credentialId: string;
+    try {
+      binding = await bindingStore.get();
+      if (generation !== this.authGeneration) return false;
+      if (!binding) return false;
+      credentialId = await this.ensureCredentialId();
+    } catch (error) {
+      this.diag?.warn("auth", "failed to read the verified account binding", error);
+      return false;
+    }
+    if (generation !== this.authGeneration || this.state.accountId) return false;
+    if (binding.credentialId !== credentialId) {
+      this.diag?.log(
+        "auth",
+        "verified account binding does not match the current credential lineage",
+      );
+      return false;
+    }
+
+    this.state.accountId = binding.accountId;
+    this.accountIdSource = "credential-binding";
+    this.clearVerificationFailure();
+    this.diag?.log("auth", "adopted verified account from the local credential binding");
+    if (!this._initializing) this.notifyChange();
+    return true;
+  }
+
+  /** One-time legacy bootstrap: with no binding yet, accept the durable vault
+   *  identity only when the cached /me account, the state's bound account and
+   *  the drive the current token can open all agree. This is deliberately
+   *  narrower than "trust the cache": a different account resolves a different
+   *  default drive and fails closed. Focus storms share one attempt. */
+  async tryBootstrapCredentialBinding(): Promise<boolean> {
+    if (this.bootstrapInFlight) return this.bootstrapInFlight;
+    const attempt = this.runBootstrapCredentialBinding().finally(() => {
+      if (this.bootstrapInFlight === attempt) {
+        this.bootstrapInFlight = null;
+      }
+    });
+    this.bootstrapInFlight = attempt;
+    return attempt;
+  }
+
+  private async runBootstrapCredentialBinding(): Promise<boolean> {
+    if (this.state.accountId || !this.state.isLoggedIn || this._initializing) {
+      return false;
+    }
+    if (!this.isTransientVerificationFailure()) return false;
+    const bindingStore = this.ctx.accountBinding;
+    const vaultIdentity = this.ctx.vaultIdentity;
+    if (!bindingStore || !vaultIdentity) return false;
+
+    const generation = this.authGeneration;
+    try {
+      const cached = await this.enqueueProfileCache(
+        async () => this.ctx.profileCache?.get(),
+      );
+      this.assertGeneration(generation);
+      const cachedAccountId = cached?.accountId ?? "";
+      const boundAccountId = vaultIdentity.getBoundAccountId() ?? "";
+      const boundDriveId = vaultIdentity.getBoundDriveId() ?? "";
+      if (!cachedAccountId || !boundAccountId || !boundDriveId) return false;
+      if (cachedAccountId !== boundAccountId) return false;
+
+      const token = await this.ensureFreshAccessToken(generation);
+      this.assertGeneration(generation);
+      const currentDriveId = await this.probeDefaultDriveId(token);
+      this.assertGeneration(generation);
+      if (!currentDriveId || currentDriveId !== boundDriveId) {
+        this.diag?.log(
+          "auth",
+          "credential bootstrap did not match the bound cloud drive",
+        );
+        return false;
+      }
+
+      const credentialId = await this.ensureCredentialId();
+      this.assertGeneration(generation);
+      this.state.accountId = boundAccountId;
+      this.accountIdSource = "credential-bootstrap";
+      this.clearVerificationFailure();
+      try {
+        await bindingStore.set({
+          version: 1,
+          accountId: boundAccountId,
+          credentialId,
+          verifiedAt: Date.now(),
+        });
+      } catch (error) {
+        // The account is usable for this session; the binding can be written
+        // again by the next live /me. Never fail the rescued session here.
+        this.diag?.warn("auth", "failed to persist the bootstrapped account binding", error);
+      }
+      this.diag?.log(
+        "auth",
+        "bootstrapped verified account from cached account and bound drive",
+      );
+      this.notifyChange();
+      return true;
+    } catch (error) {
+      if (error instanceof AuthOperationInvalidatedError) return false;
+      this.diag?.warn("auth", "credential bootstrap attempt failed", error);
+      return false;
+    }
+  }
+
+  /** Read the drive id the current token defaults to. Used only by the legacy
+   *  bootstrap; 5xx/timeouts here leave the session fail-closed. */
+  private async probeDefaultDriveId(accessToken: string): Promise<string | null> {
+    const response = await withAuthRequestTimeout(
+      requestUrl({
+        url: "https://graph.microsoft.com/v1.0/me/drive?$select=id",
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+        throw: false,
+      }),
+      AUTH_REQUEST_TIMEOUT_MS,
+    );
+    if (response.status !== 200) return null;
+    const data = response.json as { id?: unknown };
+    return typeof data.id === "string" && data.id.length > 0 ? data.id : null;
+  }
+
+  /** One manual/local verification attempt. Returns true once accountId is
+   *  bound (live /me, credential binding, or the legacy bootstrap). */
+  async verifyAccountNow(options: { allowBootstrap?: boolean } = {}): Promise<boolean> {
+    if (this.state.accountId) return true;
+    if (this._initializing) return false;
+    if (!this.state.isLoggedIn) {
+      const established = await this.establishSessionFromStoredCredential();
+      if (!established) return false;
+    }
+    if (this.verificationAttemptInFlight) return this.verificationAttemptInFlight;
+
+    const attempt = this.runAccountVerification(options).finally(() => {
+      if (this.verificationAttemptInFlight === attempt) {
+        this.verificationAttemptInFlight = null;
+      }
+    });
+    this.verificationAttemptInFlight = attempt;
+    return attempt;
+  }
+
+  private async runAccountVerification(
+    options: { allowBootstrap?: boolean },
+  ): Promise<boolean> {
+    const generation = this.authGeneration;
+    this.lastVerificationAttemptAt = Date.now();
+    try {
+      const token = await this.ensureFreshAccessToken(generation);
+      this.assertGeneration(generation);
+      await this.fetchUserProfile(generation, token);
+      this.assertGeneration(generation);
+      if (!this.state.accountId && options.allowBootstrap !== false) {
+        await this.tryBootstrapCredentialBinding();
+      }
+      return this.state.accountId !== "";
+    } catch (error) {
+      if (error instanceof AuthOperationInvalidatedError) return false;
+      this.diag?.warn("auth", "account verification attempt failed", authErrorDiagData(error));
+      if (error instanceof AuthError && error.type === AuthErrorType.NetworkError) {
+        this.recordVerificationFailure("network");
+      }
+      return false;
+    }
+  }
+
+  /** Foreground retry control; the host page lifecycle decides when the
+   *  session is visible. Hidden pages stop the chain to avoid background
+   *  request storms. */
+  setVerificationRetryActive(active: boolean): void {
+    if (active === this.verificationRetryActive) {
+      if (active) this.requestImmediateVerificationRetry();
+      return;
+    }
+    this.verificationRetryActive = active;
+    if (active) {
+      this.verificationRetryAttempt = 0;
+      this.requestImmediateVerificationRetry();
+    } else {
+      this.stopVerificationRetry();
+    }
+  }
+
+  /** A foreground/online signal restarts the chain instead of waiting out a
+   *  five-minute backoff. The 5s floor still protects against focus storms. */
+  private requestImmediateVerificationRetry(): void {
+    if (!this.isSessionPending) return;
+    if (this.verificationRetryTimer) {
+      compatClearTimeout(this.verificationRetryTimer);
+      this.verificationRetryTimer = null;
+    }
+    const sinceLast = Date.now() - this.lastVerificationAttemptAt;
+    this.scheduleVerificationRetry(
+      Math.max(0, ACCOUNT_VERIFY_MIN_GAP_MS - sinceLast),
+    );
+  }
+
+  stopVerificationRetry(): void {
+    if (this.verificationRetryTimer) {
+      compatClearTimeout(this.verificationRetryTimer);
+      this.verificationRetryTimer = null;
+    }
+    this.verificationRetryAttempt = 0;
+  }
+
+  private scheduleVerificationRetry(delayOverride?: number): void {
+    if (!this.verificationRetryActive || !this.isSessionPending) {
+      this.stopVerificationRetry();
+      return;
+    }
+    if (this.verificationRetryTimer) return;
+    const index = Math.min(
+      this.verificationRetryAttempt,
+      ACCOUNT_VERIFY_RETRY_DELAYS_MS.length - 1,
+    );
+    const baseDelay = delayOverride ?? ACCOUNT_VERIFY_RETRY_DELAYS_MS[index];
+    const retryAfter = this.lastVerificationFailure?.retryAfterMs ?? 0;
+    const delay = Math.min(
+      Math.max(baseDelay, retryAfter),
+      ACCOUNT_VERIFY_RETRY_MAX_DELAY_MS,
+    );
+    this.verificationRetryTimer = compatSetTimeout(() => {
+      this.verificationRetryTimer = null;
+      void this.runScheduledVerificationRetry();
+    }, delay);
+  }
+
+  private async runScheduledVerificationRetry(): Promise<void> {
+    if (!this.verificationRetryActive || !this.isSessionPending) {
+      this.stopVerificationRetry();
+      return;
+    }
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      this.stopVerificationRetry();
+      return;
+    }
+    const sinceLast = Date.now() - this.lastVerificationAttemptAt;
+    if (sinceLast < ACCOUNT_VERIFY_MIN_GAP_MS) {
+      this.scheduleVerificationRetry(ACCOUNT_VERIFY_MIN_GAP_MS - sinceLast);
+      return;
+    }
+    this.verificationRetryAttempt += 1;
+    const verified = await this.verifyAccountNow({ allowBootstrap: true });
+    if (verified) {
+      this.stopVerificationRetry();
+      return;
+    }
+    if (this.lastVerificationFailure?.kind === "auth") {
+      this.stopVerificationRetry();
+      return;
+    }
+    this.scheduleVerificationRetry();
+  }
+
+  private isTransientVerificationFailure(): boolean {
+    const kind = this.lastVerificationFailure?.kind;
+    return kind === "network" || kind === "timeout" || kind === "provider";
+  }
+
+  private recordVerificationFailure(
+    kind: AccountVerificationFailureKind,
+    status?: number,
+    retryAfterMs?: number,
+  ): void {
+    this.lastVerificationFailure = { kind, status, retryAfterMs, at: Date.now() };
+    if (kind === "auth") {
+      this.stopVerificationRetry();
+    } else if (this.verificationRetryActive) {
+      this.scheduleVerificationRetry();
+    }
+  }
+
+  private clearVerificationFailure(): void {
+    this.lastVerificationFailure = null;
+    this.stopVerificationRetry();
+  }
+
+  /** Read the credential-lineage label without creating one. */
+  private async readCredentialId(): Promise<string | null> {
+    await this.secretStorageTail;
+    return await this.ctx.secretStorage.get(SS_CREDENTIAL_ID);
+  }
+
+  /** Read the label, creating one lazily for installs that predate it. */
+  private async ensureCredentialId(): Promise<string> {
+    if (this.credentialId) return this.credentialId;
+    if (this.credentialIdLoad) return this.credentialIdLoad;
+    const load = (async () => {
+      let existing: string | null;
+      try {
+        existing = await this.readCredentialId();
+      } catch {
+        throw new AuthError(
+          AuthErrorType.SecretStorageUnavailable,
+          this.tr("auth.error.secretStorageUnavailable", "SecretStorage not available"),
+        );
+      }
+      if (existing && existing.length > 0) {
+        this.credentialId = existing;
+        return existing;
+      }
+      const generated = generateCredentialId();
+      await this.enqueueSecretStorage(async () => {
+        await this.ctx.secretStorage.set(SS_CREDENTIAL_ID, generated);
+      });
+      this.credentialId = generated;
+      return generated;
+    })().finally(() => {
+      this.credentialIdLoad = null;
+    });
+    this.credentialIdLoad = load;
+    return load;
+  }
+
+  /** A fresh login starts a new credential lineage; write the label before the
+   *  token so any crash leaves a mismatch (fail-closed), never a stale match. */
+  private async rotateCredentialId(generation: number): Promise<string> {
+    const generated = generateCredentialId();
+    await this.enqueueSecretStorage(async () => {
+      if (generation !== this.authGeneration) return;
+      await this.ctx.secretStorage.set(SS_CREDENTIAL_ID, generated);
+    });
+    this.assertGeneration(generation);
+    this.credentialId = generated;
+    return generated;
   }
 
   private notifyChange(): void {
@@ -1439,6 +1964,72 @@ export class AuthModule {
       this.onChange();
     }
   }
+}
+
+/** A 128-bit random label for one credential lineage. It names the stored
+ *  refresh-token family; it is not the token and cannot be used to obtain one. */
+function generateCredentialId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Classify an HTTP status from /me: only 429/5xx are transient enough for the
+ *  binding fallback and the retry chain. */
+function classifyAccountVerificationStatus(
+  status: number,
+): AccountVerificationFailureKind {
+  if (status === 401 || status === 403) return "auth";
+  if (status === 429 || status === 408) return "provider";
+  if (status >= 500 && status <= 599) return "provider";
+  if (status >= 400 && status <= 499) return "auth";
+  return "unknown";
+}
+
+function classifyAccountVerificationError(error: unknown): {
+  kind: AccountVerificationFailureKind;
+  status?: number;
+  retryAfterMs?: number;
+} {
+  if (error instanceof AuthRequestTimeoutError) {
+    return { kind: "timeout" };
+  }
+  const status = typeof (error as { status?: unknown })?.status === "number"
+    ? (error as { status: number }).status
+    : undefined;
+  if (status !== undefined) {
+    const responseHeaders = (error as {
+      headers?: Record<string, string>;
+      response?: { headers?: Record<string, string> };
+    })?.response?.headers ?? (error as { headers?: Record<string, string> })?.headers;
+    return {
+      kind: classifyAccountVerificationStatus(status),
+      status,
+      retryAfterMs: parseRetryAfterMs(responseHeaders),
+    };
+  }
+  return { kind: "network" };
+}
+
+/** Retry-After is either delta-seconds or an HTTP date; cap it at the retry
+ *  ceiling so a malformed provider value cannot strand the session. */
+function parseRetryAfterMs(
+  headers: Record<string, string> | undefined,
+): number | undefined {
+  const raw = headers?.["retry-after"];
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, ACCOUNT_VERIFY_RETRY_MAX_DELAY_MS);
+  }
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) {
+    return Math.min(
+      Math.max(0, at - Date.now()),
+      ACCOUNT_VERIFY_RETRY_MAX_DELAY_MS,
+    );
+  }
+  return undefined;
 }
 
 /** Provider `expires_in` → absolute access-token expiry instant. A missing or

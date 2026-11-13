@@ -714,7 +714,6 @@ const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
 const KEY_LOCAL_FOLDER_DELETE_HINTS = "easy-sync-local-folder-delete-hints";
-/** 片② 本机独有条目记录：原路径 ↔ 本机改动副本（片④ 消费、片⑤ 联动）。 */
 /**
  * Device-local one-shot authorizations for the cloud-deletion follow direction.
  * Kept out of the V2 shared envelope: another device must never inherit this
@@ -722,6 +721,7 @@ const KEY_LOCAL_FOLDER_DELETE_HINTS = "easy-sync-local-folder-delete-hints";
  * checkpoint settles.
  */
 const KEY_LOCAL_DELETE_DECISIONS = "easy-sync-local-delete-decisions";
+/** 片② 本机独有条目记录：原路径 ↔ 本机改动副本（片④ 消费、片⑤ 联动）。 */
 const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
 /** 删除记录簿（设备本地记录族，不进 V2 信封、不进同步）。 */
 const KEY_DELETION_LEDGER = "easy-sync-deletion-ledger";
@@ -6268,7 +6268,7 @@ export class StateManager {
    *
    * The upload parent rebase can rewrite its receipt alone because parentId
    * lives outside the receipt-shape contract; a rename's receipt paths are
-   * pinned to the intent by `assertFileReceiptShapeV1`, so both durable halves
+   * pinned to the intent by `assertFileReceiptShape`, so both durable halves
    * must move in one write. Two writes would open a crash window in which the
    * record is invalid under the shared admission gate.
    *

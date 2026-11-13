@@ -41,6 +41,8 @@ vi.mock("../src/auth/auth-module", () => ({
     getAccessToken = vi.fn().mockResolvedValue("token");
     checkDeviceCodeNow = vi.fn().mockResolvedValue(undefined);
     refreshNowIfNeeded = vi.fn().mockResolvedValue(undefined);
+    setVerificationRetryActive = vi.fn();
+    stopVerificationRetry = vi.fn();
   },
 }));
 

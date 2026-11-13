@@ -72,13 +72,6 @@ type EasySyncSidecarKey = {
   [K in keyof EasySyncPathSet]: EasySyncPathSet[K] extends string ? K : never;
 }[keyof EasySyncPathSet];
 
-/**
- * Sidecar keys the layout migration moves one-to-one, keyed by the shared path
- * registry so a key can never be spelled twice. Exported together with the two
- * prefix groups: the completeness gate (tests/easy-sync-storage-layout.test.ts)
- * proves every registered sidecar is either listed here or spells the same path
- * in both layouts, so a newly added sidecar cannot be forgotten silently.
- */
 /** Direct sidecars the migration probes for explicitly (a superset probe of the
  *  tree walk below, which is only entered when the legacy plugin existed). */
 export const EASY_SYNC_LAYOUT_DIRECT_MIGRATION_KEYS = [

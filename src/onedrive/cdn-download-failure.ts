@@ -92,6 +92,17 @@ export function cdnHostOfDownloadUrl(url: string): string | null {
   }
 }
 
+/** True for a pre-signed content host, i.e. anything other than the Graph
+ *  API itself. A 401/403 here means the signed URL was rejected (expired or
+ *  provider outage); it is not evidence that the session token expired. */
+export function isPreSignedContentHost(url: string): boolean {
+  const host = cdnHostOfDownloadUrl(url);
+  if (!host) return false;
+  const normalized = host.toLowerCase();
+  return normalized !== "graph.microsoft.com"
+    && !normalized.endsWith(".graph.microsoft.com");
+}
+
 type CdnDownloadFailureFingerprint = {
   stage: CdnDownloadFailureStage;
   /** Generic pre-signed host example: my.microsoftpersonalcontent.com — no

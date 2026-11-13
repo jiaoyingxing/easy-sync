@@ -229,7 +229,7 @@ export interface FinalizeCanonicalPlanInputV2 {
     item: Readonly<SyncPlanItem>,
     progress: { current: number; total: number },
   ) => Promise<string>;
-  /** Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): optional
+  /** Knife-1 (2026-09-08, carrier `20260908-1331`): optional
    *  planner-stage downloadUrl refresh for the *exact* budgeted verification
    *  download set (conflict-candidate downloads below). The planner invokes it
    *  at most once per candidate set before downloading (the both-sides set
@@ -242,7 +242,7 @@ export interface FinalizeCanonicalPlanInputV2 {
   refreshVerificationDownloadUrls?: (
     items: ReadonlyArray<SyncPlanItem>,
   ) => Promise<void>;
-  /** Knife-2 (2026-09-08, carrier `docs/temp/20260908-1331`): optional
+  /** Knife-2 (2026-09-08, carrier `20260908-1331`): optional
    *  bounded read-only window for plan-time content-verification downloads.
    *  When provided, the conflict-candidate downloads below run in windows of
    *  at most `maxFiles` files and `maxBytes` total bytes (a candidate larger
@@ -1756,7 +1756,7 @@ interface VerificationPrefetchInputV2 {
 }
 
 /**
- * Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
+ * Knife-1 (2026-09-08, carrier `20260908-1331`): planner-stage
  * downloadUrl refresh for exactly the budgeted verification download set.
  * Called at most once per candidate set, before any content download below;
  * fail-open — a missing or throwing hook leaves every URL unset so the
@@ -1779,7 +1779,7 @@ async function refreshVerificationDownloadUrlsV2({
 }
 
 /**
- * Knife-2 (2026-09-08, carrier `docs/temp/20260908-1331`): bounded
+ * Knife-2 (2026-09-08, carrier `20260908-1331`): bounded
  * read-only overlap for the conflict-candidate verification downloads.
  * downloadCandidates is the exact budgeted set the loop below downloads
  * (every member has unknown equality by construction), so we may prefetch

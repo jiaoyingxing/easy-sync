@@ -13,7 +13,7 @@ import {
  *
  * 本项目对「两个路径是不是同一个」有多份实现，本文件把**真实语义**钉成可执行
  * 对照表，让漂移不必靠读注释争论。三类语义：
- * - `identityPath` 系（`recovery-anchor-v2.ts:65` 唯一共享导出。原
+ * - `identityPath` 系（`recovery-anchor-v2.ts` 唯一共享导出。原
  *   `folder-state-reducer-v2.ts`／`folder-state-v2.ts`／`stale-identity-resolution.ts`
  *   三份私有副本已于 2026-10-23 删除；文件末尾的源码守卫只匹配名字恰为
  *   `identityPath` 的声明，等价实现 `normalizeIdentityPath` 不在守卫内）＝
@@ -21,7 +21,7 @@ import {
  * - `nfcPath` 系＝只做 NFC，**区分大小写**；
  * - 逐字节＝不归一化。
  *
- * `normalizeVaultPathKey`（`obsidian-compat.ts:116`）比 `identityPath` 多一步
+ * `normalizeVaultPathKey`（`obsidian-compat.ts`）比 `identityPath` 多一步
  * 反斜杠→斜杠，纯 `/` 路径上等价（第 1 条断言）。
  */
 

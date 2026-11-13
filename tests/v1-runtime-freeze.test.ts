@@ -256,7 +256,7 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
       "src/sync/state-v2-migration.ts",
       "src/sync/sync-executor.ts",
       // S1 观测刀（2026-10-17 用户拍板）：轮末只读扫描恢复账本记录面组成事实
-      // 指纹（零写入、零控制流；见 docs/temp/20261016-151934 §六 S1）。
+      // 指纹（零写入、零控制流；见 20261016-151934 §六 S1）。
       "src/sync/sync-idle-observation.ts",
       "src/sync/types.ts",
     ],

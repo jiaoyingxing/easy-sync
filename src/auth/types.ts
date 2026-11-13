@@ -164,3 +164,33 @@ export const MS_AUTH_CONFIG = {
 
 /** SecretStorage slot name for the OneDrive refresh token */
 export const SS_REFRESH_TOKEN = "easy-sync-onedrive-refresh-token";
+
+/** SecretStorage slot for the local credential-lineage id. It labels the
+ *  refresh-token family; a fresh login replaces it, normal rotation keeps it. */
+export const SS_CREDENTIAL_ID = "easy-sync-onedrive-credential-id";
+
+/** Vault-local binding between a verified Graph account and the local
+ *  credential lineage. Persisted in plugin data (never the refresh token). */
+export interface AccountCredentialBindingV1 {
+  version: 1;
+  accountId: string;
+  credentialId: string;
+  /** Epoch ms of the last successful /me that wrote this binding. */
+  verifiedAt: number;
+}
+
+/** Shape check for the persisted binding; unknown/malformed values fail closed
+ *  (the caller simply gets no binding and keeps the live /me requirement). */
+export function isAccountCredentialBindingV1(
+  value: unknown,
+): value is AccountCredentialBindingV1 {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<AccountCredentialBindingV1>;
+  return record.version === 1
+    && typeof record.accountId === "string"
+    && record.accountId.length > 0
+    && typeof record.credentialId === "string"
+    && record.credentialId.length > 0
+    && typeof record.verifiedAt === "number"
+    && Number.isFinite(record.verifiedAt);
+}

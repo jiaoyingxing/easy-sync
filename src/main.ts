@@ -20,7 +20,11 @@ import {
   type UpdateReminderSnooze,
 } from "./update-check";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
-import { AuthError, AuthErrorType } from "./auth/types";
+import {
+  AuthError,
+  AuthErrorType,
+  isAccountCredentialBindingV1,
+} from "./auth/types";
 import { createAuthBrowserLauncher } from "./auth/auth-browser";
 import {
   compatClearInterval,
@@ -409,6 +413,9 @@ const KEY_NOTIFICATION_POPUPS = "notification-popups";
 const KEY_MOBILE_STATUS_BAR = "mobile-status-bar";
 const KEY_ACKNOWLEDGED_RULES = "acknowledged-rules";
 const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
+/** Vault-local binding between the verified account and the local credential
+ *  lineage. Account id + random lineage label only; never a token. */
+const KEY_ACCOUNT_CREDENTIAL_BINDING = "easy-sync-account-credential-binding-v1";
 /** One-shot notice memory: plugin bundles whose upload the downgrade guard
  *  already told the user about. A marker is dropped once the deferral is gone
  *  (plan no longer uploads the bundle), so a future real misalignment can
@@ -682,11 +689,6 @@ function normalizeNotificationPopupsLevel(
   return value === "important" || value === "off" ? value : "all";
 }
 
-/**
- * EasySync / 易同步
- * 面向新手用户的极简 Obsidian 云盘同步插件
- * MVP 首发 OneDrive App Folder 双向同步
- */
 /** One pending new-plugin row for the sidebar adoption section (slice 2). */
 export interface CommunityPluginAdoptionRow {
   pluginId: string;
@@ -1184,9 +1186,50 @@ export default class EasySyncPlugin extends Plugin {
           });
         },
       },
+      // Verified-account binding: vault-local, account id + random lineage
+      // label. The refresh token stays in SecretStorage and never enters here.
+      accountBinding: {
+        get: async () => {
+          const data = await this.readPluginDataSnapshot();
+          const value = data?.[KEY_ACCOUNT_CREDENTIAL_BINDING];
+          return isAccountCredentialBindingV1(value) ? value : null;
+        },
+        set: async (binding) => {
+          await this.updatePluginData((data) => {
+            data[KEY_ACCOUNT_CREDENTIAL_BINDING] = binding;
+          });
+        },
+        clear: async (expectedCredentialId?: string) => {
+          await this.updatePluginData((data) => {
+            const current = data[KEY_ACCOUNT_CREDENTIAL_BINDING];
+            if (expectedCredentialId) {
+              if (!isAccountCredentialBindingV1(current)) return;
+              if (current.credentialId !== expectedCredentialId) return;
+            }
+            delete data[KEY_ACCOUNT_CREDENTIAL_BINDING];
+          });
+        },
+      },
+      // Durable vault identity for the one-time legacy bootstrap. Read-only
+      // and synchronous: an unloaded state yields empty values and the
+      // bootstrap stays off.
+      vaultIdentity: {
+        // The legacy bootstrap trusts the durable vault identity only when the
+        // account binding and the loaded sync scope agree; an inconsistent or
+        // not-yet-loaded state yields no identity and keeps the session closed.
+        getBoundAccountId: () => {
+          const bound = this.state?.boundAccountId ?? "";
+          const scopeAccount = this.state?.remoteScope?.accountId ?? "";
+          return bound && scopeAccount && bound === scopeAccount ? bound : null;
+        },
+        getBoundDriveId: () => this.state?.remoteScope?.driveId ?? null,
+      },
       diag: this.diag,
     };
     this.auth = new AuthModule(authCtx, (key, params) => this.i18n.t(key, params));
+    // Foreground verification retries are lifecycle-driven; a hidden page
+    // leaves the chain parked until the host brings it back.
+    this.auth.setVerificationRetryActive(document.visibilityState !== "hidden");
 
     // CRITICAL: register callback BEFORE initialize() so UI updates
     // when the background token refresh completes
@@ -1496,9 +1539,11 @@ export default class EasySyncPlugin extends Plugin {
         // Backgrounding can end in a hard kill before the batch window fires;
         // push the pending diagnostic lines to disk now (2026-10-13 F26).
         void this.diag.forceFlush();
+        this.auth?.setVerificationRetryActive(false);
         return;
       }
       if (document.visibilityState === "visible") {
+        this.auth?.setVerificationRetryActive(true);
         this.requestMutationRecoveryObservation("foreground");
         this.requestDescendantFileReconstructionContinuation("foreground");
         void this.scheduleCommunityPluginLocalReconciliation("foreground");
@@ -1516,13 +1561,15 @@ export default class EasySyncPlugin extends Plugin {
     });
     this.registerDomEvent(window, "focus", () => {
       this.refreshInstalledManifestVersion(true);
+      this.auth?.setVerificationRetryActive(true);
       void this.auth?.checkDeviceCodeNow();
       void this.auth?.refreshNowIfNeeded();
     });
     this.registerDomEvent(window, "online", () => {
       // Connectivity restored (e.g. laptop wake or network reconnection):
       // give the silent token refresh a fresh chance immediately, clearing
-      // any transient backoff.
+      // any transient backoff. The verification chain restarts as well.
+      this.auth?.setVerificationRetryActive(true);
       void this.auth?.refreshNowIfNeeded(true);
     });
     this.registerDomEvent(window, "offline", () => {
@@ -1826,6 +1873,7 @@ export default class EasySyncPlugin extends Plugin {
     compatClearTimeout(this.scopeCrossingPromptTimer);
     this.scopeCrossingPromptTimer = null;
     this.stopAutoSync();
+    this.auth?.stopVerificationRetry();
     this.cancelDescendantFileReconstructionContinuation();
     this.disableMobileStatusBar();
     compatClearTimeout(this.ribbonSuccessTimer);
@@ -4189,6 +4237,15 @@ export default class EasySyncPlugin extends Plugin {
       "manual",
       "blocked manual sync result",
     )) return;
+    // A pending session used to make this entry return silently. Give the
+    // click one live verification attempt; the existing busy state covers the
+    // wait, and the background retry chain continues if it cannot bind. No
+    // separate failure surface is added: the root cause (a transient provider
+    // outage) is handled by the retry mechanism, not by compensation UI.
+    if (this.auth?.isSessionPending) {
+      const verified = await this.auth.verifyAccountNow({ allowBootstrap: true });
+      if (!verified) return;
+    }
     if (!await this.checkAccountBindingForSync()) return;
 
     // If a plan review is pending, execute it directly — but keep the
@@ -5263,7 +5320,7 @@ export default class EasySyncPlugin extends Plugin {
     //   outcomes stop the vault. The failure row and the notice stay.
     // Conflicts no longer pause automatic sync either: they stay a visible
     // pending decision (sidebar/ribbon still show them) while the rest of the
-    // vault keeps syncing (user decision 2026-09-01, docs/temp/20260901-221059).
+    // vault keeps syncing (user decision 2026-09-01, 20260901-221059).
     // The gate asks whether *every* counted error belongs to an exempt family,
     // not whether one family accounts for all of them: a round mixing exempt
     // families (a breaker-deferred item plus a fresh dropped link, or a
@@ -10191,12 +10248,6 @@ export default class EasySyncPlugin extends Plugin {
     this.noticeCenter.setNotificationPopups(this.notificationPopups);
   }
 
-  /** Generate a diagnostic report Markdown file in the vault root.
-   *  Collects recent anomalies from state and diagnostic buffer.
-   *
-   *  Any failure — the vault write, or the evidence gathering that precedes
-   *  it — surfaces as one simple "could not save" notice instead of a
-   *  silently dropped promise. */
   /** Generate the report and return its file name, or undefined when the
    *  generation failed (already noticed). `resetSnapshot` marks the
    *  reset-flow capture: that report is the raw pre-reset evidence and must
@@ -10468,7 +10519,7 @@ export default class EasySyncPlugin extends Plugin {
    * 形状指名占用者并返回 false（不静默失败），由调用方把下拉拨回。
    *
    * 第二道前置门＝未结算 mutation（台账非空，以及损坏／隔离／V2 载入阻塞——同口径
-   * 来源 `state-manager.ts:5954-5963` 的判定）。未结算的出站 intent 会在下一轮
+   * 见 `hasUnsettledMutationRecovery` 的判定）。未结算的出站 intent 会在下一轮
    * `recoverMutationLedger` 里被结算／补完，那会在单向模式下产生一笔云端写入，
    * 与模式承诺冲突，故命中即拒绝且零写入。呈现复用现成文案
    * `notice.sideActionPendingWork`（语义正合：还有未完成的恢复处理），不新增键。
@@ -10569,7 +10620,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /**
-   * 未结算 mutation 的第二道门（同口径来源 `state-manager.ts:5954-5963`）：
+   * 未结算 mutation 的第二道门（同口径见 `hasUnsettledMutationRecovery`）：
    * 台账非空，或账本／隔离区损坏、V2 载入阻塞——都属"恢复未完成"，此时切换
    * 方向会让下一轮的恢复结算在单向模式下补完一笔云端写入。
    */

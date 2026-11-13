@@ -1227,6 +1227,48 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    {
+      name: "a pre-signed content host rejection",
+      downloadUrl: "https://my.microsoftpersonalcontent.com/personal/x/_layouts/15/download.aspx",
+      expected: OneDriveErrorType.NetworkError,
+    },
+    {
+      name: "a Graph API rejection",
+      downloadUrl: "https://graph.microsoft.com/v1.0/drives/d/items/i/content",
+      expected: OneDriveErrorType.AuthExpired,
+    },
+  ])("classifies a 401 from $name by host", async ({ downloadUrl, expected }) => {
+    vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{
+            id: "protocol-v2-id",
+            name: "protocol-v2.json",
+            size: 2,
+            eTag: "protocol-v2-etag",
+            file: {},
+            "@microsoft.graph.downloadUrl": downloadUrl,
+          }],
+        },
+      } as never)
+      .mockRejectedValueOnce({ status: 401, headers: {}, json: {} });
+    const client = new OneDriveClient(async () => "token");
+
+    const error = await client.readSharedSyncProtocolObjects("testVault")
+      .then(() => null, (cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(SharedSyncProtocolObservationError);
+    expect(error).toMatchObject({
+      component: "v2",
+      observationCause: expect.objectContaining({
+        type: expected,
+      }),
+    });
+  });
+
   it("re-dispatches after a deadlined control-directory request and never reuses its late result", async () => {
     vi.useFakeTimers();
     let resolveLate: ((value: never) => void) | undefined;

@@ -21,7 +21,7 @@ import {
 } from "./helpers/sync-safety-harness";
 
 const CONTENT = new ArrayBuffer(8);
-/** Desktop persistence batch (`UPLOAD_CHECKPOINT_BATCH`); the test env runs
+/** Desktop persistence batch (`uploadCheckpointBatch`); the test env runs
  *  the desktop build, where a full batch is sixteen files (2026-11-08: 8→16). */
 const BATCH = 16;
 

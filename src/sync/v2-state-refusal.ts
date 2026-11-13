@@ -12,7 +12,7 @@
  * 响亮整轮失败，静默从不被假设（fail-closed 由类型承接，不再依赖字符串集合）。
  */
 
-/** 封闭的吸收拒绝词表：恰为 `V2_STATE_ABSORPTION_REFUSAL_KINDS` 的 27 项。 */
+/** 封闭的吸收拒绝词表：恰为 `V2_STATE_REFUSAL_KINDS` 的 27 项。 */
 export const V2_STATE_REFUSAL_KINDS = [
   // file-state-reducer-v2.ts — committed-tree / world divergence
   "V2 remote upsert is missing a drive id",

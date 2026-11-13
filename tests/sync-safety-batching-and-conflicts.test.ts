@@ -1706,6 +1706,7 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     stateOverrides?: Record<string, unknown>;
     fileManager?: Record<string, unknown>;
     vaultFile?: unknown;
+    getFileByPath?: ReturnType<typeof vi.fn>;
     getFileMetadata?: ReturnType<typeof vi.fn>;
     getDriveItemMetadataById?: ReturnType<typeof vi.fn>;
     initVaultScope?: ReturnType<typeof vi.fn>;
@@ -1810,7 +1811,8 @@ describe("Conflict resolution actions report standalone transfer progress", () =
           adapter,
           getFiles: vi.fn().mockReturnValue([]),
           getName: vi.fn().mockReturnValue("testVault"),
-          getFileByPath: vi.fn().mockReturnValue(options.vaultFile ?? null),
+          getFileByPath: options.getFileByPath
+            ?? vi.fn().mockReturnValue(options.vaultFile ?? null),
           ...(hostWriteSurface
             ? {
                 modify: vi.fn(async (file: TFile, data: string) => {
@@ -3176,6 +3178,54 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     notice.center.dispose();
   });
 
+  it("keeps the local-only version when trashFile resolves false and the file remains", async () => {
+    const path = "notes/note.md";
+    const localBytes = new TextEncoder().encode("local only\n").buffer;
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1_700_000_000_000,
+      binary: false,
+    };
+    const store = makeKeepRemoteFileStore({ [path]: localBytes });
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const commitMutationCheckpoint = vi.fn().mockResolvedValue(undefined);
+    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
+    const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+    const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const trashFile = vi.fn().mockResolvedValue(false);
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{ type: SyncActionType.Conflict, path, local }],
+      inspectFile: store.inspectFile,
+      adapterOverrides: store.adapterOverrides,
+      stateOverrides: {
+        recordMutationReceipt,
+        commitMutationCheckpoint,
+        recordCloudDeletion,
+        removePendingConflict,
+        abandonMutationIntent,
+      },
+      vaultFile: { path },
+      fileManager: { trashFile },
+      noticeCenter: notice.center,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    expect(trashFile).toHaveBeenCalledTimes(1);
+    expect(store.files.has(path)).toBe(true);
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(recordCloudDeletion).not.toHaveBeenCalled();
+    expect(removePendingConflict).not.toHaveBeenCalled();
+    expect(abandonMutationIntent).toHaveBeenCalledTimes(1);
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.failed:${path}`);
+    notice.center.dispose();
+  });
+
   it("keeps the local-only version in place when it cannot be archived before the followed cloud deletion", async () => {
     const path = "note.md";
     const localBytes = new TextEncoder().encode("local only\n").buffer;
@@ -3433,6 +3483,93 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     expect(trashFile).toHaveBeenCalledTimes(1);
     expect(remove).not.toHaveBeenCalledWith(path);
     expect(removePendingDelete).not.toHaveBeenCalled();
+  });
+
+  it("does not commit the delete when trashFile resolves false and the file remains", async () => {
+    const path = "note.md";
+    const reviewedLocal: LocalFileEntry = {
+      path,
+      hash: "aa".repeat(32),
+      size: 1,
+      mtime: 1,
+      binary: false,
+    };
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const removePendingDelete = vi.fn().mockResolvedValue(undefined);
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const trashFile = vi.fn().mockResolvedValue(false);
+    const executor = makeProgressAwareExecutor({
+      pendingRemoteDeletes: [{
+        type: SyncActionType.ConfirmLocalDelete,
+        path,
+        local: reviewedLocal,
+      }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: reviewedLocal }),
+      adapterOverrides: { remove },
+      stateOverrides: {
+        removePendingDelete,
+        recordMutationReceipt,
+        abandonMutationIntent,
+      },
+      vaultFile: { path },
+      fileManager: { trashFile },
+    });
+
+    await executor.confirmRemoteDelete(path);
+    await waitUntil(() => {
+      expect(executor.isSideActionQueued(path)).toBe(false);
+    });
+
+    expect(trashFile).toHaveBeenCalledTimes(1);
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(abandonMutationIntent).toHaveBeenCalledTimes(1);
+    expect(remove).not.toHaveBeenCalledWith(path);
+    expect(removePendingDelete).not.toHaveBeenCalled();
+  });
+
+  it("treats trashFile false as success when the file is already gone", async () => {
+    const path = "note.md";
+    const reviewedLocal: LocalFileEntry = {
+      path,
+      hash: "aa".repeat(32),
+      size: 1,
+      mtime: 1,
+      binary: false,
+    };
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const trashFile = vi.fn().mockResolvedValue(false);
+    const notice = makeNoticeRecorder();
+    const getFileByPath = vi.fn()
+      .mockReturnValueOnce({ path })
+      .mockReturnValue(null);
+    const executor = makeProgressAwareExecutor({
+      pendingRemoteDeletes: [{
+        type: SyncActionType.ConfirmLocalDelete,
+        path,
+        local: reviewedLocal,
+      }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: reviewedLocal }),
+      stateOverrides: {
+        recordMutationReceipt,
+        abandonMutationIntent,
+      },
+      getFileByPath,
+      fileManager: { trashFile },
+      noticeCenter: notice.center,
+    });
+
+    await executor.confirmRemoteDelete(path);
+    await waitUntil(() => {
+      expect(executor.isSideActionQueued(path)).toBe(false);
+    });
+
+    expect(trashFile).toHaveBeenCalledTimes(1);
+    expect(recordMutationReceipt).toHaveBeenCalledTimes(1);
+    expect(abandonMutationIntent).not.toHaveBeenCalled();
+    expect(notice.center.activeKey).toBe(`side-action:notice.delete.confirmed:${path}`);
+    notice.center.dispose();
   });
 
   it("rejects a legacy pending conflict that has no decision token", async () => {

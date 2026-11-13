@@ -2,7 +2,7 @@
 // 发布产物压缩（release minification）：构建后对 main.js / styles.css 做保守后处理。
 //
 // 口径来源：obsidian-plugin-release-protection skill 的 references/release-minification.md
-// 与 scripts/release-artifact-minify.mjs（2026-10-14 对账：同源产物 main.js 3,261,681→1,704,002B、
+// 与 release-protection skill 的 `release-artifact-minify.mjs`（2026-10-14 对账：同源产物 main.js 3,261,681→1,704,002B、
 // styles.css 45,237→28,304B；隔离实例宿主验证通过，官方插件槽 49–59ms vs 未压缩 73ms）。
 // 机制落仓内的原因：技能脚本经 %USERPROFILE%\.codex（junction 到 D:\.codex）调用时入口判定
 // 会静默跳过（exit 0、零输出），不能作为构建链的依赖；且构建应只依赖本仓。

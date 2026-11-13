@@ -366,7 +366,6 @@ function clickByText(content: MockEl, text: string): void {
   target.__click?.();
 }
 
-/** 等首屏列完：列表滚动区里出现行或空态文案。 */
 /** 等首屏列完：列表滚动区出现内容且不再挂着加载文案。 */
 async function waitForList(content: MockEl, i18n: I18n): Promise<void> {
   await vi.waitFor(() => {

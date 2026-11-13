@@ -52,7 +52,7 @@ interface DownloadBatchObservation {
    *  time only). This is the honest single-file signal: on mobile the wall
    *  clock is dominated by metadata, hashing and verification, so a healthy
    *  serial link still measured below the throughput floor and the limit could
-   *  never rise (docs/temp/20261026-1240 C2). */
+   *  never rise (20261026-1240 C2). */
   transferMs: number;
   failed: boolean;
   degradedPath: boolean;
@@ -71,7 +71,7 @@ interface DownloadBatchObservation {
  * still locks the download direction to serial — but no longer forever. The
  * upload direction has been AIMD since `20261026-2327`, while one CDN hiccup
  * pinned every later download of the round to one file at a time
- * (`docs/temp/20261026-1240` B/C), which is exactly the asymmetry the field
+ * (`20261026-1240` B/C), which is exactly the asymmetry the field
  * reports describe. After the lock, a batch that settled every file and shows
  * a healthy transfer-time rate (when it moved enough bytes to judge one) steps
  * the limit back up by one, every {@link RECOVERY_HEALTHY_BATCHES} consecutive

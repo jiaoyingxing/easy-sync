@@ -322,6 +322,50 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.fileManager.trashFile).toHaveBeenCalledOnce();
   });
 
+  it("does not resurrect a local file when trashFile resolves false", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.executor.setAutomaticHandlingPolicy({
+      autoDeleteLocalFiles: true,
+      mergeNonOverlappingText: true,
+    });
+    harness.mutations.uploadFile.mockClear();
+    harness.remoteItemState.splice(
+      harness.remoteItemState.findIndex((item) => item.id === "file-a"),
+      1,
+    );
+    harness.failTrashSilentlyOnce();
+
+    const failed = await harness.executor.run("manual");
+
+    expect(failed).toMatchObject({
+      success: false,
+      deleted: 0,
+      errors: 1,
+    });
+    expect(harness.localEntryState.some((entry) => entry.path === "Notes/a.md")).toBe(true);
+    expect(harness.state.baseSnapshot.some((entry) => entry.path === "Notes/a.md")).toBe(true);
+    expect(harness.state.mutationLedger).toEqual([]);
+
+    const retried = await harness.executor.run("manual");
+
+    expect(retried).toMatchObject({
+      success: true,
+      deleted: 1,
+      errors: 0,
+    });
+    expect(harness.localEntryState).toEqual([]);
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+    expect(harness.remoteItemState.some((item) => item.id === "file-a")).toBe(false);
+  });
+
   it.each([
     { label: "unreceipted", receipted: false },
     { label: "receipted", receipted: true },

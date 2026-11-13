@@ -3771,7 +3771,6 @@ export class EasySyncSyncView extends ItemView {
     this.updateByteProgress(progress);
   }
 
-  /** 进度条宽度：本轮数字（已结算）或云端核验读数，二者同一判据。 */
   /**
    * A confirmed-delete batch queued behind a running round belongs to the same
    * visible activity: fold its queued size into the round's own total so the
@@ -3783,6 +3782,7 @@ export class EasySyncSyncView extends ItemView {
       + (this.plugin.syncExecutor?.queuedSideActionCount ?? 0);
   }
 
+  /** 进度条宽度：本轮数字（已结算）或云端核验读数，二者同一判据。 */
   private updateProgressBarWidth(progress: Readonly<SyncProgressState>): void {
     if (!this.progressFillEl) return;
     const recoveryPercent = remoteScopeRecoveryPercent(progress);
