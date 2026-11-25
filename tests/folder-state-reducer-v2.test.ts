@@ -6,6 +6,7 @@ import {
   reduceFolderStateEnvelopeV2,
 } from "../src/sync/folder-state-reducer-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import type {
   FolderAnchorV2,
   SyncAnchorV2,
@@ -35,7 +36,12 @@ function envelope(folders: DriveItem[] = []): SyncStateEnvelopeV2 {
       committedAt: 1,
     },
     scope,
-    remoteIndex: buildRemoteIndexV2(folders, scope.filesRootId, "delta", 2).index,
+    remoteIndex: buildRemoteIndexV2(
+      toRemoteScanFactsV1(folders),
+      scope.filesRootId,
+      "delta",
+      2,
+    ).index,
     anchors: { schemaVersion: 2, byAnchorId: {} },
     folderAnchors: { schemaVersion: 2, byAnchorId: {} },
   };
@@ -734,7 +740,12 @@ function identityEnvelope(input: {
       committedAt: 1,
     },
     scope,
-    remoteIndex: buildRemoteIndexV2(remoteItems, scope.filesRootId, "delta", 2).index,
+    remoteIndex: buildRemoteIndexV2(
+      toRemoteScanFactsV1(remoteItems),
+      scope.filesRootId,
+      "delta",
+      2,
+    ).index,
     anchors: {
       schemaVersion: 2,
       byAnchorId: Object.fromEntries(

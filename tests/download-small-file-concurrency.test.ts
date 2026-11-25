@@ -129,20 +129,25 @@ describe("small-file download concurrency (2026-10-27)", () => {
     expect(peak).toBeLessThanOrEqual(4);
     expect(result.metrics?.fileTransfers.download.peakConcurrency).toBe(peak);
 
-    // The whole round refreshes every missing URL once; version checks then
-    // ride the commit group (8 desktop / 4 mobile), so 30 files cost four
-    // post-download metadata requests instead of 30.
+    // The whole round refreshes every missing URL through the lookahead: a
+    // head chunk of 8 ids the first transfer batch waits for, then the rest
+    // in one call (2026-11-19). Version checks then ride the commit group
+    // (8 desktop / 4 mobile), so 30 files cost four post-download metadata
+    // requests instead of 30.
     const refreshCalls = getDriveItemMetadataByIds.mock.calls
       .filter((call) => call[1] === "downloadUrlRefresh");
-    expect(refreshCalls).toHaveLength(1);
-    expect(refreshCalls[0][0]).toHaveLength(entries.length);
+    expect(refreshCalls).toHaveLength(2);
+    expect(refreshCalls[0][0]).toHaveLength(8);
+    expect([...refreshCalls[0][0], ...refreshCalls[1][0]].sort())
+      .toEqual(entries.map((entry) => entry.driveId).sort());
     const refreshLog = diag.log.mock.calls.find(
       (call) => call[1] === "batch downloadUrl refresh",
     );
     expect(refreshLog?.[2]).toMatchObject({
       files: entries.length,
       filled: entries.length,
-      batchRequests: 2,
+      // Head 8 (1 POST) + the remaining 22 in 20-id chunks (2 POSTs).
+      batchRequests: 3,
     });
     const verifyCalls = getDriveItemMetadataByIds.mock.calls
       .filter((call) => call[1] === "downloadVersionVerify");

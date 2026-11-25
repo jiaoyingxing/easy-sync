@@ -1823,7 +1823,9 @@ describe("Persistent remote delta state", () => {
       "Mutation outcome requires manual review: sanitized-network-op-1",
     );
 
-    expect(getFileMetadata).toHaveBeenCalledTimes(2);
+    // P1 的 superseded 判定会在读取远端后追加一次身份复核，确认对象在读取
+    // 期间没有被替换；被裁决的那条记录因此多一次 getFileMetadata。
+    expect(getFileMetadata).toHaveBeenCalledTimes(3);
     expect(state.mutationLedger).toHaveLength(2);
     expect(state.recordMutationReceipt).not.toHaveBeenCalled();
     expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();

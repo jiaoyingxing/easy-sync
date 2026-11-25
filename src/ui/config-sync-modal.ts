@@ -33,6 +33,7 @@ import {
 import { EasySyncModal } from "./easy-sync-modal";
 import {
   bindModalKeyboardDismissal,
+  bindModalKeyboardInset,
   keepModalFocusOnBody,
 } from "./easy-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
@@ -97,6 +98,29 @@ export function isPluginRowHiddenByCloudCleanup(
   return column !== undefined && local === false && cleaned;
 }
 
+/**
+ * A mobile device must not create a participation intent that can never take
+ * effect: a confirmed desktop-only remote bundle cannot be downloaded, and
+ * without a complete local bundle there is nothing to keep or manage. Blocking
+ * only the off→on direction leaves an already-enabled row usable (the user can
+ * still turn it off), and a complete local bundle keeps its normal switch.
+ *
+ * The engine still treats a platform-incompatible row as this round's
+ * non-participant; this guard only prevents a deterministic dead end from
+ * being created by the manager.
+ */
+export function isCommunityPluginToggleEnableBlocked(input: {
+  isMobileApp: boolean;
+  desktopOnly: boolean;
+  localBundleComplete: boolean;
+  enabled: boolean;
+}): boolean {
+  return input.isMobileApp
+    && input.desktopOnly
+    && !input.localBundleComplete
+    && !input.enabled;
+}
+
 interface ScopeToggleConfig {
   key: string;
   get: () => boolean;
@@ -148,6 +172,7 @@ export class ConfigSyncModal extends EasySyncModal {
   private inventoryReloadGateTimer: TimeoutHandle | null = null;
   private lastInventoryReloadCompletedAt = 0;
   private keyboardDismissDisposer: (() => void) | null = null;
+  private keyboardInsetDisposer: (() => void) | null = null;
   /**
    * Set when the remote catalog refresh was skipped because a sync round was
    * in flight at manager open time. The next inventory revision retries once;
@@ -204,6 +229,8 @@ export class ConfigSyncModal extends EasySyncModal {
     this.inventoryRevisionRefreshPending = false;
     this.keyboardDismissDisposer?.();
     this.keyboardDismissDisposer = null;
+    this.keyboardInsetDisposer?.();
+    this.keyboardInsetDisposer = null;
     compatClearTimeout(this.searchRenderDebounce);
     this.searchRenderDebounce = null;
     compatClearTimeout(this.inventoryReloadGateTimer);
@@ -765,8 +792,10 @@ export class ConfigSyncModal extends EasySyncModal {
     this.listScrollEl = this.contentEl.createDiv(
       "easy-sync-plugin-list-scroll",
     );
-    // 手机软键盘弹出时给清单滚动区让位（键盘收起为 0，桌面恒 0）。
-    this.listScrollEl.addClass("easy-sync-keyboard-tail");
+    // 手机软键盘：按「聚焦行实际被盖住多少」给清单滚动区补滚动余量（共享
+    // 锚不进文档流；桌面端本函数是空操作）。2026-11-22 起键盘余量统一走
+    // `bindModalKeyboardInset`，旧的整键盘高度 tail 类已退场。
+    this.keyboardInsetDisposer = bindModalKeyboardInset(this.listScrollEl);
     this.renderPluginListArea();
   }
 
@@ -865,6 +894,14 @@ export class ConfigSyncModal extends EasySyncModal {
       || (column === "data"
         && !this.getCommunityPluginScopeEnabled("files"));
     const pendingValue = this.pendingPluginValues.get(rowKey);
+    const currentEnabled = pendingValue
+      ?? this.isPluginEffectivelyEnabled(item.id, column);
+    const enableBlocked = isCommunityPluginToggleEnableBlocked({
+      isMobileApp: this.plugin.platformFacts.isMobileApp,
+      desktopOnly: item.desktopOnly,
+      localBundleComplete: item.localBundleComplete === true,
+      enabled: currentEnabled,
+    });
     const status = queued
       ? this.plugin.i18n.t("settings.communityPlugins.queuedStatus")
       : this.describeInventoryItem(item, column);
@@ -929,11 +966,8 @@ export class ConfigSyncModal extends EasySyncModal {
       );
     }
     const toggle = new ToggleComponent(toggleCell)
-      .setValue(
-        pendingValue
-        ?? this.isPluginEffectivelyEnabled(item.id, column),
-      )
-      .setDisabled(busy || scopeDisabled)
+      .setValue(currentEnabled)
+      .setDisabled(busy || scopeDisabled || enableBlocked)
       .onChange((enabled) => {
         if (column === "data" && enabled) {
           void this.confirmPluginDataSelection(item, restricted);

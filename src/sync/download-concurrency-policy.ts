@@ -41,6 +41,16 @@ const MIN_SMALL_FILE_THROUGHPUT_BPS = 64 * 1024;
 const SMALL_FILE_RAMP_BATCHES = 2;
 const SMALL_FILE_CEILING_BATCHES = 4;
 
+/** Warm start (2026-11-19): a completed round hands its settled limit to the
+ *  next round. Without it every round restarts at one and a round of 8–20
+ *  files never reaches the platform ceiling. The value is clamped into the
+ *  platform range; degradation, the serial lock and the recovery ramp are
+ *  unchanged, so a remembered value the link cannot sustain still falls back
+ *  inside the new round. */
+interface DownloadConcurrencyPolicyOptions {
+  initialConcurrency?: number;
+}
+
 interface DownloadBatchObservation {
   files: number;
   bytes: number;
@@ -61,8 +71,10 @@ interface DownloadBatchObservation {
 /**
  * Conservative, per-run download concurrency controller.
  *
- * Pre-lock ramp (unchanged): every sync round starts at one, two healthy
- * batches reach two, four reach the platform ceiling (4 desktop / 2 mobile).
+ * Pre-lock ramp (unchanged for a cold start): a round with no remembered
+ * depth starts at one, two healthy batches reach two, four reach the platform
+ * ceiling (4 desktop / 2 mobile). A round that follows a completed one starts
+ * at that round's settled limit instead (`DownloadConcurrencyPolicyOptions`).
  * "Healthy" is bandwidth evidence, or — since {@link isSmallFileHealthyBatch}
  * — a completed transfer in the small-file tier that showed a real request
  * window; the 512 KiB/s gate alone could never open for 18-byte notes.
@@ -94,7 +106,10 @@ export class DownloadConcurrencyPolicy {
    *  (A2 mobile read-only prefetch — memory bound 2 × ≤8 MiB in flight). */
   constructor(
     private readonly maxConcurrency = ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
-  ) {}
+    options: DownloadConcurrencyPolicyOptions = {},
+  ) {
+    this.concurrency = clampWarmStart(options.initialConcurrency, maxConcurrency);
+  }
 
   get limit(): number {
     return this.concurrency;
@@ -133,6 +148,9 @@ export class DownloadConcurrencyPolicy {
         this.observeSmallFileBatch();
         return;
       }
+      // A completed batch that moved no bytes (zero-byte files) is not
+      // evidence of a stall: it must not pull a warm start back to serial.
+      if (observation.files > 0 && observation.bytes === 0) return;
       this.smallFileBatches = 0;
       this.stableBatches = 0;
       this.concurrency = 1;
@@ -154,7 +172,12 @@ export class DownloadConcurrencyPolicy {
     if (this.stableBatches >= 4) {
       this.concurrency = this.maxConcurrency;
     } else if (this.stableBatches >= 2) {
-      this.concurrency = Math.min(2, this.maxConcurrency);
+      // Never below the current depth: a warm start can already sit above two,
+      // and the ladder only exists to climb from the floor.
+      this.concurrency = Math.max(
+        this.concurrency,
+        Math.min(2, this.maxConcurrency),
+      );
     }
   }
 
@@ -195,6 +218,22 @@ export class DownloadConcurrencyPolicy {
     this.recoveryBatches = 0;
     this.smallFileBatches = 0;
   }
+}
+
+/** Clamp a remembered limit into the platform range; anything unusable falls
+ *  back to the per-round floor of one. */
+function clampWarmStart(
+  remembered: number | undefined,
+  max: number,
+): number {
+  if (
+    remembered === undefined
+    || !Number.isFinite(remembered)
+    || remembered <= 0
+  ) {
+    return 1;
+  }
+  return Math.min(max, Math.max(1, Math.round(remembered)));
 }
 
 /** A batch may argue for recovery when every one of its files settled and it

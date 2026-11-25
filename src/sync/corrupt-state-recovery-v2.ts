@@ -7,6 +7,7 @@ import {
   type RemoteIndexProjectionV2,
   type RemoteNodeV2,
 } from "./remote-index-v2";
+import { toRemoteScanFactsV1 } from "./remote-facts-adapter";
 import {
   validateEnvelope,
   type FolderAnchorV2,
@@ -124,7 +125,7 @@ export async function buildCorruptStateRecoveryCandidateV2(
   let projection: RemoteIndexProjectionV2;
   try {
     projection = buildRemoteIndexV2(
-      [...input.remoteItems],
+      toRemoteScanFactsV1([...input.remoteItems]),
       input.source.scope.filesRootId,
       input.deltaLink,
       sourceCursorRevision(raw, input.source.corruption),

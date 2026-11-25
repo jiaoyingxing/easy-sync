@@ -2,6 +2,7 @@ import type { App } from "obsidian";
 import { compareCommunityPluginVersions } from "../sync/community-plugin-bundle";
 import type {
   CommunityPluginBundleFilePresentationV1,
+  CommunityPluginBundleManifestIdentityV1,
   CommunityPluginBundleReviewBlockReasonV1,
   ManualMutationResolutionChoiceV1,
   ManualMutationResolutionLocalFactV1,
@@ -26,6 +27,10 @@ import {
   type FileComparisonAction,
   type FileComparisonRow,
 } from "./file-comparison-modal";
+import {
+  formatUserDateTimeFull,
+  type UserTimeLanguage,
+} from "./user-time-format";
 
 type MutationResolutionSnapshot = Readonly<ManualMutationResolutionSnapshotV1>;
 type MutationResolutionSnapshotInput =
@@ -44,13 +49,14 @@ function fileFactText(
     ManualMutationResolutionLocalFactV1 | ManualMutationResolutionRemoteFactV1
   > | undefined,
   t: I18nFn,
+  language: UserTimeLanguage,
 ): string {
   if (!fact?.exists) return t("syncView.mutationResolution.missing");
   const size = formatFileSize(fact.size ?? 0);
   return fact.mtime !== undefined
     ? t("syncView.mutationResolution.presentWithTime", {
         size,
-        time: new Date(fact.mtime).toLocaleString(),
+        time: formatUserDateTimeFull(fact.mtime, language),
       })
     : t("syncView.mutationResolution.present", { size });
 }
@@ -81,10 +87,11 @@ function bundleLocalText(
   fact: Readonly<ManualMutationResolutionLocalFactV1> | undefined,
   file: Readonly<CommunityPluginBundleFilePresentationV1> | undefined,
   t: I18nFn,
+  language: UserTimeLanguage,
 ): string {
   if (!fact?.exists) return t("syncView.mutationResolution.missing");
   if (file?.localMtime !== undefined) {
-    return new Date(file.localMtime).toLocaleString();
+    return formatUserDateTimeFull(file.localMtime, language);
   }
   return formatFileSize(fact.size ?? 0);
 }
@@ -94,12 +101,28 @@ function bundleRemoteText(
   fact: Readonly<ManualMutationResolutionRemoteFactV1> | undefined,
   file: Readonly<CommunityPluginBundleFilePresentationV1> | undefined,
   t: I18nFn,
+  language: UserTimeLanguage,
 ): string {
   if (!fact?.exists) return t("syncView.mutationResolution.missing");
   if (file?.remoteMtime !== undefined) {
-    return new Date(file.remoteMtime).toLocaleString();
+    return formatUserDateTimeFull(file.remoteMtime, language);
   }
   return formatFileSize(fact.size ?? 0);
+}
+
+/** One side's declared manifest identity as it reads inside a sentence:
+ *  the display name when the manifest carries one, then the logical id. */
+function bundleManifestIdentityText(
+  identity: Readonly<CommunityPluginBundleManifestIdentityV1>,
+  t: I18nFn,
+): string {
+  const name = identity.name?.trim();
+  return name && name !== identity.id
+    ? t("syncView.pluginBundleReview.identityWithName", {
+        name,
+        id: identity.id,
+      })
+    : identity.id;
 }
 
 /**
@@ -119,6 +142,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
     app: App,
     snapshot: MutationResolutionSnapshotInput,
     private readonly t: I18nFn,
+    private readonly language: UserTimeLanguage,
     private readonly getFileDiff?: (
       pluginId: string,
       path: string,
@@ -317,20 +341,25 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
     bundle: NonNullable<MutationResolutionSnapshot["bundleReview"]>;
   }): void {
     const { body, snapshot, bundle } = args;
-    // The directory holds two different plugins on the two sides: no
-    // keep-side choice exists at all. A single explanatory notice replaces
-    // the two duplicated "side unavailable" lines plus the generic
-    // read-only sentence, which would otherwise read as a temporary state
-    // the user is expected to resolve by picking a side.
-    const identityMismatchOnBothSides = Boolean(
-      !bundle.local.available
-      && bundle.local.reason === "identity-mismatch"
-      && !bundle.remote.available
-      && bundle.remote.reason === "identity-mismatch",
+    // The directory holds two different plugins on the two sides. Both sides
+    // are complete bundles, so each keep-side choice is executable — but the
+    // user must see WHICH plugins they are choosing between, otherwise a
+    // keep-side click silently replaces one plugin with another. The notice
+    // names both identities in place of the two generic "side unavailable"
+    // lines (those only appear when a direction really is unavailable).
+    const localIdentity = snapshot.bundlePresentation?.localIdentity ?? null;
+    const remoteIdentity = snapshot.bundlePresentation?.remoteIdentity ?? null;
+    const identityDrifted = Boolean(
+      localIdentity
+      && remoteIdentity
+      && localIdentity.id !== remoteIdentity.id,
     );
-    if (identityMismatchOnBothSides) {
+    if (identityDrifted) {
       body.createEl("p", {
-        text: this.t("syncView.pluginBundleReview.identityMismatchNotice"),
+        text: this.t("syncView.pluginBundleReview.identityMismatchNotice", {
+          local: bundleManifestIdentityText(localIdentity!, this.t),
+          remote: bundleManifestIdentityText(remoteIdentity!, this.t),
+        }),
         cls: "easy-sync-comparison-unavailable",
       });
     } else {
@@ -479,12 +508,12 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
       ? "—"
       : isManifest && localVersion !== null
         ? this.t("syncView.pluginBundleReview.version", { version: localVersion })
-        : bundleLocalText(local, file, this.t);
+        : bundleLocalText(local, file, this.t, this.language);
     const remoteValue = identical
       ? "—"
       : isManifest && remoteVersion !== null
         ? this.t("syncView.pluginBundleReview.version", { version: remoteVersion })
-        : bundleRemoteText(remote, file, this.t);
+        : bundleRemoteText(remote, file, this.t, this.language);
     const localCell = row.createEl("td", "easy-sync-meta-col-local");
     localCell.setText(localValue);
     const remoteCell = row.createEl("td", "easy-sync-meta-col-remote");
@@ -562,6 +591,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
     const modal = new BundleFileDiffModal(
       this.app,
       this.t,
+      this.language,
       path,
       getFileDiff
         ? () => getFileDiff(pluginId, path)
@@ -582,10 +612,12 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
       local: fileFactText(
         snapshot.local.find((fact) => fact.path === path),
         this.t,
+        this.language,
       ),
       remote: fileFactText(
         snapshot.remote.find((fact) => fact.path === path),
         this.t,
+        this.language,
       ),
     }));
   }
@@ -671,6 +703,7 @@ class BundleFileDiffModal extends EasySyncModal {
   constructor(
     app: App,
     private readonly t: I18nFn,
+    private readonly language: UserTimeLanguage,
     private readonly path: string,
     private readonly loadData: () => Promise<BundleFileDiffData | null>,
   ) {
@@ -821,7 +854,7 @@ class BundleFileDiffModal extends EasySyncModal {
 
   private formatMtime(mtime: number | undefined): string {
     return mtime !== undefined
-      ? new Date(mtime).toLocaleString()
+      ? formatUserDateTimeFull(mtime, this.language)
       : "—";
   }
 }

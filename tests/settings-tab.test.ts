@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { ButtonComponent, Setting, requireApiVersion } from "obsidian";
-import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
+import {
+  ButtonComponent,
+  Setting,
+  ToggleComponent,
+  requireApiVersion,
+} from "obsidian";
+import {
+  ConfigSyncModal,
+  isCommunityPluginToggleEnableBlocked,
+  isPluginRowHiddenByCloudCleanup,
+} from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
 import { createMockElement } from "./__mocks__/obsidian";
 import {
@@ -334,7 +343,9 @@ describe("settings tab", () => {
     expect(source).toContain("busyCommunityPluginScopeRows");
     expect(source).toContain("pendingCommunityPluginScopeValues");
     expect(source).toContain("const scopeDisabled = !this.getCommunityPluginScopeEnabled(column)");
-    expect(source).toContain(".setDisabled(busy || scopeDisabled)");
+    expect(source).toContain(
+      ".setDisabled(busy || scopeDisabled || enableBlocked)",
+    );
     expect(source).toContain(
       "!scopeEnabled",
     );
@@ -840,6 +851,101 @@ describe("settings tab", () => {
       .toBe("云端插件或同步位置变化后，下次同步会重新核对。");
     expect(zhCN["settings.communityPlugins.guidance.retry"])
       .toBe("恢复受阻时，稍后重新同步即可重试。");
+  });
+
+  it("blocks only the off-to-on direction for a mobile desktop-only bundle without a complete local copy", () => {
+    expect(isCommunityPluginToggleEnableBlocked({
+      isMobileApp: true,
+      desktopOnly: true,
+      localBundleComplete: false,
+      enabled: false,
+    })).toBe(true);
+    // An already-enabled (blocked or local-complete) row stays operable so the
+    // user can turn it off.
+    expect(isCommunityPluginToggleEnableBlocked({
+      isMobileApp: true,
+      desktopOnly: true,
+      localBundleComplete: false,
+      enabled: true,
+    })).toBe(false);
+    // A complete local bundle is manageable even when the remote copy is
+    // desktop-only: the switch means keep/exit this device's copy.
+    expect(isCommunityPluginToggleEnableBlocked({
+      isMobileApp: true,
+      desktopOnly: true,
+      localBundleComplete: true,
+      enabled: false,
+    })).toBe(false);
+    // Desktop is never blocked by a mobile platform fact.
+    expect(isCommunityPluginToggleEnableBlocked({
+      isMobileApp: false,
+      desktopOnly: true,
+      localBundleComplete: false,
+      enabled: false,
+    })).toBe(false);
+    // Only a confirmed desktop-only bundle triggers the guard; unknown stays
+    // with the existing fail-closed join preflight.
+    expect(isCommunityPluginToggleEnableBlocked({
+      isMobileApp: true,
+      desktopOnly: false,
+      localBundleComplete: false,
+      enabled: false,
+    })).toBe(false);
+
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
+    expect(source).toContain("isCommunityPluginToggleEnableBlocked({");
+    expect(source).toContain("localBundleComplete === true");
+    expect(source).toContain(
+      ".setDisabled(busy || scopeDisabled || enableBlocked)",
+    );
+  });
+
+  it("wires the mobile desktop-only guard into the rendered switch", () => {
+    const item = {
+      id: "desktop-locked",
+      name: "Desktop Locked",
+      local: false,
+      remote: true,
+      dataLocally: false,
+      dataRemotely: false,
+      desktopOnly: true,
+      manifestIssue: false,
+    };
+    const render = (localBundleComplete: boolean) => {
+      const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+      Object.assign(modal as object, {
+        plugin: {
+          app: {},
+          i18n: { t: (key: string) => key },
+          platformFacts: { isMobileApp: true },
+          syncCommunityPlugins: true,
+          syncPluginData: false,
+          communityPluginSyncPolicy: {
+            files: { mode: "selected", pluginIds: ["desktop-locked"] },
+            data: { mode: "none", pluginIds: [] },
+          },
+          isCommunityPluginFilesParticipationEnabled: () => false,
+        },
+        listScrollEl: createMockElement(),
+        busyPluginRows: new Set<string>(),
+        confirmingDataRows: new Set<string>(),
+        pendingPluginValues: new Map<string, boolean>(),
+        cleanedPluginIds: new Set<string>(),
+        remoteInventoryAvailable: true,
+      });
+      ToggleComponent.instances = [];
+      (modal as unknown as {
+        renderPluginRow(item: Record<string, unknown>, column: "files"): void;
+      }).renderPluginRow(
+        localBundleComplete ? { ...item, localBundleComplete: true } : item,
+        "files",
+      );
+      return ToggleComponent.instances[0];
+    };
+
+    expect(render(false)?.disabled).toBe(true);
+    expect(render(false)?.value).toBe(false);
+    expect(render(true)?.disabled).toBe(false);
   });
 
   it("keeps rows of cloud-cleaned plugins out of the files list", () => {
@@ -1528,10 +1634,11 @@ describe("settings save call sites", () => {
     const rowsSource = readSourceFile("src/ui/settings-page-rows.ts");
     const count = (text: string, needle: string) => text.split(needle).length - 1;
     expect(count(tabSource, "notice.settingsSaveFailed")).toBe(3);
-    expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(7);
+    // 页面行现役 9 处：原 7 处＋S4 局域网加速开关/阈值 2 处。
+    expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(9);
     // 回滚语义：控件拨回上一值；自动处理开关按内存现值拨回（同义）。
     expect(count(tabSource, ".setValue(previous)")).toBe(2);
-    expect(count(rowsSource, ".setValue(previous)")).toBe(6);
+    expect(count(rowsSource, ".setValue(previous)")).toBe(7);
     expect(rowsSource).toContain(
       "toggle.setValue(plugin.automaticHandlingPolicy[policyKey]);",
     );

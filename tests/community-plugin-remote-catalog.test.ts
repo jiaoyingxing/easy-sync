@@ -14,6 +14,7 @@ import {
   buildRemoteIndexV2,
   type RemoteIndexV2,
 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import type { DriveItem } from "../src/onedrive/types";
 import type { RemoteFileEntry, SyncScope } from "../src/sync/types";
 
@@ -216,7 +217,7 @@ describe("remote community-plugin catalog", () => {
   describe("committed-index variant", () => {
     function committedIndex(entries: readonly DriveItem[]): RemoteIndexV2 {
       return buildRemoteIndexV2(
-        entries as DriveItem[],
+        toRemoteScanFactsV1(entries),
         SCOPE.filesRootId,
         null,
       ).index;

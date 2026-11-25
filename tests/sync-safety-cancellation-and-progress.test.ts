@@ -155,6 +155,67 @@ describe("Cancellation checkpoint semantics", () => {
     expect(reconcilePendingIssues).not.toHaveBeenCalled();
   });
 
+  it("ends the round as cancelled, not as a failed scan, when the cancel lands inside the local scan", async () => {
+    // 2026-11-23 field report: a phone sat on "scanning local files" for a
+    // day. The scan is now interruptible, so a mid-walk cancel must report
+    // the user's stop — never "scan incomplete", and never a partial entry
+    // list walking into planning.
+    let executor: SyncExecutor;
+    const state = makeActiveV2State([], [], {
+      upsertPendingConflicts: vi.fn().mockResolvedValue(undefined),
+      prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
+      upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
+      prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
+      lastSyncTime: 0,
+    });
+    const scanAll = vi.fn().mockImplementation(async () => {
+      executor.cancel();
+      // The scanner stops at the next file boundary and returns this shape.
+      // `complete: false` mirrors the real walk; only `aborted` distinguishes
+      // a user stop from an uncertain read.
+      return {
+        entries: [],
+        folders: [],
+        folderScanComplete: false,
+        folderScanFailures: [],
+        skippedLarge: [],
+        failedPaths: [],
+        skippedCount: 0,
+        complete: false,
+        aborted: true,
+        recoveryCopies: [],
+      };
+    });
+    const getDelta = vi.fn().mockResolvedValue({ value: [], "@odata.deltaLink": "tok" });
+    executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll,
+        scanFile: vi.fn().mockResolvedValue(null),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(false);
+    // The user's stop owns the message; an uncertain-read report would read
+    // as a scan failure and hide that they cancelled.
+    expect(result.message).toBe("result.cancelled");
+    expect(result.errors).toBe(0);
+    expect(result.runFacts?.termination).toBe("cancelled");
+    // A partial walk never reaches remote preparation.
+    expect(getDelta).not.toHaveBeenCalled();
+    // The scanner actually received the round's cancel signal.
+    expect(scanAll.mock.calls[0]?.[1]).toBeInstanceOf(AbortSignal);
+  });
+
   it("records a durable receipt but commits no shared state after cancellation", async () => {
     let executor: SyncExecutor;
     const setLastSyncTime = vi.fn().mockResolvedValue(undefined);
@@ -560,6 +621,13 @@ describe("S1a — sync run phase observability", () => {
           failedPaths: [],
           skippedCount: 0,
           complete: true,
+          metrics: {
+            files: 2,
+            bytes: 8,
+            cacheHits: 1,
+            readMs: 3,
+            hashMs: 5,
+          },
         }),
         getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
       } as unknown as LocalScanner,
@@ -629,7 +697,7 @@ describe("S1a — sync run phase observability", () => {
     );
     expect(summaryCall).toBeDefined();
     expect(summaryCall?.[2]).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       platform: expect.stringMatching(/^(desktop|mobile)$/),
       mode: "manual",
       status: "success",
@@ -651,6 +719,15 @@ describe("S1a — sync run phase observability", () => {
         reviewWait: expect.any(Number),
         transfer: expect.any(Number),
         commit: expect.any(Number),
+      },
+      // Scan cost facts travel with the summary so a field report can tell a
+      // big vault from a stalled walk without a debug build.
+      scan: {
+        files: 2,
+        bytes: 8,
+        cacheHits: 1,
+        readMs: 3,
+        hashMs: 5,
       },
       // Observation-only per-round queue accounting (iOS "stuck with no logs"
       // forensics). Presence is the contract; the numbers never feed a decision.
@@ -690,7 +767,7 @@ describe("S1a — sync run phase observability", () => {
       ([category, message]) => category === "lifecycle" && message === "sync run phase summary",
     );
     expect(previewSummary?.[2]).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       platform: expect.stringMatching(/^(desktop|mobile)$/),
       mode: "manual",
       status: "stopped",
@@ -795,22 +872,38 @@ describe("S1a — sync run phase observability", () => {
       );
       // 判定用「最快一轮」而不是中位数：机器忙（整仓并行跑）只会让某一轮**变慢**、
       // 不会让它变快，取最小值天然抗负载；中位数照旧打印，供发布时人工比对趋势。
+      // 两臂逐轮交错、每轮偶数次先关后开、奇数次先开后关：整仓并行时负载随时间
+      // 漂移，先跑满 9 轮关再跑 9 轮开会把「时段负载」混进诊断开销。判定量取
+      // **成对差值的最小值**（同一对相邻两轮里「开－关」），而不是两臂各自最小值
+      // 再相减：后者可能拿安静时段的关对比繁忙时段的开，仍把时段负载算进开销；
+      // 成对差值共享同一小段负载，真实开销会在每一对出现，取最优一对即可。
       const ROUNDS_PER_MODE = 9;
       const withoutDiagnosticsMs: number[] = [];
       const withDiagnosticsMs: number[] = [];
+      const pairOverheadsMs: number[] = [];
+
+      const runOnce = async (diagnostics: boolean): Promise<number> => {
+        diagnosticsEnabled.value = diagnostics;
+        const startedAt = performance.now();
+        const result = await executor.run("manual", {});
+        const elapsed = performance.now() - startedAt;
+        expect(result.success).toBe(true);
+        return elapsed;
+      };
 
       for (let round = 0; round < ROUNDS_PER_MODE; round++) {
-        const startedAt = performance.now();
-        const result = await executor.run("manual", {});
-        withoutDiagnosticsMs.push(performance.now() - startedAt);
-        expect(result.success).toBe(true);
-      }
-      diagnosticsEnabled.value = true;
-      for (let round = 0; round < ROUNDS_PER_MODE; round++) {
-        const startedAt = performance.now();
-        const result = await executor.run("manual", {});
-        withDiagnosticsMs.push(performance.now() - startedAt);
-        expect(result.success).toBe(true);
+        const withoutFirst = round % 2 === 0;
+        const withoutElapsed = withoutFirst
+          ? await runOnce(false)
+          : undefined;
+        const withElapsed = await runOnce(true);
+        const withoutAfter = withoutFirst
+          ? undefined
+          : await runOnce(false);
+        const off = withoutFirst ? withoutElapsed! : withoutAfter!;
+        withoutDiagnosticsMs.push(off);
+        withDiagnosticsMs.push(withElapsed);
+        pairOverheadsMs.push(withElapsed - off);
       }
 
       const totalRuns = ROUNDS_PER_MODE * 2;
@@ -830,9 +923,11 @@ describe("S1a — sync run phase observability", () => {
       const fastestWithDiagnostics = Math.min(...withDiagnosticsMs);
       const medianWithoutDiagnostics = [...withoutDiagnosticsMs].sort((a, b) => a - b)[medianIndex];
       const medianWithDiagnostics = [...withDiagnosticsMs].sort((a, b) => a - b)[medianIndex];
+      const fastestPairOverhead = Math.min(...pairOverheadsMs);
+      const medianPairOverhead = [...pairOverheadsMs].sort((a, b) => a - b)[medianIndex];
       const allowedProbeOverheadMs = Math.max(fastestWithoutDiagnostics * 0.05, 10);
       // 反向变异证据（给诊断路径注入真实开销时本条必须变红）见本轮收口日志。
-      expect(fastestWithDiagnostics - fastestWithoutDiagnostics).toBeLessThanOrEqual(allowedProbeOverheadMs);
+      expect(fastestPairOverhead).toBeLessThanOrEqual(allowedProbeOverheadMs);
       console.info("[a0p-production-entry]", JSON.stringify({
         schemaVersion: 1,
         mode: "platform-neutral",
@@ -841,9 +936,11 @@ describe("S1a — sync run phase observability", () => {
         diagnosticsOffFastestMs: Number(fastestWithoutDiagnostics.toFixed(3)),
         diagnosticsOnFastestMs: Number(fastestWithDiagnostics.toFixed(3)),
         diagnosticsOverheadFastestMs: Number((fastestWithDiagnostics - fastestWithoutDiagnostics).toFixed(3)),
+        diagnosticsOverheadFastestPairMs: Number(fastestPairOverhead.toFixed(3)),
         diagnosticsOffMedianMs: Number(medianWithoutDiagnostics.toFixed(3)),
         diagnosticsOnMedianMs: Number(medianWithDiagnostics.toFixed(3)),
         diagnosticsOverheadMs: Number((medianWithDiagnostics - medianWithoutDiagnostics).toFixed(3)),
+        diagnosticsOverheadMedianPairMs: Number(medianPairOverhead.toFixed(3)),
         allowedProbeOverheadMs: Number(allowedProbeOverheadMs.toFixed(3)),
         operations: {
           fullScansPerRun: scanAll.mock.calls.length / totalRuns,

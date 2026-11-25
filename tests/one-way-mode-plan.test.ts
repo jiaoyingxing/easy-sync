@@ -22,6 +22,7 @@ import {
   type FinalizeCanonicalPlanInputV2,
 } from "../src/sync/canonical-plan-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import type {
   FolderAnchorV2,
   SyncAnchorV2,
@@ -136,7 +137,12 @@ function envelope(input: {
       committedAt: 1,
     },
     scope,
-    remoteIndex: buildRemoteIndexV2(items, scope.filesRootId, null, 2).index,
+    remoteIndex: buildRemoteIndexV2(
+      toRemoteScanFactsV1(items),
+      scope.filesRootId,
+      null,
+      2,
+    ).index,
     anchors: {
       schemaVersion: 2,
       byAnchorId: Object.fromEntries(

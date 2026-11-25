@@ -4,6 +4,11 @@
  */
 
 import { describeError } from "../obsidian-compat";
+import {
+  RemoteError,
+  RemoteErrorType,
+  type RemoteProviderErrorDetail,
+} from "../remote/errors";
 
 /** Identity set: user, application, or device that performed an action. */
 interface IdentitySet {
@@ -121,75 +126,19 @@ export interface UploadResult {
   parentReference?: DriveItem["parentReference"];
 }
 
-/** OneDrive-specific error types for classification */
-export enum OneDriveErrorType {
-  Unauthorized = "Unauthorized",
-  Forbidden = "Forbidden",
-  NotFound = "NotFound",
-  Conflict = "Conflict",
-  RateLimited = "RateLimited",
-  InsufficientStorage = "InsufficientStorage",
-  ServerError = "ServerError",
-  NetworkError = "NetworkError",
-  AuthExpired = "AuthExpired",
-  PreconditionFailed = "PreconditionFailed",
-  RangeNotSatisfiable = "RangeNotSatisfiable",
-  Unknown = "Unknown",
-}
+/** Historical OneDrive error vocabulary, re-exported from the neutral base so
+ *  the 12 string values stay byte-identical. */
+export { RemoteErrorType as OneDriveErrorType };
 
-/** Graph error body details kept for diagnostics. `message` is
- *  developer-facing and must never be shown to users; only `code` and
- *  `innerCode` are stable enough to reason about. */
-export interface OneDriveGraphErrorDetail {
-  code: string;
-  message: string;
-  innerCode: string | null;
-  requestId: string | null;
-  date: string | null;
-}
+/** Historical name for the provider error detail; the shape is neutral. */
+export type OneDriveGraphErrorDetail = RemoteProviderErrorDetail;
 
-export class OneDriveError extends Error {
-  public readonly type: OneDriveErrorType;
-  public readonly statusCode: number;
-  public readonly retryAfterSeconds: number | null;
-  public readonly graphCode: string | null;
-  public readonly graphError: OneDriveGraphErrorDetail | null;
-  /**
-   * 刀 2 错误路由类型化：当本错误承载的是一个不可取消的请求超时（客户端
-   * deadline 到点，请求可能仍在宿主侧运行）时，记录该 deadline 的毫秒数；
-   * 其余错误为 null。路由面以此判别，不再依赖错误消息文本。
-   */
-  public readonly requestTimeoutMs: number | null;
-
-  constructor(
-    type: OneDriveErrorType,
-    message: string,
-    statusCode: number = 0,
-    retryAfterSeconds: number | null = null,
-    graphCode: string | null = null,
-    graphError: OneDriveGraphErrorDetail | null = null,
-    requestTimeoutMs: number | null = null,
-  ) {
-    super(message);
+/** Historical-name compatibility subclass: keeps `name`, constructor
+ *  arguments and `instanceof OneDriveError` identity for existing callers. */
+export class OneDriveError extends RemoteError {
+  constructor(...args: ConstructorParameters<typeof RemoteError>) {
+    super(...args);
     this.name = "OneDriveError";
-    this.type = type;
-    this.statusCode = statusCode;
-    this.retryAfterSeconds = retryAfterSeconds;
-    this.graphCode = graphError?.code ?? graphCode;
-    this.graphError = graphError;
-    this.requestTimeoutMs = requestTimeoutMs;
-  }
-
-  get graphMessage(): string | null {
-    return this.graphError?.message ?? null;
-  }
-
-  get graphInnerCode(): string | null {
-    return this.graphError?.innerCode ?? null;
-  }
-
-  get graphRequestId(): string | null {
-    return this.graphError?.requestId ?? null;
   }
 }
 

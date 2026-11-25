@@ -17,6 +17,7 @@ import { SyncExecutor } from "../src/sync/sync-executor";
 import { UploadConcurrencyPolicy } from "../src/sync/upload-concurrency-policy";
 import type { StateManager } from "../src/sync/state-manager";
 import type { LocalScanner } from "../src/sync/local-scanner";
+import { SyncProgressStore } from "../src/sync/sync-progress";
 import {
   TEST_SYNC_SCOPE,
   makeActiveV2State,
@@ -57,6 +58,12 @@ async function makeScenario(input: {
     parentReference: { id: string };
   }>;
   state?: StateManager;
+  progressStore?: SyncProgressStore;
+  /** Replace the default complete scan; used to observe the scan stage's own
+   *  progress callback or to stop the round right after scanning. */
+  scanAll?: (
+    onProgress?: (current: number, total?: number) => void,
+  ) => Promise<unknown>;
 }): Promise<{ executor: SyncExecutor; state: StateManager }> {
   const entries: LocalFileEntry[] = [];
   for (const file of input.files) {
@@ -91,7 +98,7 @@ async function makeScenario(input: {
         getFiles: vi.fn().mockReturnValue([]),
         getName: vi.fn().mockReturnValue("testVault"),
       },
-      scanAll: vi.fn().mockResolvedValue({
+      scanAll: vi.fn(input.scanAll ?? (async () => ({
         entries,
         folders: [],
         folderScanComplete: true,
@@ -100,7 +107,7 @@ async function makeScenario(input: {
         failedPaths: [],
         skippedCount: 0,
         complete: true,
-      }),
+      }))),
       scanFile: vi.fn(async (path: string) => entryByPath.get(path) ?? null),
       inspectFile: vi.fn(async (path: string) => {
         const entry = entryByPath.get(path);
@@ -112,6 +119,8 @@ async function makeScenario(input: {
     } as unknown as LocalScanner,
     state,
     "testVault",
+    undefined,
+    input.progressStore,
   );
   return { executor, state };
 }
@@ -138,6 +147,80 @@ async function waitUntil(
     await sleep(2);
   }
 }
+
+describe("scan stage progress", () => {
+  function incompleteScan() {
+    return {
+      entries: [],
+      folders: [],
+      folderScanComplete: false,
+      folderScanFailures: [],
+      skippedLarge: [],
+      failedPaths: ["bad.md"],
+      skippedCount: 0,
+      complete: false,
+    };
+  }
+
+  it("publishes the scan's checked/total into the existing counter slot", async () => {
+    // The stage's own count must never enter the round's current/total (those
+    // mean settled plan items and do not exist during scanning). It reuses the
+    // one status counter slot; no new component or wording.
+    const progressStore = new SyncProgressStore();
+    const setPhaseMetric = vi.spyOn(progressStore, "setPhaseMetric");
+    const progressEvents: string[] = [];
+    const { executor } = await makeScenario({
+      files: [],
+      uploadFile: async () => {
+        throw new Error("no upload expected after an incomplete scan");
+      },
+      progressStore,
+      scanAll: async (onProgress) => {
+        onProgress?.(120, 500);
+        return incompleteScan();
+      },
+    });
+
+    const result = await executor.run("manual", {
+      onProgress: (_current, _total, currentFile) => {
+        progressEvents.push(currentFile);
+      },
+    });
+
+    expect(result.errors).toBe(1);
+    expect(setPhaseMetric).toHaveBeenCalledWith({
+      current: 120,
+      total: 500,
+      unit: "items",
+    });
+    // The lightweight UI refresh path runs on the same tick, so the counter
+    // does not wait for the next phase transition.
+    expect(progressEvents.length).toBeGreaterThan(1);
+  });
+
+  it("keeps the elapsed fallback when the denominator is not trustworthy", async () => {
+    // includePaths makes the vault file list an incomplete denominator. A
+    // count without a total is exactly the half-number the 2026-11-20 report
+    // removed; the slot must keep "elapsed" instead.
+    const progressStore = new SyncProgressStore();
+    const setPhaseMetric = vi.spyOn(progressStore, "setPhaseMetric");
+    const { executor } = await makeScenario({
+      files: [],
+      uploadFile: async () => {
+        throw new Error("no upload expected after an incomplete scan");
+      },
+      progressStore,
+      scanAll: async (onProgress) => {
+        onProgress?.(120, undefined);
+        return incompleteScan();
+      },
+    });
+
+    await executor.run("manual", {});
+
+    expect(setPhaseMetric).not.toHaveBeenCalled();
+  });
+});
 
 describe("live per-file progress", () => {
   it("counts settled files one by one while eight uploads are in flight", async () => {

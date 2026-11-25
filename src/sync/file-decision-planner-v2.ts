@@ -142,12 +142,18 @@ export function protectEasySyncSelfSyncPlan(
   items: readonly SyncPlanItem[],
   configDir: string,
   pluginId = "easy-sync",
+  installedPluginDir?: string,
 ): SyncPlanItem[] {
   return items.map((item) => {
     if (
       item.local
       && !item.remote
-      && isEasySyncSelfSyncFilePath(item.path, configDir, pluginId)
+      && isEasySyncSelfSyncFilePath(
+        item.path,
+        configDir,
+        pluginId,
+        installedPluginDir,
+      )
       && (
         item.type === SyncActionType.Conflict
         || item.type === SyncActionType.ConfirmLocalDelete

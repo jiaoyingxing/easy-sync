@@ -736,6 +736,8 @@ describe("Persistent remote delta state", () => {
       version: 1,
       localVersion: "0.9.13",
       remoteVersion: "0.9.12",
+      localIdentity: { id: "resojot", name: "Resojot" },
+      remoteIdentity: { id: "resojot", name: "Resojot" },
       files: [
         {
           path: `${root}/main.js`,
@@ -1562,6 +1564,64 @@ describe("Persistent remote delta state", () => {
     expect(harness.state.mutationLedger).toHaveLength(1);
   });
 
+  it("settles a bundle whose suspended review row recorded older facts than the review shows", async () => {
+    // 真实现场（2026-11-20）：降级核对行在 17:45 挂起，插件 20:37 在本机被
+    // 更新；计划守卫为避免「核对卡住」保留旧行不重写，于是行的决策令牌一直
+    // 停在挂起那一刻的事实，而核对弹框读到的是当前事实。结算自证要求两者逐
+    // 字节一致，结果用户每点一次都得到通用的「结算证据无效」，两个方向都出不去。
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: paths,
+      local: {
+        [paths[0]]: "updated local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "updated local styles",
+      },
+      remote: {
+        [paths[0]]: "remote code",
+        [paths[1]]: manifest,
+        [paths[2]]: "remote styles",
+      },
+      // 行里记的是插件更新前的事实。
+      staleConflictLocal: {
+        [paths[0]]: "older local code",
+        [paths[2]]: "older local styles",
+      },
+    });
+
+    const reviewed = await harness.executor.getCommunityPluginBundleReviewSnapshot(
+      "resojot",
+    );
+    expect(reviewed?.bundleReview?.executableChoices)
+      .toEqual(["keep-local", "keep-remote"]);
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    // 结算成功：两端不同的成员上传成当前本机版本（manifest 两端一致，不上传），
+    // 旧证据与冲突行归零。
+    expect(harness.uploadFile.mock.calls.map(([, memberPath]) => memberPath).sort())
+      .toEqual([paths[0], paths[2]].sort());
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    for (const path of paths) {
+      expect(new Uint8Array(harness.remoteFiles.get(path)!.bytes))
+        .toEqual(new Uint8Array(harness.localBytes.get(path)!));
+    }
+  });
+
   it("resumes a persisted whole-plugin choice after local replacement but before receipts", async () => {
     const root = ".obsidian/plugins/resojot";
     const path = `${root}/main.js`;
@@ -2048,7 +2108,7 @@ describe("Persistent remote delta state", () => {
     expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
   });
 
-  it("fails both bundle directions closed when manifest identities disagree", async () => {
+  it("offers both bundle directions for review when manifest identities disagree", async () => {
     const root = ".obsidian/plugins/resojot";
     const path = `${root}/main.js`;
     const manifest = (id: string) => JSON.stringify({
@@ -2069,19 +2129,72 @@ describe("Persistent remote delta state", () => {
       },
     });
 
-    expect(await harness.executor.getMutationRecoveryResolutionSnapshot())
-      .toMatchObject({
-        bundleReview: {
-          pluginId: "resojot",
-          local: { available: false, reason: "identity-mismatch" },
-          remote: { available: false, reason: "identity-mismatch" },
-          executionReady: false,
-        },
-        keepLocal: { available: false },
-        keepRemote: { available: false },
-      });
+    // Identity drift (2026-11-23): both sides are complete bundles, so the
+    // user reviews and picks one; ordinary sync still never moves either side
+    // on its own (the identity gate keeps failing the bundle closed).
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    expect(reviewed).toMatchObject({
+      bundleReview: {
+        pluginId: "resojot",
+        local: { available: true },
+        remote: { available: true },
+        executionReady: true,
+        executableChoices: ["keep-local", "keep-remote"],
+      },
+      keepLocal: { available: true },
+      keepRemote: { available: true },
+    });
+    // The notice names both plugins; without them the choice is blind.
+    expect(reviewed?.bundlePresentation?.localIdentity)
+      .toEqual({ id: "resojot", name: "resojot" });
+    expect(reviewed?.bundlePresentation?.remoteIdentity)
+      .toEqual({ id: "another-plugin", name: "another-plugin" });
     expect(harness.uploadFile).not.toHaveBeenCalled();
     expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+  });
+
+  it("settles an identity drift by replacing the cloud side with the kept local bundle", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [`${root}/main.js`, `${root}/manifest.json`];
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: paths,
+      local: {
+        [paths[0]]: "local code",
+        [paths[1]]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "1.0.0",
+        }),
+      },
+      remote: {
+        [paths[0]]: "remote code",
+        [paths[1]]: JSON.stringify({
+          id: "another-plugin",
+          name: "Another",
+          version: "9.9.9",
+        }),
+      },
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const resolved = await harness.executor.resolveMutationRecovery(
+      reviewed!,
+      "keep-local",
+    );
+
+    expect(resolved).toBe(true);
+    // Both members are pushed local→cloud; the cloud now declares the local
+    // identity, so the next round's identity gate has nothing to block.
+    expect(harness.uploadFile.mock.calls.map(([, path]) => path))
+      .toEqual([paths[0], paths[1]]);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    const remoteManifest = JSON.parse(
+      new TextDecoder().decode(harness.remoteFiles.get(paths[1])!.bytes),
+    );
+    expect(remoteManifest.id).toBe("resojot");
   });
 
   it("retires an intent-only plugin-code upload when its owner explicitly exits this device scope", async () => {
@@ -2124,6 +2237,92 @@ describe("Persistent remote delta state", () => {
       .toBe(localBefore);
     expect(new TextDecoder().decode(harness.remoteFiles.get(path)!.bytes))
       .toBe(remoteBefore);
+  });
+
+  it("retires its own intent-only plugin-code upload after the exit already left the scope", async () => {
+    // 现场（2026-11-23，iOS 1.7.1）：退出命令先落盘、投影随即把该插件移出
+    // 选中集合，而第二次准入仍要求「仍在选中」。于是同一条记录永远过不去，
+    // 整库停在 recovery。这里把退出之后的真实现场钉住：插件目录已删、
+    // 当前策略已不再选中它，记录仍然必须能被同一个退出通道零写入销账。
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: { [path]: "older local plugin code" },
+      remote: {
+        [path]: "newer remote plugin code",
+        [`${root}/manifest.json`]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "0.9.13",
+        }),
+      },
+      // 退出后本机该插件整目录消失：只剩云端那份上传产物。
+      localExcludedByCurrentScope: true,
+    });
+    // 投影已经把 resojot 移出选中集合（exit-requested 不在投影里），并把
+    // 扫描器的路径范围一并收窄——真实宿主里这两件事同时发生，所以下面两道
+    // 门在退出后都是「假」：该路径不在当前范围、该插件也不再被选中。
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "selected", pluginIds: [] },
+      data: { mode: "none", pluginIds: [] },
+    });
+    Object.assign(
+      (harness.executor as unknown as { scanner: object }).scanner,
+      { shouldSyncPath: () => false, shouldSyncFolderPath: () => false },
+    );
+    const remoteBefore = new TextDecoder().decode(
+      harness.remoteFiles.get(path)!.bytes,
+    );
+
+    expect(
+      harness.executor.inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
+        (pluginId) => pluginId === "resojot",
+      ),
+    ).toHaveLength(1);
+
+    await expect(
+      harness.executor.retireSelectedPluginCodeUploadRecoveriesForScopeExit(
+        (pluginId) => pluginId === "resojot",
+      ),
+    ).resolves.toBe(true);
+
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.downloadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(harness.remoteFiles.get(path)!.bytes))
+      .toBe(remoteBefore);
+  });
+
+  it("does not retire a plugin-code upload whose plugin is still selected", async () => {
+    // 反向控制：插件没退出（仍在选中集合）时，这条通道不得替它销账——
+    // 退出证据是「本机不再参与」，不是「这条记录无法核销」。
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: { [path]: "older local plugin code" },
+      remote: { [path]: "newer remote plugin code" },
+    });
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "selected", pluginIds: ["resojot"] },
+      data: { mode: "none", pluginIds: [] },
+    });
+
+    await expect(
+      harness.executor.retireSelectedPluginCodeUploadRecoveriesForScopeExit(
+        () => false,
+      ),
+    ).resolves.toBe(false);
+
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
   });
 
   it("does not retire unrelated recovery during plugin scope exit", async () => {

@@ -31,6 +31,7 @@
  */
 
 import type { DataAdapter } from "obsidian";
+import type { LanContentHint } from "./lan-content-source";
 import type {
   DeltaPageCallback,
   DeltaResponse,
@@ -44,6 +45,7 @@ import type {
   OneDriveMetadataReason,
   SharedSyncProtocolBindingProvenObject,
 } from "../onedrive/client";
+import type { ProviderCapabilities } from "./provider-capabilities";
 
 // ---- 逐字镜像块：client.ts 私有类型（未导出，无法 import，同形声明）----
 
@@ -143,11 +145,16 @@ interface SharedSyncProtocolObjectsObservation {
  * 同步引擎对云端客户端的消费合同（刀 5a 插座）。
  *
  * 方法集 = SyncExecutor 的 `this.onedrive.*` 实调（30 个方法）＋引擎内
- * cloud-bootstrap 传输工厂实调（4 个方法）。签名逐字复制自 OneDriveClient
- * 对应公开方法；客户端侧带默认值的参数在这里以可选参数表达（接口不能
- * 携带默认值，函数类型层面等价）。
+ * cloud-bootstrap 传输工厂实调（4 个方法），共 34 个方法；另加 1 个只读能力
+ * 属性（14 位静态声明）。签名逐字复制自 OneDriveClient 对应公开方法；客户端
+ * 侧带默认值的参数在这里以可选参数表达（接口不能携带默认值，函数类型层面
+ * 等价）。
  */
 export interface SyncProvider {
+  // ---- 能力声明（静态事实；无 I/O、无 await、无每轮参数） ----
+  /** 本提供方的能力声明；B1 起为必填只读属性，引擎在后续行为切片才读取。 */
+  readonly capabilities: ProviderCapabilities;
+
   // ---- 运行度量与中断 ----
   setAbortSignal(signal: AbortSignal | null): void;
   beginRunMetrics(): void;
@@ -181,6 +188,7 @@ export interface SyncProvider {
     vaultName: string,
     filePaths: readonly string[],
     metadataReason?: OneDriveMetadataReason,
+    options?: { chunkConcurrency?: number },
   ): Promise<Map<string, DriveItem | null>>;
   listFolderChildrenById(driveItemId: string): Promise<DriveItem[]>;
   getFileMetadata(
@@ -247,6 +255,35 @@ export interface SyncProvider {
     fileSize?: number,
     expectedSha256?: string,
     onProgress?: (downloaded: number, total: number) => void,
+  ): Promise<DownloadToPathResult>;
+  /** S4: true only when the user switch, an installed source and the
+   *  per-file threshold all allow an attempt. The executor uses this before
+   *  building any LAN hint, so default-off downloads keep the exact cloud
+   *  call shape. */
+  shouldAttemptLan?(fileSize: number): boolean;
+  /** S2a optional LAN-first variants. Providers that do not implement them
+   *  keep the unchanged cloud methods; the executor only calls them when a
+   *  remote sha256 hint exists. */
+  downloadFileWithLan?(
+    vaultName: string,
+    filePath: string,
+    downloadUrl: string | undefined,
+    driveItemId: string | undefined,
+    fileSize: number,
+    onProgress: ((downloaded: number, total: number) => void) | undefined,
+    lanHint: LanContentHint,
+  ): Promise<ArrayBuffer>;
+  downloadFileToPathWithLan?(
+    vaultName: string,
+    filePath: string,
+    localPath: string,
+    adapter: DataAdapter,
+    downloadUrl: string | undefined,
+    driveItemId: string | undefined,
+    fileSize: number,
+    expectedSha256: string | undefined,
+    onProgress: ((downloaded: number, total: number) => void) | undefined,
+    lanHint: LanContentHint,
   ): Promise<DownloadToPathResult>;
   deleteItem(
     vaultName: string,
@@ -318,3 +355,9 @@ const oneDriveClientImplementsSyncProvider: OneDriveClientImplementsSyncProvider
   true;
 // 断言常量只在本文件消费（防漂移检查不外泄成导出面）；void 保持零运行时行为。
 void oneDriveClientImplementsSyncProvider;
+// capabilities 必须是必填属性：写成可选会让 OneDrive 漏声明也通过合同检查，
+// 因为 `ProviderCapabilities | undefined` 会让 `undefined extends ...` 成立。
+type SyncProviderCapabilitiesRequired =
+  undefined extends SyncProvider["capabilities"] ? never : true;
+const syncProviderCapabilitiesRequired: SyncProviderCapabilitiesRequired = true;
+void syncProviderCapabilitiesRequired;

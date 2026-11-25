@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
 import { planFolderStateV2 } from "../src/sync/folder-state-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import type {
   FolderAnchorV2,
   SyncAnchorV2,
@@ -83,7 +84,12 @@ function envelope(input: {
       committedAt: 1,
     },
     scope,
-    remoteIndex: buildRemoteIndexV2(remoteItems, scope.filesRootId, null, 1).index,
+    remoteIndex: buildRemoteIndexV2(
+      toRemoteScanFactsV1(remoteItems),
+      scope.filesRootId,
+      null,
+      1,
+    ).index,
     anchors: {
       schemaVersion: 2,
       byAnchorId: Object.fromEntries(

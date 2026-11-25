@@ -2,8 +2,9 @@
 // 传输阶段先把全部 2,000 个 downloadUrl 一次取完（20 个一组 ⇒ ~100 次串行
 // `$batch` POST，实测 5.8 秒/次），期间零字节传输，两轮分别 297 秒 / 260 秒
 // 被取消且 0 B 落盘。这里锁住替代行为的三条：
-// 1. 同一次批量刷新调用仍在（一次调用、请求形状与 20-id 分块不变），但每一块
-//    一解析出来就发布，第一批下载在该块之后立刻开始，后续块与内容传输重叠；
+// 1. 刷新按块解析、按块发布，第一批下载在该块之后立刻开始，后续块与内容传输
+//    重叠；2026-11-19 起首块只有 8 个 id（`$batch` 自身延迟随子请求数增长），
+//    让第一批更早开跑，其余仍按 20-id 分块；
 // 2. 刷新调用在发布第一块后整个失败时，已发布的那一块照常下载，只有没读到的
 //    尾部退回现有的逐批刷新路径，整轮不退化；
 // 3. 某一小批的地址刷新失败只让那一批失败，其余批次照常下载、照常提交。
@@ -21,8 +22,11 @@ import {
 } from "./helpers/sync-safety-harness";
 
 const CONTENT = new Uint8Array(18).fill(7).buffer;
-/** Graph's own per-request cap; the lookahead must not change it. */
+/** Graph's own per-request cap. */
 const REFRESH_CHUNK = 20;
+/** Head chunk of the lookahead (2026-11-19): the first transfer batch waits
+ *  only for these ids, so they are published before the rest is read. */
+const HEAD_CHUNK = 8;
 
 type ChunkObserver = (resolved: ReadonlyMap<string, DriveItem>) => void;
 
@@ -231,11 +235,11 @@ describe("download URL refresh lookahead (2026-10-27)", () => {
     expect(state.baseSnapshot).toHaveLength(entries.length);
     expect(state.mutationLedger).toEqual([]);
 
-    // One batched refresh call, same request shape as before (every missing id
-    // in plan order, one `$batch` per 20) — the pipeline is not a re-chunking
-    // of it.
-    expect(refreshCalls).toHaveLength(1);
-    expect([...refreshCalls[0]].sort())
+    // Two batched refresh calls (2026-11-19): a head chunk of 8 ids that the
+    // first transfer batch waits for, then the rest in ordinary 20-id chunks.
+    expect(refreshCalls).toHaveLength(2);
+    expect(refreshCalls[0]).toHaveLength(HEAD_CHUNK);
+    expect([...refreshCalls.flat()].sort())
       .toEqual(entries.map((entry) => entry.driveId).sort());
 
     // Timeline: chunk 1 published → first transfer started (while chunks 2-3
@@ -320,12 +324,16 @@ describe("download URL refresh lookahead (2026-10-27)", () => {
     expect(state.baseSnapshot).toHaveLength(entries.length);
     expect(state.mutationLedger).toEqual([]);
 
-    // The first chunk's URLs survived the failure: the published 20 ids are
-    // never re-read, and the fallback only covers the tail after them.
-    expect([...refreshCalls[0]].sort())
-      .toEqual(entries.map((entry) => entry.driveId).sort());
-    const publishedIds = refreshCalls[0].slice(0, REFRESH_CHUNK);
-    const fallbackCalls = refreshCalls.slice(1);
+    // The head chunk's 8 URLs survived the failure, and the rest call had
+    // already published its first 20-id chunk: neither is re-read, and the
+    // fallback only covers the tail after them.
+    expect(refreshCalls[0]).toHaveLength(HEAD_CHUNK);
+    expect(refreshCalls[1]).toHaveLength(entries.length - HEAD_CHUNK);
+    const publishedIds = [
+      ...refreshCalls[0],
+      ...refreshCalls[1].slice(0, REFRESH_CHUNK),
+    ];
+    const fallbackCalls = refreshCalls.slice(2);
     expect(fallbackCalls.length).toBeGreaterThan(0);
     for (const ids of fallbackCalls) {
       expect(ids.length).toBeLessThanOrEqual(4);
@@ -397,7 +405,17 @@ describe("download URL refresh lookahead (2026-10-27)", () => {
     expect(result.downloaded).toBe(entries.length - failedPaths.size);
     expect(localStore.files.size).toBe(entries.length - failedPaths.size);
     for (const path of failedPaths) expect(localStore.files.has(path)).toBe(false);
-    expect(localStore.files.has(entries[entries.length - 1].path)).toBe(true);
+    // A file that sorts after every failed one still downloaded: the failure
+    // did not stop the batches that follow it.
+    const sortedPaths = entries.map((entry) => entry.path).sort();
+    const lastFailedIndex = Math.max(
+      ...sortedPaths.map((path, index) => (failedPaths.has(path) ? index : -1)),
+    );
+    expect(
+      sortedPaths
+        .slice(lastFailedIndex + 1)
+        .some((path) => localStore.files.has(path)),
+    ).toBe(true);
     expect(state.baseSnapshot).toHaveLength(entries.length - failedPaths.size);
     expect(state.mutationLedger).toEqual([]);
   });

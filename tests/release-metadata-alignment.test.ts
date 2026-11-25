@@ -28,7 +28,15 @@ interface ReleaseMetadataFiles {
   versions: Record<string, string> | null;
   packageLock: {
     version?: string;
-    packages?: Record<string, { version?: string }>;
+    packages?: Record<
+      string,
+      {
+        version?: string;
+        resolved?: string;
+        integrity?: string;
+        dependencies?: Record<string, string>;
+      }
+    >;
   } | null;
 }
 
@@ -137,6 +145,32 @@ function collectMetadataIssues(files: ReleaseMetadataFiles): {
     }
   }
 
+  // 2026-11-21：第三方包的 `version` 与 `resolved` 必须指向同一个版本。
+  //
+  // 背景是一次真实的版本 bump 事故：把插件版本 `1.7.0 → 1.7.1` 做全文替换时
+  // 连 `node_modules/esquery` 的 `version` 也改成了 `1.7.1`，而它的 `resolved`
+  // 仍指向 `esquery-1.7.0.tgz`、`integrity` 也是 1.7.0 的哈希。这一处不一致
+  // 在本地安装时不会报错（npm 认 `resolved`／`integrity`），却让锁文件说谎：
+  // 任何人按它审计依赖版本都会得到错误结论。既有门禁只比根版本，看不见它。
+  if (packageLock?.packages) {
+    for (const [path, entry] of Object.entries(packageLock.packages)) {
+      if (path === "" || !entry) continue;
+      const declared = entry.version;
+      const resolved = entry.resolved;
+      if (typeof declared !== "string" || typeof resolved !== "string") continue;
+      if (!SEMVER.test(declared)) continue;
+      // 只校验 npm registry 的 tarball 形态：其它形态（本地链接、workspace、
+      // git 依赖）没有可比的版本段，跳过。
+      const match = /\/(?:-\/)?[^/]+-(\d+\.\d+\.\d+)\.tgz$/.exec(resolved);
+      if (!match) continue;
+      if (match[1] !== declared) {
+        issues.push(
+          `package-lock.json ${path}: version=${declared} but resolved points at ${match[1]} (${resolved})`,
+        );
+      }
+    }
+  }
+
   return { issues, warnings };
 }
 
@@ -185,6 +219,41 @@ describe("release metadata alignment gate", () => {
     };
     expect(collectMetadataIssues(aligned).issues).toEqual([]);
 
+    // 反假绿：自洽的第三方条目不能被误报（规则只在真漂移时说话）。
+    const withConsistentDependency: ReleaseMetadataFiles = {
+      ...aligned,
+      packageLock: {
+        version: "1.6.0",
+        packages: {
+          "": { version: "1.6.0" },
+          "node_modules/example": {
+            version: "3.2.1",
+            resolved: "https://registry.npmjs.org/example/-/example-3.2.1.tgz",
+          },
+          "node_modules/scoped": {
+            version: "1.6.0",
+            resolved: "https://registry.npmjs.org/@scope/scoped/-/scoped-1.6.0.tgz",
+          },
+        },
+      },
+    };
+    expect(collectMetadataIssues(withConsistentDependency).issues).toEqual([]);
+    // 整个插件版本恰好等于某个依赖版本时也不该误报。
+    const coincidence: ReleaseMetadataFiles = {
+      ...aligned,
+      packageLock: {
+        version: "1.6.0",
+        packages: {
+          "": { version: "1.6.0" },
+          "node_modules/esquery": {
+            version: "1.6.0",
+            resolved: "https://registry.npmjs.org/esquery/-/esquery-1.6.0.tgz",
+          },
+        },
+      },
+    };
+    expect(collectMetadataIssues(coincidence).issues).toEqual([]);
+
     const drifted: Array<[string, ReleaseMetadataFiles]> = [
       ["manifest version drift", { ...aligned, manifest: { ...aligned.manifest!, version: "1.6.1" } }],
       ["lock version drift", { ...aligned, packageLock: { ...aligned.packageLock!, version: "1.5.9" } }],
@@ -210,6 +279,22 @@ describe("release metadata alignment gate", () => {
       [
         "author drift",
         { ...aligned, manifest: { ...aligned.manifest!, author: "Someone Else" } },
+      ],
+      [
+        "third-party resolved drift",
+        {
+          ...aligned,
+          packageLock: {
+            version: "1.6.0",
+            packages: {
+              "": { version: "1.6.0" },
+              "node_modules/example": {
+                version: "1.6.0",
+                resolved: "https://registry.npmjs.org/example/-/example-1.5.9.tgz",
+              },
+            },
+          },
+        },
       ],
     ];
 

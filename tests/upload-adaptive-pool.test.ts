@@ -14,7 +14,10 @@ import { SyncExecutor } from "../src/sync/sync-executor";
 import type { StateManager } from "../src/sync/state-manager";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { DiagnosticLogger } from "../src/sync/diagnostic-logger";
-import { UploadConcurrencyPolicy } from "../src/sync/upload-concurrency-policy";
+import {
+  DESKTOP_UPLOAD_MAX_CONCURRENCY,
+  UploadConcurrencyPolicy,
+} from "../src/sync/upload-concurrency-policy";
 import {
   OneDriveError,
   OneDriveErrorType,
@@ -246,6 +249,38 @@ describe("adaptive upload pool", () => {
     expect(batches.at(-1)).toBe(8);
   });
 
+  it("starts the next round at the depth the previous round settled on", async () => {
+    // Warm start (2026-11-19): the same executor runs two rounds. The first
+    // climbs to the ceiling; the second must construct its policy there instead
+    // of restarting at two, which is what the per-round floor used to do.
+    const uploadFile = vi.fn(async (_vault: string, path: string) => {
+      await sleep(20);
+      return okUpload(path);
+    });
+    const fileCount = BATCH * 3;
+    const sizes = Array.from(
+      { length: fileCount },
+      (_, index) => 8 * 2 ** Math.floor(index / 4),
+    );
+    const scenario = await makePoolScenario({ fileCount, sizes, uploadFile });
+
+    await scenario.executor.run("manual", {});
+
+    const settled = scenario.lines
+      .filter((line) => line.msg === "upload batch settled")
+      .map((line) => line.data.concurrency);
+    expect(settled.at(-1)).toBe(DESKTOP_UPLOAD_MAX_CONCURRENCY);
+
+    const second = await scenario.executor.run("auto", {});
+
+    expect(second.success).toBe(true);
+    const pools = scenario.lines.filter((line) => line.msg.startsWith("pools —"));
+    expect(pools).toHaveLength(2);
+    expect(pools[1].msg).toContain(
+      `adaptive ${DESKTOP_UPLOAD_MAX_CONCURRENCY}→${DESKTOP_UPLOAD_MAX_CONCURRENCY}`,
+    );
+  });
+
   it("lets a freed slot take the next file instead of waiting for a slow one", async () => {
     const events: Array<{ kind: "start" | "end"; path: string }> = [];
     const uploadFile = vi.fn(async (_vault: string, path: string) => {
@@ -400,10 +435,20 @@ describe("adaptive upload pool", () => {
 
     expect(cancelled.success).toBe(false);
     expect(first.uploadFile.mock.calls.length).toBeLessThan(BATCH + 4);
-    // One batch is in flight at most: its intents are durable, and the members
-    // that never reached their PUT stay intent-only for the next round.
+    // One batch was written before its first PUT, so the settled ledger never
+    // exceeds BATCH. It can sit below BATCH: a member already dispatched when
+    // the cancel lands may return before its mutation applies, and the
+    // per-item path then abandons that durable intent (there is no remote
+    // side effect to recover). The full batch write is pinned separately by
+    // the diagnostic row below.
     const ledger: MutationLedgerEntryV1[] = first.state.mutationLedger;
-    expect(ledger.length).toBe(BATCH);
+    expect(ledger.length).toBeGreaterThan(0);
+    expect(ledger.length).toBeLessThanOrEqual(BATCH);
+    expect(ledger.every((record) => record.intent.path.startsWith("pool-")))
+      .toBe(true);
+    const settledBatch = first.lines.find((line) =>
+      line.msg === "upload batch settled" && line.data.batch === 0);
+    expect(settledBatch?.data.intents).toBe(BATCH);
     const receipted = ledger.filter((record) => record.receipt !== null);
     const intentOnly = ledger.filter((record) => record.receipt === null);
     expect(receipted.length).toBeGreaterThan(0);

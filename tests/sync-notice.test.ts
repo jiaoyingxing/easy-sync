@@ -250,10 +250,16 @@ describe("resolveSyncProgressNoticePresentation", () => {
     for (const phase of [
       "idle",
       "scanning",
+      "recovering",
       "preparing",
       "baseline",
       "checking",
+      "planningRecords",
       "planning",
+      "savingPlan",
+      "establishingSync",
+      "preparingAction",
+      "committing",
     ] as const) {
       expect(resolveSyncProgressNoticePresentation(progress({ phase })))
         .toMatchObject({ showProgressBar: false });
@@ -273,6 +279,68 @@ describe("resolveSyncProgressNoticePresentation", () => {
     }))).toMatchObject({ showProgressBar: true });
     expect(resolveSyncProgressNoticePresentation(progress({ phase: "executing" })))
       .toMatchObject({ showProgressBar: false });
+  });
+
+  it("joins a phase count into the same notice text without a bar", () => {
+    const i18n = new I18n("zh-cn");
+    const presentation = resolveSyncProgressNoticePresentation(progress({
+      phase: "planningRecords",
+      phaseMetric: { current: 3, total: 10, unit: "batches" },
+    }));
+
+    expect(presentation).toMatchObject({
+      kind: "stage",
+      determinate: false,
+      showProgressBar: false,
+      metric: { kind: "count", current: 3, total: 10, unit: "batches" },
+    });
+    expect(formatSyncProgressNoticeLabel(presentation, i18n.t.bind(i18n)))
+      .toBe("☁️ 整理同步记录 3/10批");
+  });
+
+  it("holds a young stage and its count until the readable window closes", () => {
+    const i18n = new I18n("zh-cn");
+    const now = 1_000_000;
+    const young = progress({
+      phase: "planningRecords",
+      startedAt: now,
+      phaseStartedAt: now,
+      phaseMetric: { current: 3, total: 10, unit: "batches" },
+    });
+
+    const withheld = resolveSyncProgressNoticePresentation(young, now);
+    expect(withheld).toMatchObject({
+      kind: "stage",
+      determinate: false,
+      showProgressBar: false,
+    });
+    expect(withheld.metric).toBeUndefined();
+    expect(formatSyncProgressNoticeLabel(withheld, i18n.t.bind(i18n)))
+      .toBe("☁️ 同步进行中…");
+
+    const revealed = resolveSyncProgressNoticePresentation(young, now + 300);
+    expect(revealed).toMatchObject({
+      kind: "stage",
+      metric: { kind: "count", current: 3, total: 10, unit: "batches" },
+    });
+    expect(formatSyncProgressNoticeLabel(revealed, i18n.t.bind(i18n)))
+      .toBe("☁️ 整理同步记录 3/10批");
+  });
+
+  it("keeps a bare zero out of the notice text", () => {
+    const i18n = new I18n("zh-cn");
+    const now = 1_000_000;
+    const checking = progress({
+      phase: "checking",
+      startedAt: now - 2_000,
+      phaseStartedAt: now - 2_000,
+      phaseMetric: { current: 0, unit: "items" },
+    });
+    const presentation = resolveSyncProgressNoticePresentation(checking, now);
+    expect(presentation.kind).toBe("stage");
+    expect(presentation.metric).toBeUndefined();
+    expect(formatSyncProgressNoticeLabel(presentation, i18n.t.bind(i18n)))
+      .toBe("☁️ 检查云端变更…");
   });
 
   it("uses whole-run progress only when execution has a known total", () => {
@@ -351,7 +419,7 @@ describe("resolveSyncProgressNoticePresentation", () => {
     expect(formatSyncProgressNoticeLabel(
       presentation,
       new I18n("zh-cn").t.bind(new I18n("zh-cn")),
-    )).toBe("☁️ 正在核验云端文件 7/10");
+    )).toBe("☁️ 核验云端文件 7/10");
   });
 
   it("formats the visible lifecycle sequence with concise localized text", () => {

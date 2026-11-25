@@ -114,6 +114,7 @@ export function createMockElement(): HTMLElement {
       contains: (token: string) => classTokens.has(token),
     },
     children: [] as unknown[],
+    dataset: {} as Record<string, string>,
     innerHTML: "",
     textContent: "",
     style: {} as Record<string, string>,
@@ -479,6 +480,8 @@ export class ButtonComponent {
 export class ToggleComponent {
   static instances: ToggleComponent[] = [];
   value = false;
+  disabled = false;
+  toggleEl = createMockElement();
   private onChangeCallback: ((value: boolean) => void | Promise<void>) | null = null;
 
   constructor(_containerEl: HTMLElement) {
@@ -486,6 +489,10 @@ export class ToggleComponent {
   }
   setValue(value: boolean): this {
     this.value = value;
+    return this;
+  }
+  setDisabled(disabled: boolean): this {
+    this.disabled = disabled;
     return this;
   }
   onChange(callback: (value: boolean) => void | Promise<void>): this {
@@ -726,6 +733,12 @@ export class Setting {
   constructor(_containerEl: HTMLElement) {}
   setName(_name: string): this { return this; }
   setDesc(_desc: string): this { return this; }
+  /** 宿主 1.13.0 起的字段级错误态：标红该行并在下方显示红字。 */
+  errorEl: HTMLElement | null = null;
+  setErrorMessage(message: string | null): this {
+    this.errorEl = message === null ? null : createMockElement();
+    return this;
+  }
   setClass(_cls: string): this { return this; }
   addButton(callback: (component: ButtonComponent) => void): this {
     callback(new ButtonComponent({} as HTMLElement));

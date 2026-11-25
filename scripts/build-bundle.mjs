@@ -7,7 +7,7 @@
 // 运行时即可对照「代码内版本」与 manifest 版本（诊断报告技术节），不一致可被看见。
 //
 // esbuild 选项与原先内联命令逐字等价（JS API 与 CLI 产物已实测逐字节相同），
-// 只多一个 --define；值取自 package.json，确定性不变。
+// 只多一个 --define；版本值取自 package.json，确定性不变。
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,8 @@ await build({
   format: "cjs",
   target: "es2020",
   outfile: path.join(root, "main.js"),
-  define: { __EASY_SYNC_BUILD_VERSION__: JSON.stringify(version) },
+  define: {
+    __EASY_SYNC_BUILD_VERSION__: JSON.stringify(version),
+  },
   logLevel: "info",
 });

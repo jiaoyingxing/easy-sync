@@ -74,6 +74,23 @@ export class CommunityPluginIdentityBlockError extends Error {
   }
 }
 
+/** File-level route for one identity block: the three shapes carry different
+ *  user exits, so their pending-issue rows must not be told apart by message
+ *  text. Classification only — it never changes blocking behaviour. */
+export function communityPluginIdentityIssueCode(
+  error: CommunityPluginIdentityBlockError,
+): "plugin-manifest-invalid" | "plugin-identity-collision"
+  | "plugin-identity-drift" {
+  switch (error.kind) {
+    case "identity-ambiguous":
+      return "plugin-identity-collision";
+    case "identity-changed":
+      return "plugin-identity-drift";
+    default:
+      return "plugin-manifest-invalid";
+  }
+}
+
 const SAFE_PLUGIN_ID = /^[a-z0-9][a-z0-9_-]*$/i;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const BUNDLE_FILES = new Set<CommunityPluginBundleFileName>([

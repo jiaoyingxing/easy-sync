@@ -51,6 +51,17 @@ type UploadConcurrencyChangeCause =
   | "window-throughput"
   | "failure-streak";
 
+/** Warm start (2026-11-19): a completed round hands its settled limit to the
+ *  next round through this option. Without it every round restarts at the
+ *  per-round floor, so a 5–50 file round pays the whole ramp again — the
+ *  common case for incremental sync. The value is clamped into the platform
+ *  range here; the AIMD rules, the throttle halving and the failure streak are
+ *  unchanged, so a remembered value that the link cannot sustain still steps
+ *  down inside the new round. */
+interface UploadConcurrencyPolicyOptions {
+  initialConcurrency?: number;
+}
+
 export interface UploadConcurrencyChange {
   from: number;
   to: number;
@@ -84,6 +95,11 @@ interface UploadThrottlePause {
 
 /**
  * Per-round adaptive upload concurrency controller (AIMD, 2026-10-26).
+ *
+ * A round that follows a completed one starts at that round's settled limit
+ * (`UploadConcurrencyPolicyOptions`) instead of the per-round floor, so a short
+ * incremental round does not pay the whole ramp again. Cold starts and every
+ * other rule below are unchanged.
  *
  * Replaces the previous "any failed wave or batch-throughput dip locks the
  * rest of the round to serial" policy. That policy compared a mixed-size
@@ -126,13 +142,18 @@ export class UploadConcurrencyPolicy {
   private optimisticRamp: boolean;
   private pausedUntilMs = 0;
 
-  constructor(private readonly mobile: boolean) {
+  constructor(
+    private readonly mobile: boolean,
+    options: UploadConcurrencyPolicyOptions = {},
+  ) {
     this.maxConcurrency = mobile
       ? MOBILE_UPLOAD_MAX_CONCURRENCY
       : DESKTOP_UPLOAD_MAX_CONCURRENCY;
-    this.concurrency = mobile
-      ? MOBILE_INITIAL_CONCURRENCY
-      : DESKTOP_INITIAL_CONCURRENCY;
+    this.concurrency = warmStartConcurrency(
+      options.initialConcurrency,
+      mobile ? MOBILE_INITIAL_CONCURRENCY : DESKTOP_INITIAL_CONCURRENCY,
+      this.maxConcurrency,
+    );
     this.optimisticRamp = true;
   }
 
@@ -270,6 +291,25 @@ export class UploadConcurrencyPolicy {
     }
     return { from, to, ...detail };
   }
+}
+
+/** Clamp a remembered limit into the platform range. Only a usable number is
+ *  honored: anything non-finite or non-positive falls back to the round floor,
+ *  and the bottom of the range stays one — a round that stepped down to serial
+ *  must not be lifted back up by its own memory. */
+function warmStartConcurrency(
+  remembered: number | undefined,
+  floor: number,
+  max: number,
+): number {
+  if (
+    remembered === undefined
+    || !Number.isFinite(remembered)
+    || remembered <= 0
+  ) {
+    return floor;
+  }
+  return Math.min(max, Math.max(MIN_CONCURRENCY, Math.round(remembered)));
 }
 
 function medianOf(samples: readonly number[]): number {

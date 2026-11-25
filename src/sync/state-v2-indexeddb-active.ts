@@ -19,6 +19,7 @@ import {
 } from "./state-envelope-v2";
 import {
   addBuildPhaseMs,
+  isIndexedDbRecoveryRecordCollision,
   StateV2IndexedDbRecoveryStore,
   stateV2IndexedDbRecoveryEnvelopeDigest,
   type StateV2CommitTimings,
@@ -472,13 +473,61 @@ export class StateV2IndexedDbActiveStore {
         "IndexedDB active-state current revision does not match commit input",
       );
     }
-    const prepared = await this.recovery.prepareValidatedDelta(
+    if (databaseAtNext && !resumesPendingWitness) {
+      // A previous attempt already committed this exact sequence but stopped
+      // before its witness was durable. The database is the authority here:
+      // finish the chain for the envelope it holds, and never recompute
+      // recovery records for a session base that is behind it — that would
+      // collide with the already published delta and wedge every later commit
+      // until the app restarts.
+      const digestStartedAt = performance.now();
+      const nextDigest = await stateV2IndexedDbRecoveryEnvelopeDigest(next);
+      if (timings) timings.canonicalMs += performance.now() - digestStartedAt;
+      if (meta.stateDigest !== nextDigest) {
+        throw new StateV2IndexedDbActiveStateError(
+          "revision-mismatch",
+          "IndexedDB active-state database already advanced to this revision with a different state",
+        );
+      }
+      await this.recovery.confirmValidatedCommittedDelta(
+        next,
+        nextDigest,
+        timings,
+      );
+      this.currentEnvelope = next;
+      this.pendingWitnessCommit = null;
+      return {
+        alreadyCommitted: true,
+        commitSeq: next.meta.commitSeq,
+        stateDigest: nextDigest,
+        logicalWrites: 0,
+      };
+    }
+    const prepareDelta = () => this.recovery.prepareValidatedDelta(
       previous,
       next,
       databaseAtPrevious
         ? { previousEnvelopeDigest: meta.stateDigest, timings }
         : { timings },
     );
+    let prepared: Awaited<ReturnType<typeof prepareDelta>>;
+    try {
+      prepared = await prepareDelta();
+    } catch (error) {
+      if (!databaseAtPrevious || !isIndexedDbRecoveryRecordCollision(error)) {
+        throw error;
+      }
+      // The metadata above proves this sequence was never committed by this
+      // database, so the record already at its path is the leftover of an
+      // earlier failed attempt in this same session. Run the restart-time
+      // proof and retirement now, so the retry does not need a reload.
+      await this.recovery.retireUncommittedFutureDelta(
+        previous,
+        meta.stateDigest,
+        async () => this.assertExactActiveEnvelope(previous, meta.stateDigest),
+      );
+      prepared = await prepareDelta();
+    }
     if (
       databaseAtNext
       && meta.stateDigest === prepared.nextEnvelopeDigest

@@ -1290,7 +1290,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.localFolderPaths.has("Empty")).toBe(false);
   });
 
-  it("deletes a synced theme/snippet directory shell with the ordinary delete-local chain", async () => {
+  it("removes a synced theme/snippet directory shell the host hides from the vault index", async () => {
     const harness = makeHarness({
       base: [],
       local: [],
@@ -1312,6 +1312,18 @@ describe("V1 to V2 controlled production activation", () => {
         },
       ],
     });
+    // 真宿主把配置目录整棵子树排除在库索引外：`.obsidian` 及后代在
+    // `getAbstractFileByPath` 里都是 null（2026-11-25 宿主实测）。旧假体返回
+    // TFolder，掩盖了 FileManager 根本拿不到配置文件夹空壳的事实。
+    const resolveIndexed = harness.scanner.vault.getAbstractFileByPath
+      .getMockImplementation()!;
+    harness.scanner.vault.getAbstractFileByPath.mockImplementation(
+      (path: string) => (
+        path === ".obsidian" || path.startsWith(".obsidian/")
+          ? null
+          : resolveIndexed(path)
+      ),
+    );
     await harness.state.load();
     expect((await harness.executor.run(
       "manual",
@@ -1338,7 +1350,85 @@ describe("V1 to V2 controlled production activation", () => {
       errors: 0,
     });
     expect(harness.localFolderPaths.has(".obsidian/snippets")).toBe(false);
-    expect(harness.fileManager.trashFile).toHaveBeenCalled();
+    expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
+    expect(harness.rawAdapter.rmdir).toHaveBeenCalledWith(
+      ".obsidian/snippets",
+      false,
+    );
+  });
+
+  it("keeps a config-directory shell when the host refuses the folder removal", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [{ path: ".obsidian" }, { path: ".obsidian/snippets" }],
+      remoteItems: [
+        {
+          id: "folder-config",
+          name: ".obsidian",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-config",
+        },
+        {
+          id: "folder-snippets",
+          name: "snippets",
+          folder: {},
+          parentReference: { id: "folder-config" },
+          eTag: "etag-folder-snippets",
+        },
+      ],
+    });
+    const resolveIndexed = harness.scanner.vault.getAbstractFileByPath
+      .getMockImplementation()!;
+    harness.scanner.vault.getAbstractFileByPath.mockImplementation(
+      (path: string) => (
+        path === ".obsidian" || path.startsWith(".obsidian/")
+          ? null
+          : resolveIndexed(path)
+      ),
+    );
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.executor.setAutomaticHandlingPolicy({
+      autoDeleteLocalFiles: true,
+      mergeNonOverlappingText: true,
+    });
+    harness.remoteItemState.splice(
+      harness.remoteItemState.findIndex((item) => item.id === "folder-snippets"),
+      1,
+    );
+    const rmdir = harness.rawAdapter.rmdir as unknown as ReturnType<typeof vi.fn>;
+    const rmdirImpl = rmdir.getMockImplementation()!;
+    rmdir.mockImplementation(async (path: string, recursive = false) => {
+      if (path === ".obsidian/snippets") throw new Error("directory not empty");
+      return rmdirImpl(path, recursive);
+    });
+
+    const failed = await harness.executor.run("manual");
+
+    expect(failed).toMatchObject({
+      success: false,
+      foldersDeleted: 0,
+      errors: 1,
+    });
+    expect(harness.localFolderPaths.has(".obsidian/snippets")).toBe(true);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+
+    rmdir.mockImplementation(rmdirImpl);
+    const retried = await harness.executor.run("manual");
+    expect(retried).toMatchObject({
+      success: true,
+      foldersDeleted: 1,
+      errors: 0,
+    });
+    expect(harness.localFolderPaths.has(".obsidian/snippets")).toBe(false);
   });
 
   it("keeps a synced community-plugin directory shell deferred", async () => {

@@ -28,10 +28,11 @@ describe("plan reason vocabulary contract (刀 1)", () => {
   it("pins every reason literal byte-for-byte (digest safety)", () => {
     // 黄金快照：改任何一个字面值都会让此测试变红——那是摘要作废级改动，
     // 必须按方案单 §六.2 的在途计划策略另行走刀，不许顺手改。
-    expect(entries.length).toBe(39);
+    expect(entries.length).toBe(40);
     expect(PLAN_REASON.newFileBothSides).toBe("reason.newFileBothSides");
     expect(PLAN_REASON.bothSidesModified).toBe("reason.bothSidesModified");
     expect(PLAN_REASON.pluginDowngradeRemote).toBe("reason.pluginDowngradeRemote");
+    expect(PLAN_REASON.pluginIdentityDrift).toBe("reason.pluginIdentityDrift");
     expect(PLAN_REASON.renameIdentityAmbiguous).toBe("reason.renameIdentityAmbiguous");
     expect(PLAN_REASON.localDeletedRemoteModified).toBe("reason.localDeletedRemoteModified");
     expect(PLAN_REASON.remoteDeletedLocalModified).toBe("reason.remoteDeletedLocalModified");

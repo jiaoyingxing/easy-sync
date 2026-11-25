@@ -1,5 +1,5 @@
 import { AuthError } from "../auth/types";
-import { OneDriveError, OneDriveErrorType } from "../onedrive/types";
+import { RemoteError, RemoteErrorType } from "../remote/errors";
 
 /** Authentication and lifecycle termination must keep their run-level
  * semantics even when they arrive during protocol create/readback. Other
@@ -10,8 +10,8 @@ export function rethrowTerminalSharedSyncProtocolTransportError(
 ): void {
   if (error instanceof AuthError) throw error;
   if (
-    error instanceof OneDriveError
-    && error.type === OneDriveErrorType.AuthExpired
+    error instanceof RemoteError
+    && error.type === RemoteErrorType.AuthExpired
   ) {
     throw error;
   }

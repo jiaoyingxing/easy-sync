@@ -26,6 +26,10 @@ export const EASY_SYNC_RECOVERY_SUFFIX = ".easy-sync-recovery";
  * landed write, a strict prefix is our own truncation, an untouched old
  * version is a bounded rewrite, and anything unattributable stops without
  * touching the file (`DECISIONS` 2026-09-23 point 9).
+ *
+ * The remote modification time rides along as `DataWriteOptions.mtime` on the
+ * desktop only (see `restorableLocalMtime`); the landing judgment still reads
+ * bytes, never the timestamp.
  */
 
 const ANDROID_TARGET_WRITE_MAX_ATTEMPTS = 3;
@@ -78,15 +82,64 @@ export class LocalReplacementTruncatedError extends Error {
   }
 }
 
+/**
+ * 远端修改时间能否还原到本机文件（2026-11-22 用户拍板只做桌面）。
+ *
+ * 这是这条通道的**唯一裁决点**：平台门、可信性门都在这里。调用方只负责把
+ * 远端的 `mtime` 原样递进来，不要各自再判一次平台——规则散在多处时，新增一条
+ * 写入路径就很容易漏掉其中一半。
+ *
+ * 桌面宿主接受 `DataWriteOptions.mtime` 并原样落到文件系统：`vault.modify`、
+ * `adapter.writeBinary`、以及改名都保留该值（真宿主实测）。安卓宿主对 `.md`
+ * 覆盖会自己盖章、丢掉传入的 mtime（`vault.modify` 与 `writeBinary` 均如此），
+ * 而 `.md` 正是库内绝大多数文件，所以移动端不做这件事，保持宿主默认行为。
+ *
+ * 只接受可信时刻：不早于 1970-01-02 的有限值。缺时间、负值、非有限值，以及
+ * 历史状态里当占位符用的极小值（`mtime: 0`／`1`）一律不还原——把一个占位数字
+ * 写进用户文件的时间，比不还原更糟。
+ *
+ * 返回 `undefined` 表示「不传这个参数」，宿主会按自己的默认行为盖章。
+ */
+const EARLIEST_PLAUSIBLE_MTIME = Date.UTC(1970, 0, 2);
+
+export function restorableLocalMtime(
+  remoteMtime: number | undefined,
+  platform: HostPlatformFacts,
+): number | undefined {
+  if (!platform.isDesktopApp) return undefined;
+  if (remoteMtime === undefined || !Number.isFinite(remoteMtime)) {
+    return undefined;
+  }
+  if (remoteMtime < EARLIEST_PLAUSIBLE_MTIME) return undefined;
+  return remoteMtime;
+}
+
+/**
+ * 把裁决结果转成写入选项；`undefined` 时调用方**不传实参**，让宿主默认行为
+ * 逐字保持原样（有调用方桩按实参个数断言）。
+ *
+ * 这是 `restorableLocalMtime` 之后的**唯一转换点**：每一条写盘路径（暂存文件、
+ * 原地替换、直写）都只调用它，不各自写 `mtime === undefined ? undefined : …`。
+ * 转换散在三处时，新增一条写入路径就会漏掉其中一处——2026-11-22 review 在
+ * `sync-executor` 的冲突分支里就发现过一次内联复制。
+ */
+export function localMtimeWriteOptions(
+  mtime: number | undefined,
+): { mtime: number } | undefined {
+  return mtime === undefined ? undefined : { mtime };
+}
+
 interface InPlaceReplacementRequest {
   /** Host-visible identity of the target. Callers only route files the vault
    *  can name here: without it there is no open view to preserve, and the
    *  atomic swap stays the safer replacement. */
   file: TFile;
-  modify?: (file: TFile, data: string) => Promise<void>;
+  modify?: (file: TFile, data: string, options?: { mtime?: number }) => Promise<void>;
   adapter: DataAdapter;
   targetPath: string;
   content: ArrayBuffer;
+  /** 要还原到落盘文件的远端修改时间；缺席＝由宿主盖章（见 `restorableLocalMtime`）。 */
+  mtime?: number;
   /** Bytes the target held before this write. Used to undo a truncated write. */
   previousBytes?: ArrayBuffer | null;
   /**
@@ -129,6 +182,9 @@ export async function writeReplacementInPlace(
     ?? ((request.platform ?? hostPlatformFacts).isAndroidApp && content.byteLength > 0
       ? ANDROID_TARGET_WRITE_MAX_ATTEMPTS
       : DEFAULT_TARGET_WRITE_MAX_ATTEMPTS);
+  // `request.mtime` 已由调用方过 `restorableLocalMtime`（唯一裁决点）；这里只把
+  // 结果转成写选项。`undefined` 时不传实参，宿主默认行为逐字保持原样。
+  const writeOptions = localMtimeWriteOptions(request.mtime);
 
   let observed: ArrayBuffer | null = null;
   let arm: PostWriteArm = "unattributed";
@@ -138,7 +194,10 @@ export async function writeReplacementInPlace(
     writeFailure = null;
     try {
       if (useHostModify) {
-        await modify(file, text);
+        if (writeOptions) await modify(file, text, writeOptions);
+        else await modify(file, text);
+      } else if (writeOptions) {
+        await adapter.writeBinary(targetPath, content, writeOptions);
       } else {
         await adapter.writeBinary(targetPath, content);
       }

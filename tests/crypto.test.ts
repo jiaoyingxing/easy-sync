@@ -35,4 +35,55 @@ describe("OneDrive QuickXor primitive", () => {
     expect(quickXorHashBase64(new Uint8Array([3, 2, 1]).buffer)).not.toBe(first);
     expect(quickXorHashBase64(new Uint8Array([1, 2, 3, 0]).buffer)).not.toBe(first);
   });
+
+  /**
+   * The production function unrolls eight bytes at a time for speed. This
+   * reference implementation is the plain per-byte form the unrolled loop must
+   * reduce to; a divergence would silently corrupt local content identity.
+   */
+  function referenceQuickXorBase64(content: ArrayBuffer): string {
+    const input = new Uint8Array(content);
+    const output = new Uint8Array(20);
+    const bitWidth = output.length * 8;
+    let shift = 0;
+    for (let index = 0; index < input.length; index += 1) {
+      const byte = input[index];
+      const byteOffset = shift >> 3;
+      const bitOffset = shift & 7;
+      output[byteOffset] ^= (byte << bitOffset) & 0xff;
+      if (bitOffset !== 0) {
+        output[(byteOffset + 1) % output.length] ^= byte >> (8 - bitOffset);
+      }
+      shift += 11;
+      if (shift >= bitWidth) shift -= bitWidth;
+    }
+    const length = BigInt(input.byteLength);
+    for (let index = 0; index < 8; index += 1) {
+      output[12 + index] ^= Number((length >> BigInt(index * 8)) & 0xffn);
+    }
+    let binary = "";
+    for (const byte of output) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  }
+
+  it("matches the per-byte reference on every block boundary and tail", () => {
+    // Eight bytes per unrolled group, 88-bit cursor advance: cover every
+    // remainder 0..8 around several full wraps of the 160-bit cursor.
+    const sizes = [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+      15, 16, 17, 19, 20, 21, 39, 40, 41, 63, 64, 65,
+      159, 160, 161, 175, 176, 177, 255, 256, 257, 1000, 4096,
+    ];
+    for (const size of sizes) {
+      for (const seed of [1, 37, 255]) {
+        const bytes = new Uint8Array(size);
+        for (let index = 0; index < size; index += 1) {
+          bytes[index] = (index * seed + size * 11) & 0xff;
+        }
+        expect(quickXorHashBase64(bytes.buffer)).toBe(
+          referenceQuickXorBase64(bytes.buffer),
+        );
+      }
+    }
+  });
 });

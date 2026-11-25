@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { TFile } from "obsidian";
 import { sha256Hex } from "../src/crypto";
+import type { HostPlatformFacts } from "../src/obsidian-compat";
 import {
   LocalReplacementVerificationError,
+  restorableLocalMtime,
   writeReplacementInPlace,
 } from "../src/sync/local-replacement-writer";
 
@@ -13,7 +15,27 @@ import {
  * ③ 写后按磁盘状态分档判定（`DECISIONS` 2026-09-23 第 9 点）：我们写入的内容
  *    原样落地或后面被宿主追加了未保存的行都算落地；只剩前缀＝我们自己写坏了，
  *    回放旧内容；磁盘还是旧版本＝同轮重试一次；认不出来＝现场不动交调用方延后。
+ * ④ 远端修改时间只在桌面还原（`restorableLocalMtime`）：桌面宿主接受
+ *    `DataWriteOptions.mtime`，安卓宿主覆盖 `.md` 时会自己盖章（真宿主实测）。
  */
+
+const DESKTOP_FACTS: HostPlatformFacts = {
+  isDesktopApp: true,
+  isMobileApp: false,
+  isIosApp: false,
+  isAndroidApp: false,
+  isDesktop: true,
+  isMobile: false,
+};
+
+const ANDROID_FACTS: HostPlatformFacts = {
+  isDesktopApp: false,
+  isMobileApp: true,
+  isIosApp: false,
+  isAndroidApp: true,
+  isDesktop: false,
+  isMobile: true,
+};
 function bytesOf(text: string): ArrayBuffer {
   return new TextEncoder().encode(text).buffer;
 }
@@ -384,5 +406,104 @@ describe("writeReplacementInPlace", () => {
 
     expect(new TextDecoder().decode(files.get("note.md"))).toBe("old\n");
     expect(calls.rename).toBe(0);
+  });
+});
+
+describe("远端修改时间还原（2026-11-22 桌面）", () => {
+  const REMOTE_MTIME = 1_700_000_000_000;
+
+  it("passes the remote mtime to the host write on the desktop", async () => {
+    const { adapter, files } = createAdapter({ "note.md": bytesOf("old\n") });
+    const seen: Array<{ mtime?: number } | undefined> = [];
+    const modify = async (
+      target: TFile,
+      data: string,
+      options?: { mtime?: number },
+    ) => {
+      seen.push(options);
+      files.set(target.path, bytesOf(data));
+    };
+
+    await writeReplacementInPlace({
+      file: new TFile("note.md"),
+      modify,
+      adapter: adapter as never,
+      targetPath: "note.md",
+      content: bytesOf("new\n"),
+      expectedVersion: await versionOf("new\n"),
+      mtime: REMOTE_MTIME,
+      platform: DESKTOP_FACTS,
+    });
+
+    // 宿主写入接口收到的是远端那一刻，不是「现在」。
+    expect(seen).toEqual([{ mtime: REMOTE_MTIME }]);
+  });
+
+  it("carries the same mtime onto the adapter write for binary bytes", async () => {
+    const { adapter, files } = createAdapter({ "assets/photo.png": bytesOf("old") });
+    const content = new Uint8Array([0x61, 0xc3, 0x62]).buffer;
+    const seen: Array<{ mtime?: number } | undefined> = [];
+    const recordingAdapter = {
+      ...adapter,
+      async writeBinary(path: string, data: ArrayBuffer, options?: { mtime?: number }) {
+        seen.push(options);
+        files.set(path, data);
+      },
+    };
+
+    await writeReplacementInPlace({
+      file: new TFile("assets/photo.png"),
+      modify: () => { throw new Error("must not be used for non-canonical bytes"); },
+      adapter: recordingAdapter as never,
+      targetPath: "assets/photo.png",
+      content,
+      expectedVersion: { hash: await sha256Hex(content), size: content.byteLength },
+      mtime: REMOTE_MTIME,
+      platform: DESKTOP_FACTS,
+    });
+
+    expect(seen).toEqual([{ mtime: REMOTE_MTIME }]);
+  });
+
+  it("passes no write option on Android once the caller routes through the single judgment point", async () => {
+    const { adapter, files } = createAdapter({ "note.md": bytesOf("old\n") });
+    const seen: Array<{ mtime?: number } | undefined> = [];
+    const modify = async (
+      target: TFile,
+      data: string,
+      options?: { mtime?: number },
+    ) => {
+      seen.push(options);
+      files.set(target.path, bytesOf(data));
+    };
+
+    await writeReplacementInPlace({
+      file: new TFile("note.md"),
+      modify,
+      adapter: adapter as never,
+      targetPath: "note.md",
+      content: bytesOf("new\n"),
+      expectedVersion: await versionOf("new\n"),
+      // 生产调用方的实形：平台裁决只在 `restorableLocalMtime` 一处。
+      mtime: restorableLocalMtime(REMOTE_MTIME, ANDROID_FACTS),
+      platform: ANDROID_FACTS,
+    });
+
+    // 安卓宿主覆盖 `.md` 会丢掉这个值（实测），所以整条链上都不该出现它；
+    // 没有值时连实参都不传，宿主默认行为逐字保持原样。
+    expect(seen).toEqual([undefined]);
+  });
+
+  it("only restores a finite positive time and only on the desktop", () => {
+    expect(restorableLocalMtime(REMOTE_MTIME, DESKTOP_FACTS)).toBe(REMOTE_MTIME);
+    // 云端没给时间 / 非法值：不传，交回宿主默认盖章。
+    expect(restorableLocalMtime(undefined, DESKTOP_FACTS)).toBeUndefined();
+    expect(restorableLocalMtime(Number.NaN, DESKTOP_FACTS)).toBeUndefined();
+    expect(restorableLocalMtime(0, DESKTOP_FACTS)).toBeUndefined();
+    expect(restorableLocalMtime(-1, DESKTOP_FACTS)).toBeUndefined();
+    expect(restorableLocalMtime(Number.POSITIVE_INFINITY, DESKTOP_FACTS))
+      .toBeUndefined();
+    // 移动端一律不还原。
+    expect(restorableLocalMtime(REMOTE_MTIME, ANDROID_FACTS)).toBeUndefined();
   });
 });

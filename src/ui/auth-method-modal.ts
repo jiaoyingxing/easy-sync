@@ -2,7 +2,8 @@
  * AuthMethodModal — first-login method chooser.
  *
  * Shows the two sign-in methods (browser redirect / device code), each with
- * a one-line difference, ordered by platform (device code first on mobile).
+ * a one-line difference, in one fixed order on every platform: browser first,
+ * device code second.
  *
  * Selection must stay on the synchronous click chain: the option click
  * invokes its callback directly (browser login opens the popup there;
@@ -11,10 +12,6 @@
 
 import type { App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
-import {
-  hostPlatformFacts,
-  type HostPlatformFacts,
-} from "../obsidian-compat";
 
 type AuthMethodResult =
   | { action: "browser" }
@@ -39,8 +36,6 @@ export class AuthMethodModal extends EasySyncModal<AuthMethodResult> {
     /** Called in the device option's click handler; resolves when the
      *  devicecode request succeeded. On rejection the option re-enables. */
     private onDeviceSelect: () => Promise<unknown>,
-    /** Platform facts for option order; tests may inject a fake. */
-    private readonly platformFacts: HostPlatformFacts = hostPlatformFacts,
   ) {
     super(app);
   }
@@ -92,14 +87,8 @@ export class AuthMethodModal extends EasySyncModal<AuthMethodResult> {
         return btn;
       },
     };
-    // D1: platform-based order, device code first on mobile, no "recommended".
-    const ordered = orderMethodOptions(
-      this.platformFacts.isMobileApp,
-      [browserEntry, deviceEntry] as const,
-    );
-    for (const option of ordered) {
-      contentEl.appendChild(option.build());
-    }
+    contentEl.appendChild(browserEntry.build());
+    contentEl.appendChild(deviceEntry.build());
   }
 
   // Option-row construction is inherited from EasySyncModal (shared with the
@@ -108,13 +97,4 @@ export class AuthMethodModal extends EasySyncModal<AuthMethodResult> {
   override onClose(): void {
     this.takePendingResolve()?.({ action: "dismiss" });
   }
-}
-
-/** Platform-based option order: device code first on mobile, otherwise
- *  browser first (D1 — neither option is marked "recommended"). */
-export function orderMethodOptions<T>(
-  deviceFirst: boolean,
-  options: readonly [T, T],
-): [T, T] {
-  return deviceFirst ? [options[1], options[0]] : [options[0], options[1]];
 }

@@ -4,6 +4,7 @@ import {
   conservativeResetRecordPaths,
   isConservativeResetOrdinaryRecord,
   isOrdinaryFileRecoveryRecord,
+  isParentSpellingAlias,
 } from "../src/sync/conservative-reset-recovery";
 import type { SyncAnchorV2 } from "../src/sync/state-envelope-v2";
 import type {
@@ -247,6 +248,35 @@ describe("conservative reset ordinary-file recovery contract", () => {
     expect(isConservativeResetOrdinaryRecord(create, scope)).toBe(false);
     expect(isConservativeResetOrdinaryRecord(
       record("upload", { expectedRemote: missingRemote, receipt: true }),
+      scope,
+    )).toBe(true);
+  });
+
+  it("admits parent-spelling moveLocal intents and valid receipts", () => {
+    // A case-only folder rename can leave this intent behind (case-sensitive
+    // host). The unreceipted form settles zero-write once the planned result
+    // is present; the receipted form is admitted so the existing receipt
+    // validation can commit its checkpoint when the target parent already
+    // matches the committed index. A receipt that does not prove the move
+    // still fails the ordinary receipt contract.
+    expect(isParentSpellingAlias("Dir/a.md", "dir/a.md")).toBe(true);
+    expect(isParentSpellingAlias("Dir/A.md", "dir/a.md")).toBe(false);
+    expect(isParentSpellingAlias("Archive/a.md", "Notes/a.md")).toBe(false);
+    expect(isParentSpellingAlias("Dir/a.md", "Dir/a.md")).toBe(false);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("moveLocal", { path: "Dir/a.md", sourcePath: "dir/a.md" }),
+      scope,
+    )).toBe(true);
+    expect(isConservativeResetOrdinaryRecord(
+      record("moveLocal", { path: "Dir/a.md", sourcePath: "dir/a.md" }),
+      scope,
+    )).toBe(false);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("moveLocal", {
+        path: "Dir/a.md",
+        sourcePath: "dir/a.md",
+        receipt: true,
+      }),
       scope,
     )).toBe(true);
   });

@@ -48,6 +48,7 @@ import {
 import { EasySyncModal } from "./easy-sync-modal";
 import { formatFileSize } from "./file-comparison-modal";
 import { NOTICE_PRIORITY, type EasySyncNoticeCenter } from "./notice-center";
+import { formatUserDateTimeFull } from "./user-time-format";
 
 /** 列表首屏条数：超出的部分由「显示更多」逐页放出（v1 不做窗口化）。 */
 const RECOVERY_PAGE_SIZE = 50;
@@ -294,7 +295,7 @@ export class RecoveryModal extends EasySyncModal {
     if (scoped) {
       head.createSpan({
         cls: "easy-sync-recovery-time",
-        text: new Date(entry.at).toLocaleString(),
+        text: formatUserDateTimeFull(entry.at, this.options.i18n.language),
       });
     } else {
       head.createSpan({ cls: "easy-sync-recovery-path", text: entry.path });
@@ -304,7 +305,7 @@ export class RecoveryModal extends EasySyncModal {
     if (!scoped) {
       meta.createSpan({
         cls: "easy-sync-recovery-time",
-        text: new Date(entry.at).toLocaleString(),
+        text: formatUserDateTimeFull(entry.at, this.options.i18n.language),
       });
     }
     if (typeof entry.size === "number") {
@@ -628,13 +629,13 @@ export class RecoveryModal extends EasySyncModal {
       this.renderLegendRow(
         caption,
         "easy-sync-diff-removed",
-        new Date(currentMtime).toLocaleString(),
+        formatUserDateTimeFull(currentMtime, this.options.i18n.language),
       );
     }
     this.renderLegendRow(
       caption,
       "easy-sync-diff-added",
-      `${new Date(entry.at).toLocaleString()}${this.t("recovery.diffLegend.historySuffix")}`,
+      `${formatUserDateTimeFull(entry.at, this.options.i18n.language)}${this.t("recovery.diffLegend.historySuffix")}`,
     );
   }
 

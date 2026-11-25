@@ -10,8 +10,8 @@
  * sync-executor 成环——见本轮收尾报告的去向对照表。
  */
 
+import type { RemoteError } from "../remote/errors";
 import type {
-  OneDriveError,
   SharedSyncProtocolObservationComponent,
 } from "../onedrive/types";
 import type {
@@ -67,7 +67,7 @@ export type SideActionPreparationPhase =
 export type SideMutationRecoveryOutcome = "applied" | "not-applied" | "unresolved";
 export interface SideMutationRecoveryResult {
   outcome: SideMutationRecoveryOutcome;
-  retryableObservationError: OneDriveError | null;
+  retryableObservationError: RemoteError | null;
 }
 
 export type FinalizeCanonicalContentVerificationArgs = {

@@ -3242,13 +3242,17 @@ describe("Persistent remote delta state", () => {
     const harness = await makeManualResolutionHarness({
       path: "notes/blocked.md",
       withLedger: true,
+      // P1 之后，可证明的「远端第三方内容」会结算为未发生；隔离用例需要一条
+      // 仍然无法裁决的记录，因此让远端正文读不全。
       expectedLocalAtIntent: true,
+      remoteUnreadable: true,
       local: {
         "notes/blocked.md": "blocked local",
         "notes/other.md": "other local bytes",
       },
       remote: {
-        "notes/blocked.md": "blocked remote bytes",
+        // 与 local 同长度、不同内容：远端正文读不全时不能靠 size 走 superseded。
+        "notes/blocked.md": "blocked REMOT",
         "notes/other.md": "other remote bytes",
       },
       pendingConflictPaths: ["notes/other.md"],
@@ -3269,12 +3273,15 @@ describe("Persistent remote delta state", () => {
     const harness = await makeManualResolutionHarness({
       path: "notes/other.md",
       withLedger: true,
+      // 同上：远端正文读不全，记录保持未裁决，才能验证同路径保护。
       expectedLocalAtIntent: true,
+      remoteUnreadable: true,
       local: {
         "notes/other.md": "other local bytes",
       },
       remote: {
-        "notes/other.md": "other remote bytes",
+        // 与 local 同长度，正文读不全时只能保持未裁决。
+        "notes/other.md": "other REMOTE byte",
       },
       pendingConflictPaths: ["notes/other.md"],
     });
@@ -3290,13 +3297,16 @@ describe("Persistent remote delta state", () => {
     const harness = await makeManualResolutionHarness({
       path: ".obsidian/app.json",
       withLedger: true,
+      // 受管配置路径同样用「远端正文读不全」保持未裁决，隔离语义与原用例一致。
       expectedLocalAtIntent: true,
+      remoteUnreadable: true,
       local: {
         ".obsidian/app.json": "config bytes",
         "notes/other.md": "other local bytes",
       },
       remote: {
-        ".obsidian/app.json": "config remote bytes",
+        // 与 local 同长度，正文读不全时只能保持未裁决。
+        ".obsidian/app.json": "config BYTES",
         "notes/other.md": "other remote bytes",
       },
       pendingConflictPaths: ["notes/other.md"],

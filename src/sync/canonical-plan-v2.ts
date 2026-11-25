@@ -54,6 +54,7 @@ import {
   isAnchoredDescendantV2,
   projectRemoteNodesV2,
   translateAnchoredPathV2,
+  type RemoteNodeV2,
 } from "./remote-index-v2";
 import {
   canonicalPlannerStateFromEnvelopeV2,
@@ -101,11 +102,46 @@ interface CanonicalPlanFactsV2 {
   localMoveHints?: readonly LocalFolderMoveHintV1[];
   localFolderDeleteHints?: readonly LocalFolderDeleteHintV1[];
   localFileMoveHints?: readonly LocalFolderMoveHintV1[];
+  /** Ledger-proven cross-device remote identity relocations. */
+  remoteIdentityMoves?: ReadonlyMap<string, { remoteId: string; path: string }>;
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;
   preserveFolderPath?: (path: string) => boolean;
   configDir: string;
   automaticDeleteLocalFiles: boolean;
+  /**
+   * Whether this provider's identity facts may be trusted for automatic deletion
+   * (W2b-2). Absent means yes: OneDrive keeps its historical behaviour and every
+   * call without this field is byte-identical to before.
+   */
+  identityConfirmed?: boolean;
+  /** Committed sync direction of this round. Absent means two-way. */
+  syncDirection?: SyncDirection;
+  /**
+   * Path-identity providers (WebDAV) cannot move a collection server-side, so
+   * a pure local folder rename is decomposed into target folder creates plus
+   * one file-level remote move per descendant. Absent keeps every
+   * stable-identity caller and every legacy fixture byte-identical.
+   */
+  pathIdentityFolderMoveDecomposition?: {
+    maxFiles: number;
+    maxBytes: number;
+    /** Folder renames this device started in an earlier round. */
+    pending: readonly CanonicalFolderMoveDecompositionV2[];
+  };
+  /**
+   * Stable-id providers execute a one-sided case-only folder rename as the
+   * ordinary single folder move (move-remote / move-local). Absent keeps the
+   * committed fail-closed conflict for every legacy caller and for path-identity
+   * providers, which cannot move a collection.
+   */
+  allowCaseOnlyFolderRename?: boolean;
+}
+
+/** One path-identity folder rename that is executed file by file. */
+interface CanonicalFolderMoveDecompositionV2 {
+  sourcePath: string;
+  targetPath: string;
 }
 
 interface CanonicalPlanViewFactsV2
@@ -142,6 +178,13 @@ export interface CanonicalPlanCandidateV2 {
    * file state only; they never enter the canonical action array.
    */
   unanchoredDescendantEvidence: SyncPlanItem[];
+  /**
+   * Path-identity folder renames decomposed into file moves. The executor
+   * writes one durable pending record per entry before the creates run, and
+   * rebinds the folder anchors only after the source subtree holds no file
+   * identity any more.
+   */
+  folderMoveDecompositions: CanonicalFolderMoveDecompositionV2[];
 }
 
 interface CanonicalIdentityReplacementV2 {
@@ -223,6 +266,12 @@ export interface FinalizeCanonicalPlanInputV2 {
    */
   syncDirection?: SyncDirection;
   baselineReconstructionIncomplete: boolean;
+  /**
+   * Whether this provider's identity facts may be trusted for automatic deletion
+   * (W2b-2). Absent means yes — OneDrive and every legacy caller keep today's
+   * exact output. The executor passes `providerConfirmsIdentity()`.
+   */
+  identityConfirmed?: boolean;
   pendingContentComparisons?: readonly PendingContentComparisonV2[];
   verifiedRemoteContentHashesById?: ReadonlyMap<string, string>;
   resolveRemoteContentHash: (
@@ -375,14 +424,414 @@ function collectCarriedFolderMovesV2({
   return { carriedFolderMoves, projectedFolderIdentities };
 }
 
+interface PathIdentityFolderMoveDecompositionArgsV2 {
+  state: CanonicalPlannerStateV2;
+  folderPlan: FolderStatePlanV2;
+  localFiles: readonly LocalFileEntry[];
+  localFolders: readonly LocalFolderEntry[];
+  includeFilePath: (path: string) => boolean;
+  preserveFolderPath: (path: string) => boolean;
+  configDir: string;
+  maxFiles: number;
+  maxBytes: number;
+  pending: readonly CanonicalFolderMoveDecompositionV2[];
+}
+
+interface PathIdentityFolderMoveDecompositionResultV2 {
+  folderPlan: FolderStatePlanV2;
+  decompositions: CanonicalFolderMoveDecompositionV2[];
+  plannedFolderCreates: Array<{ path: string; remoteId: string }>;
+}
+
+interface AcceptedFolderMoveDecompositionV2 {
+  sourcePath: string;
+  targetPath: string;
+  pending: boolean;
+}
+
+/**
+ * Turn path-identity folder renames into the action set the provider can
+ * actually execute: create the target collections, move every descendant file
+ * through the ordinary `RenameRemote` path, and leave the source shells to the
+ * executor's post-move settlement. A collection MOVE is forbidden on the
+ * servers this path serves (Nutstore answers 403 OperationNotAllowed), so
+ * there is no O(1) alternative to decompose.
+ *
+ * Only a pure subtree is accepted: every descendant file must still be the
+ * exact bytes the anchor recorded at the mechanically translated destination,
+ * and no unrelated folder action may intersect either root. A single
+ * destination collision keeps that file for the ordinary conflict exit while
+ * the rest still move; anything structural (content edit, local delete, extra
+ * local file, remote change) keeps the whole folder on today's deferred path.
+ *
+ * Pending entries are continuations of earlier rounds. Their remaining subtree
+ * may already be partial, so the purity gate does not apply; the cap does, and
+ * the folder-layer interpretations of the in-progress state are hidden.
+ */
+function planPathIdentityFolderMoveDecompositionsV2({
+  state,
+  folderPlan,
+  localFiles,
+  localFolders,
+  includeFilePath,
+  preserveFolderPath,
+  configDir,
+  maxFiles,
+  maxBytes,
+  pending,
+}: PathIdentityFolderMoveDecompositionArgsV2): PathIdentityFolderMoveDecompositionResultV2 {
+  const unchanged: PathIdentityFolderMoveDecompositionResultV2 = {
+    folderPlan,
+    decompositions: [],
+    plannedFolderCreates: [],
+  };
+  if (state.folderAnchors === null || state.remoteIndex.complete !== true) {
+    return unchanged;
+  }
+  const localFolderKeys = new Set(
+    localFolders.map((folder) => normalizeRemotePathKey(folder.path)),
+  );
+  const localFileByKey = new Map(
+    localFiles.map((entry) => [normalizeRemotePathKey(entry.path), entry]),
+  );
+  const folderAnchorPaths = state.folderAnchors.map((anchor) => anchor.lastPath);
+  const remoteFolderKeys = new Set<string>();
+  const remoteFileKeys = new Set<string>();
+  for (const node of state.remoteNodes) {
+    const path = state.remotePathById.get(node.id);
+    if (!path) continue;
+    (node.kind === "folder" ? remoteFolderKeys : remoteFileKeys)
+      .add(normalizeRemotePathKey(path));
+  }
+  const fileAnchorsBelow = (root: string) =>
+    state.fileAnchors.filter((anchor) =>
+      isNfcAtOrBelowV2(anchor.lastPath, root));
+  const folderAnchorsBelow = (root: string) =>
+    folderAnchorPaths.filter((path) => isNfcAtOrBelowV2(path, root));
+  const pathOrAncestorProtected = (path: string): boolean => {
+    let current = path;
+    while (current !== "") {
+      if (
+        preserveFolderPath(current)
+        || isProtectedFolderDeletePath(current, configDir)
+      ) return true;
+      current = parentFolderPath(current);
+    }
+    return false;
+  };
+  /**
+   * A rename that touches a preserved folder (out of scope, isolated recovery,
+   * community-plugin policy, or the protected config subtree) must stay on the
+   * folder layer's deferral: the decomposition only reuses ordinary file
+   * moves, it does not carry those preservation semantics.
+   */
+  const folderSubtreeProtected = (
+    sourcePath: string,
+    targetPath: string,
+  ): boolean =>
+    folderAnchorsBelow(sourcePath).some(pathOrAncestorProtected)
+    || pathOrAncestorProtected(targetPath);
+  const withinBudget = (anchors: ReadonlyArray<{ size: number }>): boolean =>
+    anchors.length <= maxFiles
+    && anchors.reduce((sum, anchor) => sum + Math.max(0, anchor.size), 0)
+      <= maxBytes;
+  /**
+   * Every ancestor of the destination must already be a collection, or be a
+   * local folder this same plan may create. A remote file on the chain is a
+   * type conflict the ordinary folder layer must report.
+   */
+  const ancestorChainUsable = (path: string): boolean => {
+    let parent = parentFolderPath(path);
+    while (parent !== "") {
+      const key = normalizeRemotePathKey(parent);
+      if (remoteFileKeys.has(key)) return false;
+      if (!remoteFolderKeys.has(key) && !localFolderKeys.has(key)) return false;
+      parent = parentFolderPath(parent);
+    }
+    return true;
+  };
+  const translate = (
+    candidate: AcceptedFolderMoveDecompositionV2,
+    path: string,
+  ): string =>
+    translateAnchoredPathV2(path, candidate.sourcePath, candidate.targetPath);
+  const sameTranslationItem = (
+    item: FolderStatePlanV2["items"][number],
+    candidate: AcceptedFolderMoveDecompositionV2,
+  ): boolean =>
+    item.type === "move-remote"
+    && Boolean(item.sourcePath)
+    && Boolean(item.targetPath)
+    && isNfcAtOrBelowV2(item.sourcePath!, candidate.sourcePath)
+    && normalizeRemotePathKey(translate(candidate, item.sourcePath!))
+      === normalizeRemotePathKey(item.targetPath!);
+  const intersectsRoots = (
+    item: FolderStatePlanV2["items"][number],
+    candidate: AcceptedFolderMoveDecompositionV2,
+  ): boolean =>
+    [item.path, item.sourcePath, item.targetPath]
+      .filter((path): path is string => Boolean(path))
+      .some((path) =>
+        isNfcAtOrBelowV2(path, candidate.sourcePath)
+        || isNfcAtOrBelowV2(path, candidate.targetPath));
+
+  const accepted = new Map<string, AcceptedFolderMoveDecompositionV2>();
+  const consumedItemIndexes = new Set<number>();
+  const planItems = folderPlan.items;
+
+  for (let index = 0; index < planItems.length; index++) {
+    const item = planItems[index];
+    if (
+      item.type !== "move-remote"
+      || !item.remoteId
+      || !item.sourcePath
+      || !item.targetPath
+    ) continue;
+    const candidate: AcceptedFolderMoveDecompositionV2 = {
+      sourcePath: item.sourcePath,
+      targetPath: item.targetPath,
+      pending: false,
+    };
+    if (
+      isNfcAtOrBelowV2(candidate.targetPath, candidate.sourcePath)
+      || isNfcAtOrBelowV2(candidate.sourcePath, candidate.targetPath)
+      || !localFolderKeys.has(normalizeRemotePathKey(candidate.targetPath))
+      || remoteFolderKeys.has(normalizeRemotePathKey(candidate.targetPath))
+      || remoteFileKeys.has(normalizeRemotePathKey(candidate.targetPath))
+      || !ancestorChainUsable(candidate.targetPath)
+      || folderSubtreeProtected(candidate.sourcePath, candidate.targetPath)
+    ) continue;
+    const anchors = fileAnchorsBelow(candidate.sourcePath);
+    if (anchors.length < 1 || !withinBudget(anchors)) continue;
+    const translatedAnchorKeys = new Set(
+      anchors.map((anchor) =>
+        normalizeRemotePathKey(translate(candidate, anchor.lastPath))),
+    );
+    let pure = true;
+    for (const anchor of anchors) {
+      const remote = anchor.remoteId
+        ? state.remoteNodeById.get(anchor.remoteId)
+        : undefined;
+      if (
+        !anchor.remoteId
+        || !includeFilePath(anchor.lastPath)
+        || remote?.kind !== "file"
+        || !remoteStillMatchesAnchorV2(remote, anchor)
+      ) {
+        pure = false;
+        break;
+      }
+      const local = localFileByKey.get(
+        normalizeRemotePathKey(translate(candidate, anchor.lastPath)),
+      );
+      if (
+        !local
+        || local.size !== anchor.size
+        || local.hash.toLowerCase() !== anchor.contentHash.toLowerCase()
+      ) {
+        pure = false;
+        break;
+      }
+    }
+    if (pure) {
+      // The destination subtree may not carry a local file the anchors do not
+      // account for: that is new content, not a rename.
+      for (const [key, entry] of localFileByKey) {
+        if (
+          isAtOrBelowPath(entry.path, candidate.targetPath)
+          && !translatedAnchorKeys.has(key)
+        ) {
+          pure = false;
+          break;
+        }
+      }
+    }
+    if (!pure) continue;
+    for (let other = 0; other < planItems.length; other++) {
+      if (other === index || sameTranslationItem(planItems[other], candidate)) {
+        continue;
+      }
+      if (intersectsRoots(planItems[other], candidate)) {
+        pure = false;
+        break;
+      }
+    }
+    if (!pure) continue;
+    accepted.set(candidate.sourcePath, candidate);
+    consumedItemIndexes.add(index);
+  }
+
+  for (const entry of pending) {
+    if (accepted.has(entry.sourcePath)) continue;
+    const candidate: AcceptedFolderMoveDecompositionV2 = {
+      sourcePath: entry.sourcePath,
+      targetPath: entry.targetPath,
+      pending: true,
+    };
+    if (
+      isNfcAtOrBelowV2(candidate.targetPath, candidate.sourcePath)
+      || isNfcAtOrBelowV2(candidate.sourcePath, candidate.targetPath)
+      || !localFolderKeys.has(normalizeRemotePathKey(candidate.targetPath))
+      || !folderAnchorPaths.some((path) =>
+        normalizeRemotePathKey(path)
+          === normalizeRemotePathKey(candidate.sourcePath))
+      || remoteFileKeys.has(normalizeRemotePathKey(candidate.targetPath))
+      || !ancestorChainUsable(candidate.targetPath)
+      || !withinBudget(fileAnchorsBelow(candidate.sourcePath))
+      || folderSubtreeProtected(candidate.sourcePath, candidate.targetPath)
+    ) continue;
+    const targetKey = normalizeRemotePathKey(candidate.targetPath);
+    if (
+      remoteFolderKeys.has(targetKey)
+      && !folderAnchorsBelow(candidate.targetPath).some((path) =>
+        normalizeRemotePathKey(path) === targetKey)
+    ) {
+      // The target collection exists but carries no identity this device
+      // established; the ordinary folder plan must report the collision.
+      continue;
+    }
+    accepted.set(candidate.sourcePath, candidate);
+  }
+
+  if (accepted.size === 0) return unchanged;
+
+  // Every target collection the renamed subtree needs, with the byte-exact
+  // local spelling, plus missing ancestors of the target root.
+  const createPathByKey = new Map<string, string>();
+  const addCreatePath = (path: string): void => {
+    const key = normalizeRemotePathKey(path);
+    if (remoteFolderKeys.has(key) || createPathByKey.has(key)) return;
+    createPathByKey.set(key, path);
+  };
+  for (const candidate of accepted.values()) {
+    for (const path of folderAnchorsBelow(candidate.sourcePath)) {
+      addCreatePath(translate(candidate, path));
+    }
+    let ancestor = parentFolderPath(candidate.targetPath);
+    while (ancestor !== "") {
+      addCreatePath(ancestor);
+      ancestor = parentFolderPath(ancestor);
+    }
+  }
+
+  const keptItems: FolderStatePlanV2["items"] = [];
+  for (let index = 0; index < planItems.length; index++) {
+    const item = planItems[index];
+    let drop = consumedItemIndexes.has(index);
+    if (!drop) {
+      for (const candidate of accepted.values()) {
+        if (sameTranslationItem(item, candidate)) {
+          drop = true;
+        } else if (candidate.pending) {
+          const paths = [item.path, item.sourcePath, item.targetPath]
+            .filter((path): path is string => Boolean(path));
+          if (
+            (item.type === "move-remote"
+              || item.type === "move-local"
+              || item.type === "delete-remote"
+              || item.type === "delete-local"
+              || item.type === "conflict")
+            && paths.some((path) =>
+              isNfcAtOrBelowV2(path, candidate.sourcePath)
+              || isNfcAtOrBelowV2(path, candidate.targetPath))
+          ) {
+            drop = true;
+          }
+          if (
+            item.type === "create-local"
+            && paths.some((path) =>
+              isNfcAtOrBelowV2(path, candidate.targetPath))
+          ) {
+            drop = true;
+          }
+        }
+        if (drop) break;
+      }
+    }
+    if (!drop) keptItems.push(item);
+  }
+  const plannedCreateKeys = new Set(
+    keptItems
+      .filter((item) => item.type === "create-remote")
+      .map((item) => normalizeRemotePathKey(item.path)),
+  );
+  const synthesizedCreates: FolderStatePlanV2["items"] = [];
+  const plannedFolderCreates: Array<{ path: string; remoteId: string }> = [];
+  for (const [key, path] of createPathByKey) {
+    if (plannedCreateKeys.has(key)) continue;
+    synthesizedCreates.push({
+      type: "create-remote",
+      path,
+      impact: { files: 0, folders: 0, bytes: 0 },
+    });
+    plannedFolderCreates.push({ path, remoteId: path });
+  }
+  const decompositions = [...accepted.values()].map(
+    ({ sourcePath, targetPath }) => ({ sourcePath, targetPath }),
+  );
+  if (synthesizedCreates.length === 0
+    && keptItems.length === planItems.length) {
+    return { folderPlan, decompositions, plannedFolderCreates };
+  }
+  const nextItems = [...keptItems, ...synthesizedCreates];
+  const counts = {
+    createLocal: 0,
+    createRemote: 0,
+    moveLocal: 0,
+    moveRemote: 0,
+    deleteLocal: 0,
+    deleteRemote: 0,
+    conflicts: 0,
+  };
+  for (const item of nextItems) {
+    switch (item.type) {
+      case "create-local": counts.createLocal++; break;
+      case "create-remote": counts.createRemote++; break;
+      case "move-local": counts.moveLocal++; break;
+      case "move-remote": counts.moveRemote++; break;
+      case "delete-local": counts.deleteLocal++; break;
+      case "delete-remote": counts.deleteRemote++; break;
+      case "conflict": counts.conflicts++; break;
+    }
+  }
+  return {
+    folderPlan: { ...folderPlan, items: nextItems, counts },
+    decompositions,
+    plannedFolderCreates,
+  };
+}
+
+/**
+ * Does the committed remote node still carry the content version the anchor
+ * recorded? Mirrors the identity layer's own "remote unchanged" gate: a
+ * decomposed rename may only carry bytes nobody edited on the cloud.
+ */
+function remoteStillMatchesAnchorV2(
+  remote: RemoteNodeV2,
+  anchor: { size: number; contentHash: string; remoteCTag?: string; remoteETag?: string },
+): boolean {
+  if (remote.size !== anchor.size) return false;
+  if (remote.contentHash) {
+    return remote.contentHash.toLowerCase() === anchor.contentHash.toLowerCase();
+  }
+  if (remote.cTag && anchor.remoteCTag) return remote.cTag === anchor.remoteCTag;
+  return Boolean(
+    remote.eTag
+    && anchor.remoteETag
+    && remote.eTag === anchor.remoteETag,
+  );
+}
+
 interface CanonicalPlannedFileMovementsInputV2 {
   state: CanonicalActionCompositionFactsV2["state"];
   localFiles: readonly LocalFileEntry[];
   projectedFolderIdentities: readonly { path: string; remoteId: string }[];
+  plannedFolderCreates: readonly { path: string; remoteId: string }[];
   carriedFolderMoves: readonly { sourcePath: string; targetPath: string }[];
   includeFilePath: (path: string) => boolean;
   remoteFilesById: ReadonlyMap<string, RemoteFileEntry>;
   localFileMoveHints?: readonly LocalFolderMoveHintV1[];
+  remoteIdentityMoves?: ReadonlyMap<string, { remoteId: string; path: string }>;
 }
 
 /**
@@ -397,16 +846,18 @@ function collectPlannedFileMoveTargetsV2({
   state,
   localFiles,
   projectedFolderIdentities,
+  plannedFolderCreates,
   carriedFolderMoves,
   includeFilePath,
   remoteFilesById,
   localFileMoveHints,
+  remoteIdentityMoves,
 }: CanonicalPlannedFileMovementsInputV2): Map<string, string> {
   const targets = new Map<string, string>();
   for (const action of planIdentityRenamesFromStateV2(
     state,
     localFiles,
-    { projectedFolderIdentities, localFileMoveHints },
+    { projectedFolderIdentities, plannedFolderCreates, localFileMoveHints, remoteIdentityMoves },
   )) {
     if (action.type !== "move-local") continue;
     if (
@@ -514,7 +965,7 @@ function buildCanonicalPlanIndexesV2({
 function composeCanonicalActionsV2(
   input: CanonicalActionCompositionFactsV2,
 ): CanonicalPlanCandidateV2 {
-  const folderPlan = planFolderStateFromViewV2({
+  const rawFolderPlan = planFolderStateFromViewV2({
     state: input.state,
     localFiles: input.localFiles,
     localFolders: input.localFolders,
@@ -524,7 +975,32 @@ function composeCanonicalActionsV2(
     includeFilePath: input.includeFilePath,
     includeFolderPath: input.includeFolderPath,
     preserveFolderPath: input.preserveFolderPath,
+    recreateRemoteDeletedFolderWithLocalContent:
+      (input.syncDirection ?? DEFAULT_SYNC_DIRECTION) !== "one-way",
+    allowCaseOnlyFolderRename: input.allowCaseOnlyFolderRename,
   });
+  // Path-identity providers cannot move a collection. Rewrite a pure local
+  // folder rename into target creates plus per-file remote moves before any
+  // folder action is applied; the raw plan stays untouched when the shape is
+  // not decomposable.
+  const decompositionInput = input.pathIdentityFolderMoveDecomposition;
+  const decomposition = decompositionInput && rawFolderPlan.status === "planned"
+    ? planPathIdentityFolderMoveDecompositionsV2({
+        state: input.state,
+        folderPlan: rawFolderPlan,
+        localFiles: input.localFiles,
+        localFolders: input.localFolders,
+        includeFilePath: input.includeFilePath ?? (() => true),
+        preserveFolderPath: input.preserveFolderPath ?? (() => false),
+        configDir: input.configDir,
+        maxFiles: decompositionInput.maxFiles,
+        maxBytes: decompositionInput.maxBytes,
+        pending: decompositionInput.pending,
+      })
+    : null;
+  const folderPlan = decomposition?.folderPlan ?? rawFolderPlan;
+  const plannedFolderCreates = decomposition?.plannedFolderCreates ?? [];
+  const folderMoveDecompositions = decomposition?.decompositions ?? [];
   const base: Omit<CanonicalPlanCandidateV2, "status" | "items"> = {
     version: 2,
     scope: { ...input.state.scope },
@@ -534,6 +1010,7 @@ function composeCanonicalActionsV2(
     identityReplacements: [],
     identityMoveVerifications: [],
     unanchoredDescendantEvidence: [],
+    folderMoveDecompositions,
   };
   if (folderPlan.status !== "planned") {
     return {
@@ -564,10 +1041,12 @@ function composeCanonicalActionsV2(
     state,
     localFiles: input.localFiles,
     projectedFolderIdentities,
+    plannedFolderCreates,
     carriedFolderMoves,
     includeFilePath,
     remoteFilesById,
     localFileMoveHints: input.localFileMoveHints,
+    remoteIdentityMoves: input.remoteIdentityMoves,
   });
   const createItems: SyncPlanItem[] = [];
   const moveItems: SyncPlanItem[] = [];
@@ -670,6 +1149,7 @@ function composeCanonicalActionsV2(
     state,
     localFiles: input.localFiles,
     projectedFolderIdentities,
+    plannedFolderCreates,
     includeFilePath,
     carriedFolderMoves,
     remoteFilesById,
@@ -677,6 +1157,7 @@ function composeCanonicalActionsV2(
     fileItems,
     deferredItems,
     localFileMoveHints: input.localFileMoveHints,
+    remoteIdentityMoves: input.remoteIdentityMoves,
   });
   fileItems = identityResult.fileItems;
   const {
@@ -1474,6 +1955,7 @@ function applyIdentityRenameActionsV2(args: {
   state: CanonicalPlannerStateV2;
   localFiles: readonly LocalFileEntry[];
   projectedFolderIdentities: readonly { path: string; remoteId: string }[];
+  plannedFolderCreates: readonly { path: string; remoteId: string }[];
   includeFilePath: (path: string) => boolean;
   carriedFolderMoves: readonly { sourcePath: string; targetPath: string }[];
   remoteFilesById: Map<string, RemoteFileEntry>;
@@ -1481,6 +1963,7 @@ function applyIdentityRenameActionsV2(args: {
   fileItems: SyncPlanItem[];
   deferredItems: SyncPlanItem[];
   localFileMoveHints?: readonly LocalFolderMoveHintV1[];
+  remoteIdentityMoves?: ReadonlyMap<string, { remoteId: string; path: string }>;
 }): {
   fileItems: SyncPlanItem[];
   identityItems: SyncPlanItem[];
@@ -1491,12 +1974,14 @@ function applyIdentityRenameActionsV2(args: {
     state,
     localFiles,
     projectedFolderIdentities,
+    plannedFolderCreates,
     includeFilePath,
     carriedFolderMoves,
     remoteFilesById,
     protectedRoots,
     deferredItems,
     localFileMoveHints,
+    remoteIdentityMoves,
   } = args;
   let { fileItems } = args;
   const identityItems: SyncPlanItem[] = [];
@@ -1505,7 +1990,7 @@ function applyIdentityRenameActionsV2(args: {
   for (const action of planIdentityRenamesFromStateV2(
     state,
     localFiles,
-    { projectedFolderIdentities, localFileMoveHints },
+    { projectedFolderIdentities, plannedFolderCreates, localFileMoveHints, remoteIdentityMoves },
   )) {
     if (action.type === "conflict" && !includeFilePath(action.path)) continue;
     if (
@@ -2044,7 +2529,15 @@ export async function finalizeCanonicalPlanCandidateV2(
     items = applyOneWayLocalOnlyCopyPlan(items, input.configDir);
     items = applyOneWayLocalDeletedPullBackPlan(items, input.configDir);
     items = suppressOutboundUserContentActions(items, input.configDir);
-    items = forceRemoteFolderDeleteFollow(items, input.configDir);
+    // W2b-2：身份账本未确认时，单向的「云端删除强制跟随」同样不成立——该模式
+    // 的语义是「本机镜像云端」，而镜像的前提是知道哪个远端路径对应哪个身份。
+    // 账本刚重建（uuid 全换）时按强制跟随执行，等于把「另一台设备改了名」
+    // 直接翻译成本机删除。此时保留确认行，用户看过一次成功同步后自动恢复。
+    // 判据是独立的 `identityConfirmed`：单向的强制跟随本来就不依赖用户设置，
+    // 拿那个设置当条件会把「设置关着」误判成「身份未确认」。
+    if (input.identityConfirmed !== false) {
+      items = forceRemoteFolderDeleteFollow(items, input.configDir);
+    }
   }
   // Two-way mode: the same-content-copy identity hold is a wait, not a user
   // decision. Keep the internal placeholder through the identity layer (the
@@ -2060,15 +2553,21 @@ export async function finalizeCanonicalPlanCandidateV2(
     );
     items = suppressParentUnavailableWhenParentCreated(items);
   }
+  const identityConfirmed = input.identityConfirmed !== false;
   items = applyAutomaticHandlingPolicy(
     items,
-    oneWay
-      ? { ...input.automaticHandlingPolicy, autoDeleteLocalFiles: true }
-      : input.automaticHandlingPolicy,
+    // W2b-2：身份账本未确认时，无论模式与设置如何都不把「云端删除」翻成
+    // 「删本机文件」——路径消失不足以证明本机这份文件是被删的，而不是被
+    // 另一台设备改名。确认行保留，用户看到一次成功同步后自动恢复。
+    identityConfirmed
+      ? oneWay
+        ? { ...input.automaticHandlingPolicy, autoDeleteLocalFiles: true }
+        : input.automaticHandlingPolicy
+      : { ...input.automaticHandlingPolicy, autoDeleteLocalFiles: false },
     input.configDir,
     // 排除块的"本机跟随云端删除"仍按双向裁决（配置白名单目录 owner 也在内）：
     // 强制跟随只落在模式自己的范围上，与上面的目录标记同一判定。
-    oneWay
+    oneWay && identityConfirmed
       ? (path) => isExcludedFromOneWaySyncPath(path, input.configDir)
       : undefined,
   );

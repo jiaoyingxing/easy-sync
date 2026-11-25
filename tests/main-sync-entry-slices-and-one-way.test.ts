@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TFile, TFolder } from "obsidian";
 import EasySyncPlugin from "../src/main";
 import { I18n } from "../src/i18n";
+import { readSourceFile } from "./helpers/source-scope";
 import type { SyncCallbacks, SyncResult } from "../src/sync/sync-executor";
 import {
   createEmptyDeviceCommunityPluginParticipation,
@@ -944,5 +945,46 @@ describe("one-way local-only batch row and reversal entry (三件优化 件②/�
     expect(harness.clearAllLocalOnlyIgnorePaths).not.toHaveBeenCalled();
     expect(harness.noticeShow).not.toHaveBeenCalled();
     expect(harness.syncViewRender).not.toHaveBeenCalled();
+  });
+});
+describe("executor progress settings refresh", () => {
+  it("uses the visible-page/1s gate instead of rebuilding per chunk", () => {
+    const source = readSourceFile("src/main.ts");
+    const start = source.indexOf("this.syncExecutor = new SyncExecutor(");
+    const end = source.indexOf(
+      "this.syncExecutor.setAutomaticHandlingPolicy",
+      start,
+    );
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const block = source.slice(start, end);
+    expect(block).toContain("this.refreshSettingsSyncStateSoon();");
+    expect(block).not.toContain("this.settingsTab?.refreshSyncState();");
+  });
+});
+
+describe("LAN chip phase edge", () => {
+  it("refreshes the sidebar ticker on the first byte of a manual LAN serve", () => {
+    const plugin = makePlugin();
+    const refresh = vi.fn();
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue({
+      refreshTransferIndicator: refresh,
+    } as never);
+    const activity = (plugin as never as {
+      lanTransferActivity: { setPhase: (phase: string) => void };
+    }).lanTransferActivity;
+    activity.setPhase("connected");
+    (plugin as never as { lanTransferPhaseOwner: string | null })
+      .lanTransferPhaseOwner = "modal";
+
+    // The manual modal only reports pairing/connected; the first byte flips
+    // the activity to transferring internally, so the owner must notify the
+    // view on that edge (the demand ticker is not polling).
+    plugin.reportLanTransferProgress(1, 100);
+    expect(refresh).toHaveBeenCalledOnce();
+
+    // More chunks in the same transfer need no extra view refresh.
+    plugin.reportLanTransferProgress(2, 100);
+    expect(refresh).toHaveBeenCalledOnce();
   });
 });

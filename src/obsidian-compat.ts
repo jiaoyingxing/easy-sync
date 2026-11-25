@@ -239,13 +239,26 @@ function buildEasySyncPaths(
   vaultOrConfigDir: Pick<Vault, "configDir"> | string,
   pluginId: string,
   layout: typeof EASY_SYNC_STORAGE_LAYOUT | typeof EASY_SYNC_LEGACY_STORAGE_LAYOUT,
+  /**
+   * 账本实例的存放子目录（相对插件目录）；null／缺省＝原地存放。
+   *
+   * F1 云端分账：一台设备只容得下一本同步账时，切到另一个云端等于让第二个
+   * 远端的文件写进第一本的账。落点按云端实例分开，靠的就是这个参数。
+   *
+   * 刻意只挂在**当前布局**上（旧布局是只读迁移源，永远是 OneDrive 那一本）。
+   * OneDrive 传 null，路径逐字不变——老用户升级零迁移，出问题只退回旧行为。
+   */
+  bookDirectory: string | null = null,
 ): EasySyncPathSet {
   const configDir = typeof vaultOrConfigDir === "string"
     ? vaultOrConfigDir
     : getConfigDir(vaultOrConfigDir);
   const pluginRoot = `${configDir}/plugins/`;
   const pluginDir = `${pluginRoot}${pluginId}`;
-  const path = (relativePath: string): string => `${pluginDir}/${relativePath}`;
+  // `data.json` 与 `manifest.json` 由宿主按插件 id 固定，挪不动也不该挪；
+  // 其余 sidecar 才按账本分目录。
+  const sidecarBase = bookDirectory ? `${pluginDir}/${bookDirectory}` : pluginDir;
+  const path = (relativePath: string): string => `${sidecarBase}/${relativePath}`;
   const sidecars = layout.sidecars;
   return {
     configDir,
@@ -253,7 +266,7 @@ function buildEasySyncPaths(
     pluginDir,
     pluginDirPrefix: `${pluginDir}/`,
     storageLayoutVersion: layout.version,
-    dataFile: path(layout.root.dataFile),
+    dataFile: `${pluginDir}/${layout.root.dataFile}`,
     remoteStateFile: path(sidecars.remoteStateFile),
     stateV2File: path(sidecars.stateV2File),
     stateV2NextFile: path(sidecars.stateV2NextFile),
@@ -286,15 +299,65 @@ function buildEasySyncPaths(
     scanCacheFile: path(sidecars.scanCacheFile),
     remoteEnumCheckpointFile: path(sidecars.remoteEnumCheckpointFile),
     deletionLedgerFile: path(sidecars.deletionLedgerFile),
-    manifestFile: path(layout.root.manifestFile),
+    manifestFile: `${pluginDir}/${layout.root.manifestFile}`,
   };
 }
 
+/**
+ * Path sets are pure functions of (configDir, pluginId, layout, bookDirectory)
+ * and are read-only after construction, yet callers ask for them per file
+ * (`isExcluded` asked four times per path). Cache the immutable result: the
+ * scan loop is the hot consumer and a repeated 30-string construction per
+ * file is host CPU spent on nothing.
+ */
+const EASY_SYNC_PATHS_CACHE_LIMIT = 64;
+const easySyncPathsCache = new Map<string, EasySyncPathSet>();
+
+function cachedEasySyncPaths(
+  configDir: string,
+  pluginId: string,
+  layout:
+    | typeof EASY_SYNC_STORAGE_LAYOUT
+    | typeof EASY_SYNC_LEGACY_STORAGE_LAYOUT,
+  bookDirectory: string | null,
+): EasySyncPathSet {
+  const key = `${configDir}\u0000${pluginId}\u0000${layout.version}\u0000${
+    bookDirectory ?? ""
+  }`;
+  const cached = easySyncPathsCache.get(key);
+  if (cached !== undefined) return cached;
+  const built = Object.freeze(
+    buildEasySyncPaths(configDir, pluginId, layout, bookDirectory),
+  );
+  easySyncPathsCache.set(key, built);
+  if (easySyncPathsCache.size > EASY_SYNC_PATHS_CACHE_LIMIT) {
+    const oldest = easySyncPathsCache.keys().next().value;
+    if (oldest !== undefined) easySyncPathsCache.delete(oldest);
+  }
+  return built;
+}
+
+/**
+ * 当前存储布局下的一份账本路径。
+ *
+ * `bookDirectory` 见 `buildEasySyncPaths`：null／缺省＝原地（OneDrive 与所有
+ * 既有调用点逐字不变），非空＝该云端实例自己的账本目录。**旧布局永远没有
+ * 账本子目录**——它是只读迁移源，永远只描述 OneDrive 那一本账。
+ */
 export function getEasySyncPaths(
   vaultOrConfigDir: Pick<Vault, "configDir"> | string,
   pluginId = "easy-sync",
+  bookDirectory: string | null = null,
 ): EasySyncPathSet {
-  return buildEasySyncPaths(vaultOrConfigDir, pluginId, EASY_SYNC_STORAGE_LAYOUT);
+  const configDir = typeof vaultOrConfigDir === "string"
+    ? vaultOrConfigDir
+    : getConfigDir(vaultOrConfigDir);
+  return cachedEasySyncPaths(
+    configDir,
+    pluginId,
+    EASY_SYNC_STORAGE_LAYOUT,
+    bookDirectory,
+  );
 }
 
 /** Paths emitted by public 1.1.3 / v1 builds, used only during local migration. */
@@ -302,10 +365,14 @@ export function getEasySyncLegacyPaths(
   vaultOrConfigDir: Pick<Vault, "configDir"> | string,
   pluginId = "easy-sync",
 ): EasySyncPathSet {
-  return buildEasySyncPaths(
-    vaultOrConfigDir,
+  const configDir = typeof vaultOrConfigDir === "string"
+    ? vaultOrConfigDir
+    : getConfigDir(vaultOrConfigDir);
+  return cachedEasySyncPaths(
+    configDir,
     pluginId,
     EASY_SYNC_LEGACY_STORAGE_LAYOUT,
+    null,
   );
 }
 
@@ -315,15 +382,22 @@ const EASY_SYNC_SELF_SYNC_FILE_NAMES: ReadonlySet<string> = new Set([
   EASY_SYNC_STORAGE_LAYOUT.root.selfSyncStylesFile,
 ]);
 
-/** Exact EasySync bundle files owned by the self-sync feature. */
+/** Exact EasySync bundle files owned by the self-sync feature.
+ *
+ *  `installedPluginDir` is the host-reported `manifest.dir`; pass it when the
+ *  call site knows the running folder, because a manual install may live in a
+ *  folder that is not named after the manifest id (`EasySync` vs `easy-sync`).
+ */
 export function isEasySyncSelfSyncFilePath(
   path: string,
   configDir = DEFAULT_CONFIG_DIR,
   pluginId = "easy-sync",
+  installedPluginDir?: string,
 ): boolean {
-  const prefix = normalizeVaultPathKey(
-    getEasySyncPaths(configDir, pluginId).pluginDirPrefix,
-  );
+  const pluginDir = installedPluginDir?.trim()
+    ? installedPluginDir.replace(/\/+$/, "")
+    : getEasySyncPaths(configDir, pluginId).pluginDir;
+  const prefix = normalizeVaultPathKey(`${pluginDir}/`);
   const normalizedPath = normalizeVaultPathKey(path);
   if (!normalizedPath.startsWith(prefix)) return false;
   const relativePath = normalizedPath.slice(prefix.length);

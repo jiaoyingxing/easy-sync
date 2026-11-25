@@ -11,6 +11,7 @@ import {
   type RangeStreamAdaptation,
 } from "../src/onedrive/range-stream-adaptation";
 import type { DiagnosticLogger } from "../src/sync/diagnostic-logger";
+import { nextRangeStreamMemory } from "../src/onedrive/client";
 import {
   DOWNLOAD_RANGE_MAX_STREAMS,
   DOWNLOAD_RANGE_START_STREAMS,
@@ -628,5 +629,97 @@ describe("RangeStreamAdaptation (G3 桌面多流档位双向自适应)", () => {
     });
     // The recovery probe is adopted and the normal ramp resumes.
     expect(adaptation.planStreams(FILE_BYTES)).toBe(16);
+  });
+});
+
+describe("cross-round tier memory (2026-11-19 warm start)", () => {
+  it("reports the confirmed knee so the next round can warm start", () => {
+    const adaptation = makeAdaptation();
+    const link = makeLink(8 * PER_CONNECTION_BPS);
+    Array.from({ length: 3 }, () => observeFile(adaptation, link));
+
+    expect(adaptation.plannedStreams).toBe(8);
+    expect(adaptation.settledStreamsForNextRound()).toBe(8);
+  });
+
+  it("reports the hold-band tier as settled evidence", () => {
+    const adaptation = makeAdaptation();
+    const link = makeLink(9 * PER_CONNECTION_BPS);
+    Array.from({ length: 3 }, () => observeFile(adaptation, link));
+
+    expect(adaptation.plannedStreams).toBe(12);
+    expect(adaptation.settledStreamsForNextRound()).toBe(12);
+  });
+
+  it("starts one rung below a remembered tier and re-proves the step", () => {
+    const adaptation = makeAdaptation();
+    adaptation.reset({ settledStreams: 24 });
+
+    // One rung below 24, so the first file cannot inherit a stale tier.
+    expect(adaptation.plannedStreams).toBe(16);
+    const link = makeLink();
+    const seen = Array.from(
+      { length: 2 },
+      () => observeFile(adaptation, link).streams,
+    );
+    expect(seen).toEqual([16, 24]);
+  });
+
+  it("starts at the floor when the remembered tier is unknown or the bottom rung", () => {
+    const unknown = makeAdaptation();
+    unknown.reset({ settledStreams: 20 }); // not on the ladder
+    expect(unknown.plannedStreams).toBe(8);
+
+    const floor = makeAdaptation();
+    floor.reset({ settledStreams: 8 });
+    expect(floor.plannedStreams).toBe(8);
+  });
+
+  it("starts one rung below the top rung", () => {
+    const adaptation = makeAdaptation();
+    adaptation.reset({ settledStreams: 32 });
+    expect(adaptation.plannedStreams).toBe(24);
+  });
+
+  it("reports nothing when the round never settled", () => {
+    const adaptation = makeAdaptation();
+    observeFile(adaptation, makeLink());
+
+    // The tier is still the floor; the next file's plan commits the probe.
+    expect(adaptation.plannedStreams).toBe(8);
+    expect(adaptation.settledStreamsForNextRound()).toBeNull();
+  });
+
+  it("a 429 reports nothing and clears the flag on the next reset", () => {
+    const adaptation = makeAdaptation();
+    const link = makeLink(8 * PER_CONNECTION_BPS);
+    Array.from({ length: 3 }, () => observeFile(adaptation, link));
+    expect(adaptation.settledStreamsForNextRound()).toBe(8);
+
+    adaptation.recordRateLimited();
+
+    expect(adaptation.hadRateLimitThisRound).toBe(true);
+    expect(adaptation.settledStreamsForNextRound()).toBeNull();
+    adaptation.reset();
+    expect(adaptation.hadRateLimitThisRound).toBe(false);
+    expect(adaptation.plannedStreams).toBe(8);
+  });
+
+  it("keeps the memory through a round with no settled evidence", () => {
+    expect(nextRangeStreamMemory(16, {
+      rateLimited: false,
+      settledStreams: null,
+    })).toBe(16);
+  });
+
+  it("adopts a newly settled tier and clears the memory on a throttle", () => {
+    expect(nextRangeStreamMemory(16, {
+      rateLimited: false,
+      settledStreams: 24,
+    })).toBe(24);
+    expect(nextRangeStreamMemory(24, {
+      rateLimited: true,
+      settledStreams: 24,
+    })).toBeNull();
   });
 });

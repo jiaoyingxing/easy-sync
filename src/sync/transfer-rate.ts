@@ -31,6 +31,18 @@ export interface TransferRateFactsV1 {
 
 type TransferSignalLevel = "zero" | "low" | "medium" | "high";
 
+export type { TransferSignalLevel };
+
+/** Colour band of a rate. One rule for every carrier (cloud reading and the
+ *  LAN session chip), so orange/red mean the same thing wherever they show. */
+export function transferRateLevel(kbps: number): TransferSignalLevel {
+  return kbps < TRANSFER_RATE_LOW_KBPS
+    ? "low"
+    : kbps < TRANSFER_RATE_MEDIUM_KBPS
+      ? "medium"
+      : "high";
+}
+
 type TransferRateDirection = "upload" | "download";
 
 /** Below this the link sits under the upload timeout-budget floor band. */
@@ -389,12 +401,7 @@ export class TransferRateSampler {
   }
 
   private readRate(kbps: number): TransferRateReading {
-    const level = kbps < TRANSFER_RATE_LOW_KBPS
-      ? "low"
-      : kbps < TRANSFER_RATE_MEDIUM_KBPS
-        ? "medium"
-        : "high";
-    return { level, kbps: Math.round(kbps) };
+    return { level: transferRateLevel(kbps), kbps: Math.round(kbps) };
   }
 
   private isFresh(

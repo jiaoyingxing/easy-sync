@@ -4,7 +4,7 @@
  * Declarative settings for Obsidian 1.13+（minAppVersion 1.13.4）：宿主从
  * `getSettingDefinitions()` 渲染整页，`display()` 不会被调用。根级按
  * 2026-11-10 拍板改成 Resojot 式窄列表（无外侧标题）：
- *   - 登录（页：OneDrive 账号 / 同步模式）
+ *   - 登录（页：OneDrive 账号 / 同步模式；WebDAV 入口暂在「维护 → 实验性」）
  *   - 打开同步面板（整行即按钮）
  *   - 社区插件同步（页：社区插件 / 社区插件数据）
  *   - 同步范围 / 自动同步 / 显示 / 关于 / 维护
@@ -25,6 +25,10 @@ import {
 } from "obsidian";
 import type EasySyncPlugin from "../main";
 import {
+  resolveWebDavConnectionStatus,
+  type WebDavCloudConnectionV1,
+} from "../cloud/cloud-settings";
+import {
   hostPlatformFacts,
   type HostPlatformFacts,
 } from "../obsidian-compat";
@@ -34,6 +38,7 @@ import {
 } from "./auth-entry-flow";
 import { buildIntroTextWithInlineGear } from "./config-sync-modal";
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
+import { applyDestructiveButton } from "./destructive-button";
 import { SyncModeDisableModal } from "./sync-mode-disable-modal";
 import { SyncModeGateModal } from "./sync-mode-gate-modal";
 import { syncModeGateInputLiteral } from "../sync/sync-mode-transition";
@@ -48,6 +53,8 @@ import {
   applyAutomaticHandlingRow,
   applyCommunityPluginScopeRow,
   applyExcludedFoldersRow,
+  applyLanAccelerationRow,
+  applyLanAccelerationThresholdRow,
   applyLocalOnlyIgnoredRow,
   applyMaxFileSizeRow,
   applyMobileStatusBarRow,
@@ -66,6 +73,9 @@ const GITHUB_README_EN_URL = `${GITHUB_URL}/blob/main/README-en.md`;
 /** 支持页「我的其他插件」落点：宿主内置插件详情深链（应用内打开，不跳出 Obsidian）。 */
 const RESOJOT_PLUGIN_URL = "obsidian://show-plugin?id=resojot";
 const OPENPLUG_PLUGIN_URL = "obsidian://show-plugin?id=openplug";
+const STORAGE_CLEANUP_PLUGIN_URL = "obsidian://show-plugin?id=storage-cleanup";
+const AI_CODING_PLAN_CHECK_PLUGIN_URL =
+  "obsidian://show-plugin?id=ai-codingplan-check";
 /** 作者小红书主页：固定用户 ID 链接（xhslink 短链会被平台作废，2026-11-10 起改用此链接）。 */
 const XHS_URL =
   "https://www.xiaohongshu.com/user/profile/605dfc23000000000101cfdb";
@@ -275,7 +285,7 @@ function buildSupportPick(
 /**
  * 支持 EasySync 页（2026-11-10 用户拍板）：
  * - 顶部按「关于—作者」行结构：标题＋详情＋两个原生按钮；
- * - 下面「我的其他插件」保留现有图标＋chevron 两行；
+ * - 下面「我的其他插件」保留现有图标＋chevron 插件行（2026-11-22 起共四行）；
  * - 页面底部一行小字「提需求、报问题、推荐给朋友，都是支持。」，
  *   复用根页页脚许可的样式（同构）。
  */
@@ -316,6 +326,20 @@ function buildSupportPage(t: I18nFn): SettingDefinitionPage {
             descKey: "settings.supportPage.openplug.desc",
             icon: "plug",
             url: OPENPLUG_PLUGIN_URL,
+            first: false,
+          }),
+          buildSupportPick(t, {
+            nameKey: "settings.supportPage.storageCleanup.name",
+            descKey: "settings.supportPage.storageCleanup.desc",
+            icon: "hard-drive",
+            url: STORAGE_CLEANUP_PLUGIN_URL,
+            first: false,
+          }),
+          buildSupportPick(t, {
+            nameKey: "settings.supportPage.aiCodingPlanCheck.name",
+            descKey: "settings.supportPage.aiCodingPlanCheck.desc",
+            icon: "bot",
+            url: AI_CODING_PLAN_CHECK_PLUGIN_URL,
             first: false,
           }),
         ],
@@ -595,10 +619,21 @@ export function renderSyncModeRow(
   t: I18nFn,
   plugin: EasySyncPlugin,
 ): void {
+  // W2b：路径身份服务（WebDAV）不提供单向模式。
+  //
+  // 设计 §13.4／§17.1：单向的语义是「本机镜像云端」，其中云端删除强制跟随。
+  // 路径身份下另一台设备改名＝旧路径删除＋新路径新建，强制跟随会把「改名」
+  // 直接翻译成本机删除——用户没做任何操作，文件却消失了。这不是配置项能兜住
+  // 的取舍，所以整条选项在 WebDAV 下不出现，并留一句话说明原因。
+  const oneWayAvailable = !isPathIdentitySyncActive(plugin);
   const hintEl = setting.descEl.createDiv({
     cls: "easy-sync-sync-mode-hint",
   });
   const renderHint = (): void => {
+    if (!oneWayAvailable) {
+      hintEl.setText(t("settings.syncMode.hint.onewayUnavailable"));
+      return;
+    }
     hintEl.setText(
       t(plugin.syncDirection === "one-way"
         ? "settings.syncMode.hint.oneway"
@@ -608,9 +643,11 @@ export function renderSyncModeRow(
   setting
     .setName(t("settings.syncMode.name"))
     .addDropdown((dropdown) => {
+      dropdown.addOption("two-way", t("settings.syncMode.option.twoway"));
+      if (oneWayAvailable) {
+        dropdown.addOption("one-way", t("settings.syncMode.option.oneway"));
+      }
       dropdown
-        .addOption("two-way", t("settings.syncMode.option.twoway"))
-        .addOption("one-way", t("settings.syncMode.option.oneway"))
         .setValue(plugin.syncDirection)
         .onChange(async (value) => {
           const previous = plugin.syncDirection;
@@ -623,6 +660,18 @@ export function renderSyncModeRow(
         });
     });
   renderHint();
+}
+
+/**
+ * 当前云端是否以**路径**作为文件身份（WebDAV V1；S3 的 key 代理身份同理）。
+ *
+ * 判据只看已生效的云端设置，不看构建期白名单：白名单只控制配置入口是否露出，
+ * 而「能不能开单向同步」是数据安全问题——用户即便在旧配置里已经是 WebDAV，
+ * 也必须被挡住。
+ */
+function isPathIdentitySyncActive(plugin: EasySyncPlugin): boolean {
+  return plugin.cloudSettings?.provider === "webdav"
+    && plugin.cloudSettings.webdav !== null;
 }
 
 /**
@@ -663,6 +712,29 @@ async function applySyncModeSelection(
 }
 
 /**
+ * 账号昵称只用于展示。纯空白、零宽与「填充字符」（全角空格、U+3164 等常被
+ * 用户当成空昵称的写法）在界面上等于空白，会让设置页行尾和账号行说明看起来
+ * 像没加载；这类昵称回退到账号名（邮箱/UPN），两者都不可见才用兜底文案
+ * （2026-11-19 用户反馈）。
+ */
+const INVISIBLE_ACCOUNT_NAME_CHARS =
+  /[\p{Cc}\p{Cf}\u115F\u1160\u2800\u3164\uFFA0]/gu;
+
+function visibleAccountName(raw: string | undefined): string {
+  return (raw ?? "").replace(INVISIBLE_ACCOUNT_NAME_CHARS, "").trim();
+}
+
+export function resolveAccountDisplayName(
+  displayName: string | undefined,
+  accountName: string | undefined,
+  fallback: string,
+): string {
+  return visibleAccountName(displayName)
+    || visibleAccountName(accountName)
+    || fallback;
+}
+
+/**
  * 根级「登录」页（2026-11-10 窄列表改版）：账号行与同步模式行原样搬进子页，
  * 根级只留一条入口行；行尾透登录状态（每行最多一个现值）。
  */
@@ -678,16 +750,41 @@ export function buildLoginPage(
   });
   // 验证中／初始化中不下发现值：此时既不能写「未登录」，也不该写「已登录」。
   const settling = (auth?.isInitializing ?? false) || (auth?.isPending ?? false);
+  const loggedIn = auth?.authState.isLoggedIn === true;
+  // 账号展示名：昵称优先，空白／不可见昵称回退账号名（邮箱/UPN），都不可见才「未知」。
+  const accountLabel = loggedIn
+    ? resolveAccountDisplayName(
+      auth.authState.displayName,
+      auth.authState.accountName,
+      t("general.unknown"),
+    )
+    : "";
   // 根级行尾：已登录直接写账号名（用户 2026-11-10 点名，不再写「已登录」）；
   // 未登录写「未登录」；验证中／初始化中留空。
   const displayValue = settling
     ? undefined
-    : auth?.authState.isLoggedIn
-      ? auth.authState.displayName || t("general.unknown")
+    : loggedIn
+      ? accountLabel
       : t("settings.loginPage.value.loggedOut");
   // 未登录（已稳定）亮宿主警示角标：声明式 `status` 字段的挂点渲染 alert-triangle，
   // 与「未登录」现值同判据（2026-11-10 用户点名）。
-  const warning = !settling && auth?.authState.isLoggedIn !== true;
+  const warning = !settling && !loggedIn;
+  // WebDAV 入口暂在「维护 → 实验性」（2026-11-24 用户拍板：达到主流可用前
+  // 不占登录页主入口）。登录页仍需要「WebDAV 是否已部署」来判断 OneDrive
+  // 登录按钮的主次与同步模式行是否出现。
+  // 部分测试替身只提供被点到的成员：云端字段用可选访问，缺省＝未配置。
+  const webdavConnection = plugin.cloudSettings?.webdav ?? null;
+  const webdavStatus = resolveWebDavConnectionStatus(
+    webdavConnection,
+    plugin.hasSavedWebDavPassword === true,
+  );
+  // 这一行是否「已部署」（＝能用来同步）。判据与状态载体同一口径：连接测试
+  // 通过才算就绪；未测试／失败都不算——失败的行点进去是重新登录，不是停用。
+  const webdavDeployed = webdavStatus === "connected";
+  // 同步模式行：OneDrive 走现役判据；WebDAV 已连接时才出现（未连接没有可
+  // 同步的对象）。两条件取或，OneDrive 行为不变。
+  const syncModeVisible = (): boolean =>
+    plugin.auth?.authState.isLoggedIn === true || webdavDeployed;
   return {
     type: "page",
     name: t("settings.loginPage.name"),
@@ -698,22 +795,28 @@ export function buildLoginPage(
         name: t("settings.account.name"),
         desc: auth?.isSessionPending
           ? t("settings.account.desc.connecting")
-          : auth?.authState.isLoggedIn
+          : loggedIn
             ? t("settings.account.desc.loggedIn", {
-              name: auth.authState.displayName || t("general.unknown"),
+              name: accountLabel,
             })
             : t(authEntry.descriptionKey),
         render: (setting) => {
           setting.addButton((btn) => {
             if (auth?.authState.isLoggedIn) {
-              btn.setButtonText(t("settings.account.logout")).onClick(() => {
-                void (async () => {
-                  await plugin.logoutUser();
-                })();
-              });
+              // 已登录＝已部署：这里挂的是「退出登录」，与「停用」同档的破坏性
+              // 动作（用户 2026-11-23：停用／退出登录都挂宿主特殊按钮样式）。
+              applyDestructiveButton(btn)
+                .setButtonText(t("settings.account.logout"))
+                .onClick(() => {
+                  void (async () => {
+                    await plugin.logoutUser();
+                  })();
+                });
             } else {
               btn.setButtonText(t(authEntry.labelKey));
-              if (authEntry.cta) btn.setCta();
+              // 另一个云端已在用时，这行的「登录」降为普通按钮：屏幕上只该有
+              // 一个主操作，否则用户不知道哪个才是「现在要点的」。
+              if (authEntry.cta && !webdavDeployed) btn.setCta();
               if (authEntry.disabled) {
                 btn.setDisabled(true);
               } else {
@@ -727,14 +830,118 @@ export function buildLoginPage(
       },
       {
         name: t("settings.syncMode.name"),
-        // 片⑥ 模式行：账号行之下，同一份行实现。
-        visible: () => plugin.auth?.authState.isLoggedIn === true,
+        // 片⑥ 模式行：账号行之下，同一份行实现；WebDAV 已连接时同样可见。
+        visible: syncModeVisible,
         render: (setting) => {
           renderSyncModeRow(setting, t, plugin);
         },
       },
     ],
   };
+}
+
+/** WebDAV 连接行说明：只写连接状态，不带上次测试时间
+ *  （用户 2026-11-20 批注：不写上次测试时间）。
+ *
+ *  「试验性」标注在行名上（2026-11-22 用户拍板，取代 2026-11-21 挂说明句的
+ *  落点）：说明句只回答「现在连上没有」，标注说的是这项能力本身，与当前
+ *  连接状态无关。 */
+function describeWebDavConnection(
+  t: I18nFn,
+  status: ReturnType<typeof resolveWebDavConnectionStatus> | null,
+  connection: WebDavCloudConnectionV1 | null,
+): string {
+  if (status === "connected") {
+    return t("settings.webdav.connection.desc.connected", {
+      host: webdavHostLabel(connection),
+    });
+  }
+  if (status === "failed") {
+    return t("settings.webdav.connection.desc.failed", {
+      reason: webDavFailureReasonText(t, connection),
+    });
+  }
+  return t("settings.webdav.connection.desc.unconfigured");
+}
+
+interface WebDavConnectionFacts {
+  readonly connection: WebDavCloudConnectionV1 | null;
+  readonly status: ReturnType<typeof resolveWebDavConnectionStatus>;
+  readonly deployed: boolean;
+  readonly active: boolean;
+  readonly anyCloudDeployed: boolean;
+}
+
+/** 维护页 WebDAV 行与登录页账号行共用的状态事实；只在渲染时读，不写状态。 */
+function webDavConnectionFacts(plugin: EasySyncPlugin): WebDavConnectionFacts {
+  const connection = plugin.cloudSettings?.webdav ?? null;
+  const status = resolveWebDavConnectionStatus(
+    connection,
+    plugin.hasSavedWebDavPassword === true,
+  );
+  const deployed = status === "connected";
+  const loggedIn = plugin.auth?.authState.isLoggedIn === true;
+  return {
+    connection,
+    status,
+    deployed,
+    active: plugin.cloudSettings?.provider === "webdav",
+    anyCloudDeployed: loggedIn || deployed,
+  };
+}
+
+/**
+ * 「维护 → 实验性」里的 WebDAV 入口行。
+ *
+ * 2026-11-24 用户拍板：WebDAV 达到主流可用前不占登录页主入口，暂放维护页
+ * 实验性分组；按钮语义与旧登录页行逐字保持——使用中挂「停用」，否则
+ * 「登录」，两个云端都没部署时「登录」是主按钮。达到 B 阶段验收后再迁回。
+ */
+function renderWebDavConnectionRow(
+  setting: Setting,
+  t: I18nFn,
+  plugin: EasySyncPlugin,
+): void {
+  const facts = webDavConnectionFacts(plugin);
+  setting.addButton((btn) => {
+    if (facts.active) {
+      // 正在使用：唯一的动作是停用——保留配置与账本，只把活动云端交还
+      // OneDrive。改地址＝先停用再登录（用户 2026-11-23 拍板 A）。
+      applyDestructiveButton(btn)
+        .setButtonText(t("settings.webdav.connection.button.disable"))
+        .onClick(() => {
+          void (async () => {
+            await plugin.deactivateCloudAndRestoreOneDrive();
+          })();
+        });
+      return;
+    }
+    // 不在用（从未配置，或配置保留但已停用）：与账号行同一个词「登录」。
+    btn.setButtonText(t("settings.webdav.connection.button.login"))
+      .onClick(() => {
+        void plugin.openWebDavConfig();
+      });
+    if (!facts.anyCloudDeployed) btn.setCta();
+  });
+}
+
+/** 失败类别 → 一句中性原因；类别来自持久化的 `lastTest.failureKind`。 */
+function webDavFailureReasonText(
+  t: I18nFn,
+  connection: WebDavCloudConnectionV1 | null,
+): string {
+  const kind = connection?.lastTest?.failureKind ?? "unknown";
+  return t(`settings.cloudTest.failed.${kind}`);
+}
+
+/** 只显示 host:port，不显示路径与查询串。 */
+function webdavHostLabel(connection: WebDavCloudConnectionV1 | null): string {
+  const url = connection?.coordinates.url ?? "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }
 
 /**
@@ -1222,11 +1429,12 @@ function buildAboutPage(
 }
 
 /** 维护页（2026-10-20 用户拍板）：顶部诊断为无标题组，…「高级」组＝同步回收站（上）＋件③ 反转入口（按条件）＋重置。 */
-function buildMaintenancePage(
+export function buildMaintenancePage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,
 ): SettingDefinitionPage {
+  const webdav = webDavConnectionFacts(plugin);
   return {
     type: "page",
     name: t("settings.group.maintenance"),
@@ -1322,6 +1530,27 @@ function buildMaintenancePage(
               });
             });
           },
+        },
+      ] },
+      // 实验性组放在「高级」下方，不新增顶层页；这里只放设置项，运行状态
+      // 归诊断报告与 lan-connect 弹框（2026-11-23 用户点名移除设置页诊断行）。
+      // WebDAV 入口暂放这里（2026-11-24 用户拍板：达到主流可用前不占登录页）。
+      { heading: t("settings.experimental.heading"), type: "group", items: [
+        {
+          name: t("settings.webdav.connection.name"),
+          desc: describeWebDavConnection(t, webdav.status, webdav.connection),
+          render: (setting) => renderWebDavConnectionRow(setting, t, plugin),
+        },
+        {
+          name: t("settings.lanAcceleration.name"),
+          desc: t("settings.lanAcceleration.desc"),
+          render: (setting) => applyLanAccelerationRow(setting, host),
+        },
+        {
+          name: t("settings.lanAccelerationThreshold.name"),
+          desc: t("settings.lanAccelerationThreshold.desc"),
+          visible: () => plugin.lanAccelerationEnabled,
+          render: (setting) => applyLanAccelerationThresholdRow(setting, host),
         },
       ] },
     ],

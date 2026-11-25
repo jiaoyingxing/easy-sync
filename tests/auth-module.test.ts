@@ -331,7 +331,11 @@ describe("AuthModule account identity", () => {
       return {
         status: 200,
         headers: {},
-        json: { displayName: "Current User", id: "current-account" },
+        json: {
+          displayName: "Current User",
+          id: "current-account",
+          userPrincipalName: "current@outlook.com",
+        },
       };
     });
     const cacheSet = vi.fn().mockResolvedValue(undefined);
@@ -356,8 +360,10 @@ describe("AuthModule account identity", () => {
     expect(auth.authState.isLoggedIn).toBe(true);
     expect(auth.authState.accountId).toBe("current-account");
     expect(auth.authState.displayName).toBe("Current User");
+    expect(auth.authState.accountName).toBe("current@outlook.com");
     expect(cacheSet).toHaveBeenCalledWith({
       displayName: "Current User",
+      accountName: "current@outlook.com",
       accountId: "current-account",
     });
   });
@@ -436,6 +442,84 @@ describe("AuthModule account identity", () => {
     expect(request.mock.calls[1][0].url).toContain("/me?");
     expect(auth.authState.accountId).toBe("current-account");
     expect(cacheSet).not.toHaveBeenCalled();
+  });
+
+  it("prefers Graph mail over userPrincipalName for the account name", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "current-token", expires_in: 3600 },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          displayName: " ",
+          id: "current-account",
+          mail: "jiao@company.com",
+          userPrincipalName: "jiao@tenant.onmicrosoft.com",
+        },
+      };
+    });
+    const cacheSet = vi.fn().mockResolvedValue(undefined);
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      profileCache: {
+        get: vi.fn().mockResolvedValue(null),
+        set: cacheSet,
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    await auth.initialize();
+
+    // 空白昵称保持原样（展示层负责回退），账号名优先取邮箱。
+    expect(auth.authState.displayName).toBe(" ");
+    expect(auth.authState.accountName).toBe("jiao@company.com");
+    expect(cacheSet).toHaveBeenCalledWith(expect.objectContaining({
+      accountName: "jiao@company.com",
+    }));
+  });
+
+  it("restores the cached account name when /me is unavailable", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "current-token", expires_in: 3600 },
+        };
+      }
+      throw new Error("profile unavailable");
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      profileCache: {
+        get: vi.fn().mockResolvedValue({
+          displayName: " ",
+          accountName: "cached@outlook.com",
+          accountId: "cached-account",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    await auth.initialize();
+
+    expect(auth.authState.displayName).toBe(" ");
+    expect(auth.authState.accountName).toBe("cached@outlook.com");
   });
 });
 

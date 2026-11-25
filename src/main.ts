@@ -118,6 +118,7 @@ import {
 import {
   EasySyncSettingTab,
   createEasySyncSettingTab,
+  resolveAccountDisplayName,
 } from "./ui/settings-tab";
 import {
   EasySyncSyncView,
@@ -136,9 +137,28 @@ import { RsMigrationOfferModal } from "./ui/rs-migration-offer-modal";
 import { RsMigrationFailureModal } from "./ui/rs-migration-failure-modal";
 import { VaultJoinOfferModal } from "./ui/vault-join-offer-modal";
 import { VaultJoinRepositoryListModal } from "./ui/vault-join-repository-list-modal";
-import { runRsMigrationTransaction } from "./sync/rs-migration-transaction";
+import { VaultCloudClientWarningModal } from "./ui/vault-cloud-client-warning-modal";
+import {
+  EMPTY_CLOUD_SETTINGS,
+  readCloudSettings,
+  validateWebDavCoordinates,
+  writeCloudSettings,
+  type CloudSettingsV1,
+  type WebDavCloudConnectionV1,
+} from "./cloud/cloud-settings";
+import {
+  cloudBookDirectory,
+  liftCloudBookView,
+  pushCloudBookView,
+  resolveActiveCloudBookId,
+} from "./cloud/cloud-book";
+import {
+  probeRsMigrationDestination,
+  runRsMigrationTransaction,
+} from "./sync/rs-migration-transaction";
 import { ScopeCrossingPromptModal } from "./ui/scope-crossing-prompt-modal";
 import { RecoveryModal } from "./ui/recovery-modal";
+import { formatUserClockTime } from "./ui/user-time-format";
 import type {
   MutationRecoveryBlockReason,
   MutationRecoveryHistory,
@@ -157,6 +177,28 @@ import {
   UNLIMITED_MAX_FILE_SIZE_MB,
 } from "./sync/types";
 import {
+  DEFAULT_LAN_ACCELERATION_ENABLED,
+  DEFAULT_LAN_ACCELERATION_THRESHOLD_MB,
+  lanAccelerationThresholdBytes,
+  normalizeLanAccelerationThresholdMb,
+} from "./sync/lan-acceleration";
+import { LanDiagnostics } from "./sync/lan-diagnostics";
+import {
+  formatLanDiagnosticsSection,
+  formatLanLogSection,
+  isLanDiagnosticLogEntry,
+  LAN_DIAGNOSTIC_LOG_LIMIT,
+} from "./sync/diagnostic-lan-evidence";
+import {
+  resolveLanServeFile,
+  type LanServeGateDeps,
+  type LanServeRequest,
+  type LanServeResult,
+} from "./sync/lan-serve-gate";
+import type {
+  LanAutoConnectManager as LanAutoConnectManagerType,
+} from "./sync/lan-auto-connect";
+import {
   sameCanonicalPlanIdentityV2,
   sameSyncScope,
   SyncActionType,
@@ -172,6 +214,10 @@ import {
   shouldSuppressSyncNoticeForVisibleSidebar,
   type SyncNoticeOutcomeKind,
 } from "./ui/sync-notice";
+import {
+  resolveSyncActivityRevealDelay,
+  SyncActivityRevealer,
+} from "./ui/sync-status-presentation";
 import {
   formatSyncResultMessage,
   isSyncResultFullyComplete,
@@ -238,6 +284,10 @@ import {
   TransferRateSampler,
   type TransferRateReading,
 } from "./sync/transfer-rate";
+import {
+  LanTransferActivity,
+  type LanTransferIndicator,
+} from "./sync/lan-transfer-activity";
 import {
   DEFAULT_AUTOMATIC_HANDLING_POLICY,
   readAutomaticHandlingPolicy,
@@ -326,6 +376,7 @@ import {
 } from "./sync/community-plugin-update-facts";
 import {
   communityPluginJoinBlockRequiresTargetRebind,
+  isCommunityPluginJoinBlockDeterministic,
   isCommunityPluginJoinBlockRecheckable,
   planCommunityPluginJoins,
   type CommunityPluginJoinAuthorization,
@@ -349,6 +400,50 @@ import {
   readStartupTimingObservations,
 } from "./startup-timing-observation";
 
+/**
+ * WebDAV 配置面的按需加载入口。
+ *
+ * 四个模块合计约 160 KB 源码（`webdav-client`／`webdav-probe`／配置弹窗／控制器），
+ * 只有用户真的点「配置」才需要。默认启动面因此保持与 C1 前一致，启动预算门
+ * 不必为未接线的能力提额。
+ */
+async function loadWebDavConfigModules() {
+  const [controller, secrets, modal, probe] = await Promise.all([
+    import("./cloud/cloud-connection-controller"),
+    import("./cloud/cloud-secrets"),
+    import("./ui/webdav-config-modal"),
+    import("./providers/webdav/webdav-probe"),
+  ]);
+  return {
+    createCloudConnectionController: controller.createCloudConnectionController,
+    createCloudSecrets: secrets.createCloudSecrets,
+    WebDavConfigModal: modal.WebDavConfigModal,
+    createRequestUrlWebDavTransport: probe.createRequestUrlWebDavTransport,
+  };
+}
+
+type WebDavConfigModules = Awaited<ReturnType<typeof loadWebDavConfigModules>>;
+type CloudSubmitFailure =
+  import("./cloud/cloud-connection-controller").CloudSubmitFailure;
+type CloudDraft = import("./cloud/cloud-connection-controller").CloudDraft;
+
+/**
+ * WebDAV 连接测试失败的一句用户可见原因。
+ *
+ * 失败类别来自持久化的 `lastTest.failureKind`；放在模块级是为了避开设置面
+ * i18n 门的「插值实参必须是字面量键」判据（门只校验 `t("key", { ... })`
+ * 里的键名，不追进嵌套调用的返回值）。
+ */
+function webDavTestFailureMessage(
+  i18n: { t: (key: string, params?: Record<string, string | number>) => string },
+  connection: WebDavCloudConnectionV1 | null,
+): string {
+  const kind = connection?.lastTest?.failureKind ?? "unknown";
+  return i18n.t("settings.webdav.connection.desc.failed", {
+    reason: i18n.t(`settings.cloudTest.failed.${kind}`),
+  });
+}
+
 /** Plugin data keys for sync settings */
 const KEY_SYNC_INTERVAL = "sync-interval";
 const KEY_AUTO_SYNC_CHANGE_DELAY_SECONDS = "auto-sync-change-delay-seconds";
@@ -368,11 +463,29 @@ const KEY_SYNC_CORE_PLUGINS = "sync-core-plugins";
 const KEY_SYNC_BOOKMARKS = "sync-bookmarks";
 const KEY_SYNC_COMMUNITY_PLUGINS = "sync-community-plugins";
 const KEY_SYNC_PLUGIN_DATA = "sync-plugin-data";
+/** SecretStorage key for the dev LAN pairing local copy (S2b2). */
+const KEY_LAN_PAIRING_SECRET = "easy-sync-lan-pairing-v1";
+/** S4 experimental LAN acceleration settings (persisted in data.json). */
+const KEY_LAN_ACCELERATION = "lan-acceleration";
+const KEY_LAN_ACCELERATION_THRESHOLD_MB = "lan-acceleration-threshold-mb";
 const KEY_COMMUNITY_PLUGIN_SYNC_POLICY = "community-plugin-sync-policy";
 const KEY_SYNC_EXCLUDED_FOLDERS = "sync-excluded-folders";
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
+/**
+ * 切换活动云端后「首轮必须手动」的标记（设备本地，F3-c）。
+ *
+ * 切换办公云端时另一本账的基线可能已经过时，自动轮若先跑会替用户做一次
+ * 没人看过的全量比对；用户拍板第一次必须由他自己点、看过计划再执行。
+ * 成功跑完一轮手动同步即清掉（失败的尝试不算，重启后仍然跳过自动轮）。
+ * 刻意不复用 `autoSyncPaused`：那是「出问题了」的暂停语义，这里是「请先
+ * 手动跑一次」的引导语义，两者的界面文案与出口都不同。
+ */
+const KEY_ACTIVATION_FIRST_MANUAL = "easy-sync-activation-first-manual";
 const KEY_LAST_RESET_FACTS = "last-reset-facts";
 const KEY_RS_ADOPTION_MARKER = "rs-adoption-marker";
+/** 云端连接设置（C1 形状）：非秘密坐标与最近一次测试结论。 */
+const KEY_CLOUD_PROVIDER = "cloud-provider";
+const KEY_CLOUD_WEBDAV = "cloud-webdav";
 
 /** Device-local memory that the confirmed adoption transaction has already
  *  placed the foreign vault content into this vault's files/ root, so fresh
@@ -412,6 +525,9 @@ const KEY_NOTIFICATION_POPUPS = "notification-popups";
 /** 移动端常驻状态图标开关（方案单 20261012-225046）：仅移动端生效，桌面状态栏不受影响。 */
 const KEY_MOBILE_STATUS_BAR = "mobile-status-bar";
 const KEY_ACKNOWLEDGED_RULES = "acknowledged-rules";
+/** 本设备「今日不再提醒」的本地日期（YYYY-MM-DD）；跨日或重置后重新提示。 */
+const KEY_VAULT_CLOUD_CLIENT_WARNING_SNOOZE_DATE =
+  "vault-cloud-client-warning-snooze-date";
 const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
 /** Vault-local binding between the verified account and the local credential
  *  lineage. Account id + random lineage label only; never a token. */
@@ -787,6 +903,16 @@ export default class EasySyncPlugin extends Plugin {
   // reload seed could never pass the 10s freshness window).
   private transferRateSampler = new TransferRateSampler();
   private transferRateRunWasActive = false;
+  /** 局域网会话阶段与实测速率（实验性）。只服务侧栏既有速度胶囊的图标与
+   *  字节槽：会话在就优先显示局域网，会话结束即回到云读数。 */
+  private lanTransferActivity = new LanTransferActivity();
+  /** 谁在向上面那枚胶囊上报（实验弹框 / 自动连接）。两者共用同一读数通道，
+   *  但生命周期互不隶属：弹框关闭时的 `null` 不能清掉自动连接的活会话
+   *  （S5b 交叉场景）。 */
+  private lanTransferPhaseOwner: "modal" | "auto" | null = null;
+  /** 自动连接最近一次上报的阶段；弹框把显示权让回时据此恢复。 */
+  private lanAutoTransferPhase: "pairing" | "connected" | "transferring" | null =
+    null;
 
   // M14: single serialized write queue for PluginData — prevents
   // StateManager.save() / saveSyncSettings() / auth profile writes
@@ -797,7 +923,24 @@ export default class EasySyncPlugin extends Plugin {
    *  digest drift can be attributed on the device itself (issue #18). */
   private readonly pluginDataWriteLog = new RecentPluginDataWriteLog();
   private pluginDataCache: Record<string, unknown> | null | undefined;
+  /** 账本视图缓存：唯一持有者是 `pluginDataBookView`，按（账本 id、物理对象
+   *  身份）判定新鲜度，物理形状一变即重建。 */
+  private pluginDataViewCache: {
+    readonly bookId: string;
+    readonly raw: Record<string, unknown>;
+    readonly view: Readonly<Record<string, unknown>>;
+  } | null = null;
   private pluginDataLoadPromise: Promise<Record<string, unknown> | null> | null = null;
+  /** Dev-only LAN pairing fallback when host SecretStorage is unavailable.
+   *  Never persisted; production product UI will own the real local copy. */
+  private lanPairingFallbackSecret: string | null = null;
+  /** S5a automatic LAN manager, loaded on first switch-on and stopped on
+   *  switch-off/unload. Dynamically imported: never in the startup closure. */
+  private lanAutoConnect: LanAutoConnectManagerType | null = null;
+  private lanAutoConnectLoad: Promise<void> | null = null;
+  /** Downloads completed by the last finished round; gates LAN prewarming on
+   *  desktop so an upload-only machine never writes presence requests. */
+  private lastRoundDownloaded = 0;
   /** Background settings read started by `onload`. The host's plugin-load
    *  phase must stay registration-only (official load-time guide), so the
    *  data-file read/parse is awaited by state/sync consumers instead of by
@@ -847,11 +990,41 @@ export default class EasySyncPlugin extends Plugin {
   excludedFolders: string[] = [];
   diagLogEnabled = false;
   autoSyncPaused = false;
+  /** 切换活动云端后，自动轮在第一次成功的手动同步之前一律让路（F3-c）。 */
+  activationFirstManualPending = false;
+  /** 用户已确认「切回 OneDrive」，等登录成功再真正切换（内存态，不落盘）。 */
+  private pendingOneDriveActivation = false;
   lastResetFacts: DiagnosticResetFacts | null = null;
   rsAdoptionMarker: RsAdoptionMarker | null = null;
   notificationPopups: EasySyncNotificationPopupsLevel = "all";
+  /**
+   * 云端连接设置（C1）：OneDrive 用户保持默认值且不写盘；WebDAV 的坐标与最近
+   * 一次测试结论文档在 `KEY_CLOUD_WEBDAV`。秘密只在 SecretStorage。
+   */
+  cloudSettings: CloudSettingsV1 = EMPTY_CLOUD_SETTINGS;
+  /**
+   * 本机是否保存了 WebDAV 密码。设置页渲染是同步的，读 SecretStorage 是异步的，
+   * 所以由设置加载与配置提交两处更新这个缓存；它是「有没有」的布尔，不含秘密。
+   */
+  hasSavedWebDavPassword = false;
+  /**
+   * WebDAV 同步运行时（W2b-1）：首次真正参与同步时才创建，之后复用已引导的
+   * provider。改配置、切换云端或登出时必须 `invalidate()`，否则会拿着旧
+   * 坐标/密码继续跑。
+   */
+  private webdavRuntime: ReturnType<typeof import("./cloud/webdav-runtime").createWebDavRuntime> | null = null;
+  /**
+   * 执行器当前挂的是哪个云端。`null`＝还没切过（仍是构造时传入的 OneDrive）。
+   * 用于避免每轮重复 setProvider，也用于判断切换是否需要先重新引导。
+   */
+  private activeSyncProviderKind: "onedrive" | "webdav" | null = null;
   /** 移动端常驻状态图标开关（仅移动端渲染与生效；桌面状态栏体系不受影响）。 */
   mobileStatusBar = true;
+  /** S4 局域网加速（实验性，默认开）：只影响下载字节来源。 */
+  lanAccelerationEnabled = DEFAULT_LAN_ACCELERATION_ENABLED;
+  lanAccelerationThresholdMb = DEFAULT_LAN_ACCELERATION_THRESHOLD_MB;
+  /** 设置页「最近一次局域网尝试」的唯一来源；纯内存，不落盘、不进同步历史。 */
+  readonly lanDiagnostics = new LanDiagnostics();
   /** 设置页「规则」行的已读记忆（本设备；清空该字段即恢复显示）。 */
   acknowledgedRules: string[] = [];
   private opLock: string | null = null;
@@ -861,7 +1034,10 @@ export default class EasySyncPlugin extends Plugin {
   /** 入口只读准备期的取消范围（2026-10-10 R1）：非空＝armed，期间两个云端仓库
    *  检测可被「取消同步」中止；进入弹框/写事务前清空（见 endEntryCancellation）。 */
   private entryCancelController: AbortController | null = null;
-  private vaultCloudClientNoticeShown = false;
+  /** 本会话已经提示过（模态或 Notice）；检测失败不置位，下一轮可重试。 */
+  private vaultCloudClientWarningShown = false;
+  /** 本设备「今日不再提醒」的本地日期；空串＝未设置。 */
+  private vaultCloudClientWarningSnoozeDate = "";
   /** 卸载即置位：晚到的 onLayoutReady 回调（vault 监听挂载）据此退场。 */
   private unloaded = false;
   private deferredSettingsMutations: Array<{
@@ -911,24 +1087,40 @@ export default class EasySyncPlugin extends Plugin {
   private v2StateReloadRetryTimer: TimeoutHandle | null = null;
   private statusBarEl: HTMLElement | null = null;
   private statusBarFrame: AnimationFrameHandle | null = null;
+  /** Last painted tuple. Status-bar updates are rAF-coalesced but still fire
+   *  on many events with the same visible state; rebuilding the segment and
+   *  its icon SVG again is pure host work. */
+  private statusBarRenderSignature = "";
   private mobileStatusBarObserver: MutationObserver | null = null;
   private mobileStatusBarResizeHandler: (() => void) | null = null;
   private mobileStatusBarRecomputeTimer: TimeoutHandle | null = null;
   private mobileStatusBarLayoutRef: EventRef | null = null;
   private mobileStatusBarLayoutRetryArmed = false;
   private ribbonEl: HTMLElement | null = null;
+  /** Last painted (status, label); same guard as the status bar. */
+  private ribbonRenderSignature = "";
   private ribbonSuccessTimer: TimeoutHandle | null = null;
   private ribbonSuccessVisible = false;
   /** Delayed "migration completed" notice; cleared on unload so a queued
    *  reminder cannot surface after the plugin is gone. */
   private rsMigrationCompletionNoticeTimer: TimeoutHandle | null = null;
   private settingsTab: EasySyncSettingTab | null = null;
+  /** Status-bar-driven settings repaint limiter: skip hidden pages entirely
+   *  and coalesce visible ones to one repaint per second. */
+  private settingsSyncRefreshTimer: TimeoutHandle | null = null;
+  private settingsSyncRefreshAt = 0;
   private stateLoadPromise: Promise<void> | null = null;
   /** One attempt per reload for the retired self-sync opt-in: see
    *  `ensureEasySyncSelfSyncScope`. */
   private selfSyncScopeTransitionAttempted = false;
   private syncNoticeFrame: AnimationFrameHandle | null = null;
   private syncNoticeSignature: string | null = null;
+  /** One-shot Notice-stage reveal deadline; cleared with the lifecycle notice
+   *  and on unload. The sidebar view's 1s interval is not involved here. */
+  private syncNoticeRevealTimer: TimeoutHandle | null = null;
+  /** Keeps the last stable Notice stage through a short next stage; reset with
+   *  the lifecycle notice. */
+  private readonly syncNoticeRevealer = new SyncActivityRevealer();
   private readonly operationLifecycle = new OperationLifecycle();
   private readonly startupPerformance = new StartupPerformanceTracker();
   private communityPluginInventoryRevision = 0;
@@ -1172,7 +1364,12 @@ export default class EasySyncPlugin extends Plugin {
           const cached = data?.[KEY_PROFILE_CACHE];
           if (!isRecord(cached)) return null;
           return typeof cached.displayName === "string" && typeof cached.accountId === "string"
-            ? { displayName: cached.displayName, accountId: cached.accountId }
+            ? {
+              displayName: cached.displayName,
+              // Caches written before the account name existed simply have none.
+              accountName: typeof cached.accountName === "string" ? cached.accountName : "",
+              accountId: cached.accountId,
+            }
             : null;
         },
         set: async (profile) => {
@@ -1237,6 +1434,8 @@ export default class EasySyncPlugin extends Plugin {
       this.updateStatusBar();
       this.syncView?.render();
       this.settingsTab?.refreshAuthState();
+      // F3-c：已确认「切回 OneDrive」的话，登录成功这一刻才真正切换。
+      this.handleOneDriveActivationProgress();
       // /me binding can turn an earlier account-changed block into stale
       // evidence (the same account is back, or the block was written before
       // verification finished). Release it first, then let the ordinary
@@ -1330,7 +1529,17 @@ export default class EasySyncPlugin extends Plugin {
     };
     // Loaded in the background after UI registration so Ribbon state is accurate.
 
-    this.scanner = new LocalScanner(this.app.vault, undefined, this.manifest.id);
+    // The manifest tells the host where this install actually lives. A manual
+    // install may use a folder name that is not `easy-sync`; the scanner must
+    // treat that real directory as EasySync's own, or its `data.json` becomes
+    // an ordinary sync-scoped file and every plan review write invalidates the
+    // plan that was just reviewed.
+    this.scanner = new LocalScanner(
+      this.app.vault,
+      undefined,
+      this.manifest.id,
+      this.manifest.dir,
+    );
     this.scanner.setDiag(this.diag);
     // Settings are still loading in the background (kicked off before the
     // scanner existed): apply the values known so far so the scanner starts
@@ -1345,6 +1554,10 @@ export default class EasySyncPlugin extends Plugin {
       this.manifest.id,
       this.platformFacts,
     );
+    // S4: the diagnostics recorder and the (default-off) runtime gate are
+    // installed before any sync can start; the settings read re-applies them.
+    this.onedrive.setLanDiagnostics?.(this.lanDiagnostics);
+    this.applyLanAccelerationRuntime();
     this.syncExecutor = new SyncExecutor(
       this.onedrive,
       this.scanner,
@@ -1358,7 +1571,10 @@ export default class EasySyncPlugin extends Plugin {
         this.updateStatusBar();
         // 侧栏动作的字节进度也按每块触发：同样只走轻量数字补丁。
         this.syncView?.renderProgress();
-        this.settingsTab?.refreshSyncState();
+        // Same visible-page/1s gate as the status-bar path: this callback
+        // fires per transport chunk, and a hidden settings page must not be
+        // rebuilt for each one.
+        this.refreshSettingsSyncStateSoon();
       },
       this.operationLifecycle,
       this.noticeCenter,
@@ -1394,6 +1610,7 @@ export default class EasySyncPlugin extends Plugin {
       () => this.handleRibbonClick(),
     );
     this.ribbonEl.addClass("easy-sync-ribbon");
+    this.ribbonRenderSignature = "";
     this.statusBarEl = this.addStatusBarItem();
     this.initStatusBar();
     this.updateStatusBar(); // Shows "Connecting…" while auth initializes
@@ -1412,6 +1629,87 @@ export default class EasySyncPlugin extends Plugin {
       name: this.i18n.t("command.showDetail"),
       callback: () => {
         void this.activateSyncView();
+      },
+    });
+    // S4 experimental LAN entry: visible only while the switch is on (the
+    // checkCallback reads the live setting). The modal is still dynamically
+    // imported so WebRTC/session/signaling code stays out of the startup
+    // closure.
+    this.addCommand({
+      id: "lan-connect",
+      // Normal sync now connects automatically; this entry stays as the
+      // diagnostic and manual-fallback path (S5b) — the name says so because
+      // the host command palette has no separate description slot.
+      name: this.i18n.t("command.lanConnect"),
+      checkCallback: (checking) => {
+        if (!this.lanAccelerationEnabled) return false;
+        if (checking) return true;
+        void import("./dev/lan-session-modal")
+          .then(({ openLanSessionModal }) => {
+            openLanSessionModal(this.app, {
+              t: this.i18n.t.bind(this.i18n),
+              // S5a: the dev modal shares the one six-check implementation
+              // with the automatic manager; neither can relax it.
+              resolveServeFile: (request) => this.resolveLanServeFileForHost(request),
+              injectSource: (source) => {
+                if (this.onedrive === null) return false;
+                this.onedrive.setLanContentSource(source);
+                return true;
+              },
+              startSync: () => {
+                void this.startManualSync();
+              },
+              clearSource: () => {
+                this.onedrive?.setLanContentSource(null);
+              },
+              getOnedriveClient: () => this.onedrive,
+              getVaultName: () => this.app.vault.getName(),
+              loadLanPairingSecretRaw: async () => {
+                try {
+                  const stored = await this.loadSecret(KEY_LAN_PAIRING_SECRET);
+                  return stored ?? this.lanPairingFallbackSecret;
+                } catch {
+                  return this.lanPairingFallbackSecret;
+                }
+              },
+              saveLanPairingSecretRaw: async (value) => {
+                this.lanPairingFallbackSecret = value;
+                try {
+                  await this.saveSecret(KEY_LAN_PAIRING_SECRET, value);
+                } catch {
+                  // Dev fallback keeps the in-memory copy for this session.
+                }
+              },
+              logServeComplete: (result) => {
+                // One line per completed LAN transfer: byte count and the
+                // meta→ack duration are the only evidence a real-device run
+                // can produce for throughput without a separate probe.
+                const mibPerSecond = result.contentMs > 0
+                  ? result.bytes / 1024 / 1024 / (result.contentMs / 1000)
+                  : 0;
+                this.diag?.log("execute", "LAN serve complete", {
+                  path: result.path,
+                  bytes: result.bytes,
+                  contentMs: result.contentMs,
+                  mibPerSecond: Number(mibPerSecond.toFixed(2)),
+                });
+              },
+              // 侧栏既有速度胶囊的图标与字节槽：会话在显示局域网阶段，
+              // 结束即回云读数。不新增文案、不新增显示面。
+              setLanPhase: (phase) => {
+                this.setLanTransferPhase(phase);
+              },
+              reportLanProgress: (downloaded, total) => {
+                this.reportLanTransferProgress(downloaded, total);
+              },
+            });
+          })
+          .catch((error: unknown) => {
+            new Notice(this.i18n.t("lanSession.loadFailed", {
+              error: error instanceof Error ? error.message : String(error),
+            }));
+          });
+        return true;
       },
     });
     this.registerRecoveryUi();
@@ -1557,6 +1855,9 @@ export default class EasySyncPlugin extends Plugin {
         // Silent token refresh: recover a session whose token expired during
         // offline/sleep periods without waiting for the next sync round.
         void this.auth?.refreshNowIfNeeded();
+        // A peer that wants to download writes its request at the start of its
+        // own round; returning to this window is the best moment to look.
+        this.lanAutoConnect?.pokeWatcher();
       }
     });
     this.registerDomEvent(window, "focus", () => {
@@ -1564,6 +1865,7 @@ export default class EasySyncPlugin extends Plugin {
       this.auth?.setVerificationRetryActive(true);
       void this.auth?.checkDeviceCodeNow();
       void this.auth?.refreshNowIfNeeded();
+      this.lanAutoConnect?.pokeWatcher();
     });
     this.registerDomEvent(window, "online", () => {
       // Connectivity restored (e.g. laptop wake or network reconnection):
@@ -1571,6 +1873,7 @@ export default class EasySyncPlugin extends Plugin {
       // any transient backoff. The verification chain restarts as well.
       this.auth?.setVerificationRetryActive(true);
       void this.auth?.refreshNowIfNeeded(true);
+      this.lanAutoConnect?.pokeWatcher();
     });
     this.registerDomEvent(window, "offline", () => {
       // Mirror the online listener: the retry-pending presentation splits on
@@ -1846,6 +2149,11 @@ export default class EasySyncPlugin extends Plugin {
     }
     this.startupPerformance.cancel();
     this.diag.log("lifecycle", "unloading");
+    this.lanAutoConnect?.stop();
+    this.lanAutoConnect = null;
+    this.lanAutoConnectLoad = null;
+    this.onedrive?.setLanSourceProvider?.(null);
+    this.onedrive?.setLanContentSource(null);
     if (this.syncExecutor) {
       this.syncExecutor.invalidateLifecycle("unload");
     } else {
@@ -1872,6 +2180,8 @@ export default class EasySyncPlugin extends Plugin {
     this.v2StateReloadRetryTimer = null;
     compatClearTimeout(this.scopeCrossingPromptTimer);
     this.scopeCrossingPromptTimer = null;
+    compatClearTimeout(this.settingsSyncRefreshTimer);
+    this.settingsSyncRefreshTimer = null;
     this.stopAutoSync();
     this.auth?.stopVerificationRetry();
     this.cancelDescendantFileReconstructionContinuation();
@@ -1879,6 +2189,7 @@ export default class EasySyncPlugin extends Plugin {
     compatClearTimeout(this.ribbonSuccessTimer);
     compatClearTimeout(this.rsMigrationCompletionNoticeTimer);
     this.rsMigrationCompletionNoticeTimer = null;
+    this.clearSyncNoticeRevealTimer();
     compatCancelAnimationFrame(this.syncNoticeFrame);
     compatCancelAnimationFrame(this.statusBarFrame);
     this.statusBarFrame = null;
@@ -2006,6 +2317,156 @@ export default class EasySyncPlugin extends Plugin {
     }
     this.closePluginSettings();
     await this.activateSyncView();
+  }
+
+  /**
+   * 打开 WebDAV 配置弹窗（C3 入口；登录页「WebDAV 连接」行调用）。
+   *
+   * 保存与测试全在 `createCloudConnectionController` 里：本方法只负责把
+   * 现役 SecretStorage 包装、真实 `requestUrl` 传输与「写回 settings」接上。
+   * 成功后重存设置并刷新设置页，让行说明立刻变成「已连接」。
+   */
+  async openWebDavConfig(): Promise<void> {
+    // A8：点「登录」这一刻就问「要不要切过去」，而不是等他填完表单、点保存
+    // 才发现这是在换同步方式（2026-11-23 用户实测反馈：直接打开输入框没有
+    // 任何提醒）。确认只是意图，不写任何东西；保存并测试通过后才真正切换。
+    const activating = this.cloudSettings.provider !== "webdav";
+    if (activating && !await this.confirmCloudActivation()) return;
+    // 全部按需加载：WebDAV 客户端与探针约 160 KB 源码，默认启动面不该为它付费
+    // （启动预算门实测）。用户点「配置」时才拉起，失败就只说一句、不抛到宿主。
+    let modules: WebDavConfigModules;
+    try {
+      modules = await loadWebDavConfigModules();
+    } catch {
+      this.noticeCenter.show({
+        key: "cloud-config-load-failed",
+        message: this.i18n.t("settings.cloudConfig.saveFailed"),
+        priority: NOTICE_PRIORITY.failure,
+      });
+      return;
+    }
+    const { createCloudSecrets, createCloudConnectionController, createRequestUrlWebDavTransport, WebDavConfigModal } = modules;
+    const secrets = createCloudSecrets(this.app.secretStorage ?? null);
+    this.hasSavedWebDavPassword = (await secrets.readWebDavPassword()) !== null;
+    const controller = createCloudConnectionController({
+      readConnection: () => this.cloudSettings.webdav,
+      writeConnection: async (connection) => {
+        this.cloudSettings = {
+          // 激活由保存并测试成功后的 `switchActiveCloud` 完成（F3-c/A8）：
+          // 写连接本身不改「当前活动云端」。否则一次失败的连接测试也会把
+          // 活动云端偷走——用户还没看到测试结果，账本已经换了。
+          provider: connection === null
+            ? "onedrive"
+            : this.cloudSettings.provider,
+          webdav: connection,
+        };
+        // 坐标或凭据变了：丢掉已引导的运行时，下次同步重新探测（旧密码不能
+        // 继续用于新地址）。
+        this.invalidateWebDavRuntime();
+        await this.saveSyncSettings();
+      },
+      readPassword: () => secrets.readWebDavPassword(),
+      writePassword: (password) => secrets.saveWebDavPassword(password),
+      transport: createRequestUrlWebDavTransport(),
+      now: () => Date.now(),
+    });
+    const modal = new WebDavConfigModal({
+      app: this.app,
+      t: this.i18n.t.bind(this.i18n),
+      coordinates: this.cloudSettings.webdav?.coordinates ?? null,
+      hasSavedPassword: this.hasSavedWebDavPassword,
+      submit: async (draft: CloudDraft) => {
+        // S3：保存前先**只读**看一眼根目录，把「切过去点同步才发现」提前到
+        // 「配置时就知道」。跑在 `controller.submit` 之前——后者成功就会把
+        // 坐标落盘，那之后再拒绝已经晚了。
+        const refusal = await this.precheckWebDavRootBeforeSave(draft, secrets);
+        if (refusal) return refusal;
+        // 确认在入口已经问过（`openWebDavConfig`），这里只执行：保存并测试
+        // 成功后才真正换账本；失败则活动云端不动（写连接本身不改 provider）。
+        if (activating) {
+          if (this.isSyncPathBusy() || this.hasUnsettledMutationRecovery()) {
+            // 守卫在保存前问一次，避免「配置已存、云端没切」的半状态。
+            if (this.isSyncPathBusy()) this.showSyncModeBusyNotice();
+            else this.showSyncModePendingWorkNotice();
+            return { ok: false, silent: true, message: "" };
+          }
+        }
+        const result = await controller.submit(draft);
+        if (result.ok) {
+          this.hasSavedWebDavPassword = true;
+          if (activating) {
+            // 测试通过、配置已落盘，这时才换账本（并按守卫重读新账）。
+            const switched = await this.switchActiveCloud("webdav");
+            if (!switched) return { ok: false, silent: true, message: "" };
+          }
+          this.settingsTab?.refreshSyncState();
+          this.updateStatusBar();
+          return { ok: true };
+        }
+        return { ok: false, message: this.describeCloudSubmitFailure(result.reason) };
+      },
+    });
+    await modal.openAndWait();
+  }
+
+  /**
+   * S3 的保存前预检。返回非空＝不要保存，直接把这句话交给弹窗。
+   *
+   * 只读：不写标记、不建目录。任何执行失败（`precheckWebDavRoot` 返回 null）
+   * 都放行——预检是加固而不是新门槛，把它变成门槛只会在弱服务器上卡死正常
+   * 用户；真正的安全闸仍在同步引导里。
+   */
+  private async precheckWebDavRootBeforeSave(
+    draft: CloudDraft,
+    secrets: { readWebDavPassword(): Promise<string | null> },
+  ): Promise<
+    | { ok: false; message: string; rootPrefixError: string }
+    | null
+  > {
+    const validated = validateWebDavCoordinates({
+      url: draft.url,
+      username: draft.username,
+      rootPrefix: draft.rootPrefix,
+    });
+    // 坐标本身不合法属于既有校验的事，交给 controller 报同一条明确的话。
+    if (!validated.value) return null;
+    const password = draft.password.length > 0
+      ? draft.password
+      : await secrets.readWebDavPassword();
+    if (password === null || password.length === 0) return null;
+
+    const { precheckWebDavRoot } = await import("./cloud/webdav-root-precheck");
+    const { createRequestUrlWebDavTransport } = await import(
+      "./providers/webdav/webdav-probe"
+    );
+    const verdict = await precheckWebDavRoot({
+      coordinates: validated.value,
+      password,
+      vaultName: this.app.vault.getName(),
+      transport: createRequestUrlWebDavTransport(),
+    });
+    if (!verdict || verdict.action === "allow") return null;
+    const message = verdict.kind === "other-vault"
+      ? this.i18n.t("settings.webdav.rootPrefix.otherVault")
+      : this.i18n.t("settings.webdav.rootPrefix.existingContent");
+    // 字段级错误与 Notice 说同一句话：红框留在弹窗上，Notice 负责即时可见。
+    return { ok: false, message, rootPrefixError: message };
+  }
+
+  /** 提交失败原因 → 用户可见一句话（复用设置面既有中性文案）。 */
+  private describeCloudSubmitFailure(
+    reason: CloudSubmitFailure,
+  ): string {
+    switch (reason) {
+      case "urlInvalid": return this.i18n.t("settings.cloudConfig.urlInvalid");
+      case "usernameInvalid": return this.i18n.t("settings.cloudConfig.usernameInvalid");
+      case "rootPrefixInvalid": return this.i18n.t("settings.cloudConfig.rootPrefixInvalid");
+      case "passwordRequired": return this.i18n.t("settings.cloudConfig.passwordRequired");
+      case "secretUnavailable": return this.i18n.t("settings.cloudConfig.secretUnavailable");
+      case "saveFailed": return this.i18n.t("settings.cloudConfig.saveFailed");
+      case "testFailed": return webDavTestFailureMessage(this.i18n, this.cloudSettings.webdav);
+      default: return this.i18n.t("settings.cloudConfig.saveFailed");
+    }
   }
 
   private async runSideActionIntent(
@@ -2845,32 +3306,48 @@ export default class EasySyncPlugin extends Plugin {
    * Warn once per session when the vault sits inside a desktop cloud client's
    * sync folder. The client edits, locks and rolls back vault files behind
    * the plugin's back — the failure shape behind repeated "state cannot be
-   * loaded safely" deadlocks and failed resets. Detection is pure string
-   * classification and must never interfere with the sync it precedes.
+   * loaded safely" deadlocks and failed resets. Manual / first-sync rounds
+   * use the modal and wait for dismissal before the sync starts; automatic
+   * rounds keep the lightweight notice and never block. The local-day snooze
+   * suppresses both carriers. Detection is pure string classification.
    */
-  private showVaultCloudClientWarningOnce(): void {
-    if (this.vaultCloudClientNoticeShown) return;
-    this.vaultCloudClientNoticeShown = true;
+  private async showVaultCloudClientWarningOnce(mode: SyncMode): Promise<void> {
+    if (this.vaultCloudClientWarningShown) return;
+    if (this.vaultCloudClientWarningSnoozeDate === this.localDateKey()) {
+      this.vaultCloudClientWarningShown = true;
+      return;
+    }
     try {
       const detection = detectVaultCloudClientEnvironment(
         this.app.vault,
         this.platformFacts,
       );
-      if (!detection.detected || !detection.service) return;
+      if (!detection.detected || !detection.service) {
+        this.vaultCloudClientWarningShown = true;
+        return;
+      }
       this.diag.log(
         "state",
         "vault located inside a cloud client sync folder",
         { service: detection.service, signature: detection.signature },
       );
-      this.noticeCenter.show({
-        key: "vault-cloud-client-warning",
-        message: this.i18n.t(
-          `notice.vaultCloudClient.${detection.service}`,
-        ),
-        priority: NOTICE_PRIORITY.attention,
-        durationMs: 10_000,
-        category: "safety",
-      });
+      const message = this.i18n.t(
+        `notice.vaultCloudClient.${detection.service}`,
+      );
+      let presented = false;
+      if (mode !== "auto" && !this.hasOpenModal()) {
+        presented = await this.presentVaultCloudClientWarningModal(message);
+      }
+      if (!presented) {
+        presented = this.noticeCenter.show({
+          key: "vault-cloud-client-warning",
+          message,
+          priority: NOTICE_PRIORITY.attention,
+          durationMs: 10_000,
+          category: "safety",
+        });
+      }
+      if (presented) this.vaultCloudClientWarningShown = true;
     } catch (error) {
       this.diag.warn(
         "state",
@@ -2878,6 +3355,67 @@ export default class EasySyncPlugin extends Plugin {
         describeError(error),
       );
     }
+  }
+
+  /** True while any host modal is open; the warning must not stack on it. */
+  private hasOpenModal(): boolean {
+    return document.querySelector(".modal-container") !== null;
+  }
+
+  /** Open the manual/first-sync warning and wait for dismissal; false means
+   *  fall back to the notice. The session flag is set before the wait so a
+   *  second sync entry cannot stack a duplicate modal; it is rolled back when
+   *  the modal fails to open. */
+  private async presentVaultCloudClientWarningModal(
+    message: string,
+  ): Promise<boolean> {
+    const previousShown = this.vaultCloudClientWarningShown;
+    this.vaultCloudClientWarningShown = true;
+    try {
+      const modal = new VaultCloudClientWarningModal(
+        this.app,
+        this.i18n.t("vaultCloudClientWarning.title"),
+        message,
+        this.i18n.t("vaultCloudClientWarning.snoozeToday"),
+        () => {
+          this.snoozeVaultCloudClientWarningForToday();
+        },
+      );
+      await modal.awaitDismiss();
+      return true;
+    } catch (error) {
+      this.vaultCloudClientWarningShown = previousShown;
+      this.diag.warn(
+        "state",
+        "vault cloud client warning modal failed to open",
+        describeError(error),
+      );
+      return false;
+    }
+  }
+
+  /** Local calendar day key; the snooze follows the device's local midnight. */
+  private localDateKey(now = new Date()): string {
+    const month = String(now.getMonth() + 1).padStart(2, "0");
+    const day = String(now.getDate()).padStart(2, "0");
+    return `${now.getFullYear()}-${month}-${day}`;
+  }
+
+  /** Persist "today no reminder"; a failed write leaves the in-memory day
+   *  active for this session but rolls back so the next session can retry. */
+  private snoozeVaultCloudClientWarningForToday(): void {
+    const today = this.localDateKey();
+    if (this.vaultCloudClientWarningSnoozeDate === today) return;
+    const previous = this.vaultCloudClientWarningSnoozeDate;
+    this.vaultCloudClientWarningSnoozeDate = today;
+    void this.saveSyncSettings().catch((error) => {
+      this.vaultCloudClientWarningSnoozeDate = previous;
+      this.diag.warn(
+        "state",
+        "vault cloud client warning snooze save failed",
+        describeError(error),
+      );
+    });
   }
 
   private async dispatchSyncRun(request: {
@@ -2890,7 +3428,16 @@ export default class EasySyncPlugin extends Plugin {
     resultOwner?: "sync" | "reset";
   }): Promise<SyncResult | null> {
     if (!this.syncExecutor) return null;
-    this.showVaultCloudClientWarningOnce();
+    // LAN acceleration starts its handshake here, before the scan and plan, so
+    // a same-network peer is usually connected by the time the first download
+    // needs bytes. Only a device that plausibly downloads prewarms: mobile
+    // always (it is receive-only in this feature), desktop only after a round
+    // that actually downloaded something, so an upload-only machine never
+    // writes dead requests to the cloud.
+    if (request.options?.recoveryOnly !== true) {
+      this.onedrive?.prewarmLanSource?.(this.expectsDownloads());
+    }
+    await this.showVaultCloudClientWarningOnce(request.mode);
     await this.preparePublic113MigrationSettings(request.options);
     if (request.options?.recoveryOnly !== true) {
       await this.reconcileCommunityPluginParticipationFromLocalBundles({
@@ -2956,7 +3503,7 @@ export default class EasySyncPlugin extends Plugin {
     let retainReviewedAuthorization = false;
     let result: SyncResult;
     do {
-      result = await this.syncExecutor.run(
+      const run = this.syncExecutor.run(
         request.mode,
         this.createSyncCallbacks(request.mode),
         continuedAfterStateOnlyRecovery && !retainReviewedAuthorization
@@ -2967,6 +3514,11 @@ export default class EasySyncPlugin extends Plugin {
           : request.reviewedAuthorization,
         runOptions,
       );
+      // `run` marks the executor running synchronously. Refresh the fixed
+      // primary action once here so "取消同步" is reachable during the
+      // pre-execution phases; later phase changes stay on the light patch.
+      this.syncView?.render();
+      result = await run;
       if (
         result.continueAfterStateOnlyMigrationRecovery
         && !continuedAfterStateOnlyRecovery
@@ -2995,6 +3547,11 @@ export default class EasySyncPlugin extends Plugin {
       }
       break;
     } while (true as boolean);
+    // The round just ended, which is exactly when a peer's request is most
+    // likely to be waiting: look once now instead of waiting out the timer.
+    // The download count also feeds the next round's prewarm decision.
+    this.lastRoundDownloaded = Math.max(0, result.downloaded ?? 0);
+    this.lanAutoConnect?.pokeWatcher();
     if (
       this.rsAdoptionMarker
       && this.state?.isV2StateActive === true
@@ -3180,6 +3737,20 @@ export default class EasySyncPlugin extends Plugin {
         recoveryContext,
       );
     }
+    // W2b-2：一轮真的成功了，才算本机「见过一次成功同步」，清掉重建待确认标记。
+    //
+    // 条件是「这轮确实读写到远端」：成功、非恢复观察轮、非 reset 归属；首轮
+    // 计划暂停（什么都没执行）不清——账本可能刚重建，先让用户看到计划。
+    // 清除失败只影响下一轮的身份推断，不改这一轮的结论。
+    if (
+      request.resultOwner !== "reset"
+      && request.options?.recoveryOnly !== true
+      && result.success
+      && result.runFacts?.planReviewPaused !== true
+      && this.isWebDavSyncActive()
+    ) {
+      void this.webdavRuntime?.confirmAfterSuccessfulRound().catch(() => false);
+    }
     if (
       request.resultOwner !== "reset"
       && request.options?.recoveryOnly !== true
@@ -3341,6 +3912,36 @@ export default class EasySyncPlugin extends Plugin {
       this.stopAutoSync();
     }
     await this.saveSyncSettings();
+  }
+
+  /**
+   * Restore V2 state authority in-session after a run failed inside the
+   * IndexedDB state/recovery layer. `load()` re-runs the startup
+   * reconciliation — a missing commit witness is confirmed from the committed
+   * database, and a delta whose transaction never committed is retired — so
+   * the next round starts from the real authority instead of failing on the
+   * same recovery collision until the app restarts. Read-only with respect to
+   * user files: this never applies, retries or deletes a mutation.
+   */
+  private async reloadV2StateAfterFailedRun(): Promise<void> {
+    if (!this.state || this.v2StateReloadInFlight) return;
+    this.v2StateReloadInFlight = true;
+    try {
+      await this.state.load();
+      this.diag.log(
+        "state",
+        "V2 state reloaded after an incomplete run",
+        { mutations: 0 },
+      );
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "V2 state reload after an incomplete run did not settle",
+        describeError(error),
+      );
+    } finally {
+      this.v2StateReloadInFlight = false;
+    }
   }
 
   /**
@@ -3590,15 +4191,82 @@ export default class EasySyncPlugin extends Plugin {
     return this.entryCancelController !== null;
   }
 
-  /** Verify the current account matches the vault's bound identity.
-   *  First sync ever silently binds. Account mismatch → Notice + block.
-   *  Returns true if sync may proceed. */
+  /**
+   * F2 绑定闭环：登记「这个库属于谁」。
+   *
+   * 两个云端各有自己的身份来源，但写的是**同一个**账本位置：
+   * - OneDrive：登录态的账号 id（`authState.accountId`）；
+   * - WebDAV：地址＋用户名的指纹（`credentialBindingId`，也是 `scope.accountId`）。
+   *
+   * 界面永不出现「账号」这个词：对 WebDAV 用户这只是「这台设备连的是哪个
+   * 网盘」的内部记号。
+   *
+   * 只管「写进去」：冲突判据与未结恢复的拦截都在 `checkAccountBinding`。
+   */
+  private async bindActiveCloudIdentity(accountId: string): Promise<void> {
+    const state = this.state;
+    if (!state || accountId.length === 0) return;
+    try {
+      await state.bindAccount(accountId);
+    } catch (error) {
+      // 登记失败不阻断本轮：账本身份是「下一次提交能用」的前提，不是同步
+      // 本身的前提，而且下一轮会重试。
+      this.diag.warn(
+        "state",
+        "cloud identity binding failed; the next round retries",
+        describeError(error),
+      );
+    }
+  }
+
+  /**
+   * 当前云端的身份，只看已生效的设置与本地算力，不发请求。
+   *
+   * 用于「这台设备连的是哪份远端」的一致性判断；WebDAV 的指纹必须与
+   * `buildWebDavScopeFields` 同源，否则同一份远端会算出两个身份。
+   */
+  private async activeCloudIdentityId(): Promise<string | null> {
+    if (this.isWebDavSyncActive()) {
+      const webdav = this.cloudSettings?.webdav;
+      if (!webdav) return null;
+      // 必须与运行时／连接测试算出同一个指纹，否则同一份远端会被绑定闸
+      // 判成「换了一个云端」。换算规则集中在 `resolveRootPath`（地址自带
+      // 路径 + 用户根前缀）；`resolveWebDavScopeEndpoint` 要求 endpoint 只要
+      // origin——它拒绝「endpoint 带路径又同时给 rootPath」的组合，那是它的
+      // 安全规则，不要绕。
+      const { buildWebDavScopeFields } = await import(
+        "./providers/webdav/webdav-scope"
+      );
+      const { resolveRootPath } = await import("./cloud/cloud-connection-test");
+      try {
+        const fields = await buildWebDavScopeFields({
+          endpoint: new URL(webdav.coordinates.url).origin,
+          rootPath: resolveRootPath(webdav.coordinates),
+          username: webdav.coordinates.username,
+        });
+        return fields.credentialBindingId;
+      } catch {
+        // 坐标不合法等于「没有可用身份」，交给入口自己报配置问题。
+        return null;
+      }
+    }
+    return this.auth?.authState.accountId ?? null;
+  }
+
+  /**
+   * 当前设备连的是哪份远端；不相等即视为换了一份云端。
+   *
+   * 首次同步会静默登记，之后只允许同一份远端继续。不相等 → Notice ＋ 拦下。
+   * 返回 true＝可以继续同步。
+   */
   private async checkAccountBinding(options: {
     suppressNotice?: boolean;
     allowInitialBind?: boolean;
   } = {}): Promise<boolean> {
-    const currentId = this.auth?.authState.accountId;
-    if (!currentId) return false; // Not logged in
+    // F2：身份来源按云端分派。原先这里第一句读的是 `authState.accountId`，
+    // WebDAV 用户永远没有它，于是整条同步路径在入口就被关死。
+    const currentId = await this.activeCloudIdentityId();
+    if (!currentId) return false; // 这个云端还没配好／没登录
 
     const bound = this.state?.boundAccountId;
     if (!bound) {
@@ -3624,6 +4292,185 @@ export default class EasySyncPlugin extends Plugin {
       return false;
     }
     return true;
+  }
+
+  /**
+   * 当前是否应走 WebDAV 引擎。
+   *
+   * 判据只看设置：`cloudProvider === "webdav"` 且坐标在位。与界面入口无关
+   * ——入口始终可见（2026-11-21 撤掉构建期白名单），运行期分流只认已生效的
+   * 云端设置。
+   */
+  private isWebDavSyncActive(): boolean {
+    return this.cloudSettings.provider === "webdav"
+      && this.cloudSettings.webdav !== null;
+  }
+
+  /**
+   * F5：三个状态载体（状态栏／侧栏／Ribbon）只消费这一份事实，不再各自读
+   * 「微软是否登录」。
+   *
+   * WebDAV 激活时 OneDrive 的登录态与它无关——从没登录过微软的库也能正常
+   * 同步、显示就绪；只有停用回 OneDrive 后才重新看登录态。字段刻意与
+   * `authState` 同名同义，让调用点的既有表达式原样成立：WebDAV 给出
+   * 「已登录（＝已配置）、非冷启动、无待校验会话、无设备码等待」的中性值，
+   * OneDrive 逐字返回现役 auth 事实，因此 OneDrive 下的行为零变化。
+   */
+  activeCloudReadiness(): {
+    provider: "onedrive" | "webdav";
+    initializing: boolean;
+    loggedIn: boolean;
+    loginPending: boolean;
+    sessionPending: boolean;
+  } {
+    if (this.isWebDavSyncActive()) {
+      return {
+        provider: "webdav",
+        initializing: false,
+        loggedIn: true,
+        loginPending: false,
+        sessionPending: false,
+      };
+    }
+    const auth = this.auth;
+    return {
+      provider: "onedrive",
+      initializing: auth?.isInitializing ?? false,
+      loggedIn: auth?.authState.isLoggedIn ?? false,
+      loginPending: auth?.isPending ?? false,
+      sessionPending: auth?.isSessionPending ?? false,
+    };
+  }
+
+  /**
+   * WebDAV 同步前的准备（W2b-1c）。
+   *
+   * 把运行时引导结果装到执行器上：provider 换成本次的 WebDAV provider，
+   * scope 作为 `providerScope` 供首同步写五字段。任何失败都不进入同步轮，
+   * 只用一句现役文案说清原因（不新增界面）。
+   *
+   * 返回 true＝执行器已挂好 WebDAV，可以继续走同步入口。
+   */
+  private async ensureWebDavSyncReady(): Promise<boolean> {
+    const executor = this.syncExecutor;
+    if (!executor) return false;
+    let runtime = this.webdavRuntime;
+    if (!runtime) {
+      try {
+        const { createWebDavRuntime } = await import("./cloud/webdav-runtime");
+        const { createCloudSecrets } = await import("./cloud/cloud-secrets");
+        const { createRequestUrlWebDavTransport } = await import(
+          "./providers/webdav/webdav-probe"
+        );
+        const secrets = createCloudSecrets(this.app.secretStorage ?? null);
+        runtime = createWebDavRuntime({
+          coordinates: this.cloudSettings.webdav?.coordinates ?? null,
+          readPassword: () => secrets.readWebDavPassword(),
+          transport: createRequestUrlWebDavTransport(),
+          vaultName: this.app.vault.getName(),
+          localStatePresent: () => this.hasCompletedSyncState(),
+          // W2b-2：「重建未确认」标记。引导真的重建了账本时由运行时写入，
+          // 一轮真的成功同步后清除；存在期间身份推断与自动删除保持关闭。
+          // 读写都经 StateManager：与其它设备本地状态同一份内存副本，不会
+          // 出现「刚写完却读不到」的半状态。
+          ledgerTrust: {
+            read: async () => this.state?.webDavLedgerRebuildMarker ?? null,
+            write: async (marker) => {
+              await this.state?.replaceWebDavLedgerRebuildMarker(marker);
+            },
+            clear: async () => {
+              await this.state?.replaceWebDavLedgerRebuildMarker(null);
+            },
+          },
+        });
+        this.webdavRuntime = runtime;
+      } catch (error) {
+        this.reportWebDavSyncUnavailable(error);
+        return false;
+      }
+    }
+
+    let connection: Awaited<ReturnType<typeof runtime.connect>>;
+    try {
+      connection = await runtime.connect();
+    } catch (error) {
+      this.reportWebDavSyncUnavailable(error);
+      return false;
+    }
+
+    if (this.activeSyncProviderKind === "webdav") return true;
+    if (!executor.setProvider(connection.provider, connection.scope)) {
+      // 有轮次在跑：不硬切，也不静默继续（那会用 OneDrive 引擎跑 WebDAV 配置）。
+      this.showSyncBusyHint();
+      return false;
+    }
+    // F2 绑定闭环：把「这个库属于谁」登记到账本上。
+    //
+    // WebDAV 的身份是地址＋用户名的指纹（`scope.accountId`，即
+    // `credentialBindingId`），本来就在 scope 里算好了（`buildWebDavScopeFields`），
+    // 只是从来没有被写进账本——整个 WebDAV 分流都跳过了账号绑定闸。后果是
+    // 账上的身份是空串，`isSyncScope` 要求非空，于是每一轮提交都被自己的
+    // 完整性校验拒绝：能扫描、能算计划，就是落不了账。
+    //
+    // 登记点刻意放在「引导成功、执行器已挂好 provider」之后：此刻 scope 是
+    // 真实探测出来的，不是配置里推的，登记失败也只是下一轮重试，不会挡住同步。
+    await this.bindActiveCloudIdentity(connection.scope.accountId);
+    this.activeSyncProviderKind = "webdav";
+    this.diag.log("execute", "sync provider switched to webdav", {
+      root: connection.rootLabel,
+      identityState: connection.identityState,
+    });
+    return true;
+  }
+
+  /** 丢弃 WebDAV 运行时与执行器上的 provider（改配置／切回 OneDrive 时）。 */
+  private invalidateWebDavRuntime(): void {
+    this.webdavRuntime?.invalidate();
+    this.webdavRuntime = null;
+    if (this.activeSyncProviderKind === "webdav") {
+      this.restoreOneDriveProvider();
+    }
+  }
+
+  /** 把执行器换回构造时的 OneDrive provider（没有在跑的轮次时）。 */
+  private restoreOneDriveProvider(): void {
+    const executor = this.syncExecutor;
+    const onedrive = this.onedrive;
+    if (!executor || !onedrive) return;
+    if (!executor.setProvider(onedrive, undefined)) return;
+    this.activeSyncProviderKind = "onedrive";
+    this.diag.log("execute", "sync provider restored to onedrive");
+  }
+
+  /** WebDAV 不可同步时的一句话反馈；不新增界面、不猜结论。 */
+  private reportWebDavSyncUnavailable(error: unknown): void {
+    const runtimeModule = this.webdavRuntimeErrorMessage(error);
+    this.diag.warn("execute", "webdav sync unavailable", describeError(error));
+    this.noticeCenter?.show({
+      key: "webdav-sync-unavailable",
+      message: runtimeModule,
+      priority: NOTICE_PRIORITY.attention,
+    });
+  }
+
+  /** 把运行时错误折成现役中性文案（复用已有键，不新增界面句子）。 */
+  private webdavRuntimeErrorMessage(error: unknown): string {
+    const name = error instanceof Error ? error.name : "";
+    if (name === "WebDavRuntimeNeedsConfirmationError") {
+      return this.i18n.t("notice.webdav.needsConfirmation");
+    }
+    if (name === "WebDavRuntimeError") {
+      const reason = (error as { reason?: string }).reason ?? "";
+      if (reason === "not-configured") return this.i18n.t("settings.webdav.connection.desc.unconfigured");
+      if (reason === "no-password") return this.i18n.t("settings.cloudConfig.passwordRequired");
+      if (reason === "rate-limited") return this.i18n.t("settings.cloudTest.failed.rateLimited");
+      return this.i18n.t("settings.webdav.connection.desc.failed", {
+        reason: this.i18n.t("settings.cloudTest.failed.unknown"),
+      });
+    }
+    return this.i18n.t("settings.webdav.connection.desc.failed", {
+      reason: this.i18n.t("settings.cloudTest.failed.unknown"),
+    });
   }
 
   private async checkAccountBindingForSync(): Promise<boolean> {
@@ -3967,10 +4814,50 @@ export default class EasySyncPlugin extends Plugin {
       });
       return "abort";
     }
+    if (!detected) {
+      // 只读检测段到此结束：后面的弹框与搬迁写事务一律不可取消（写一半停下
+      // 比等一会更危险，2026-10-10 R1 边界）。
+      this.endEntryCancellation();
+      return "fresh";
+    }
+
+    // 目标目录预检（2026-11-17 P2）：EasySync 的 files/ 已有内容时，自动迁移
+    // 必然失败，所以不把「迁移」摆到用户面前。预检仍属只读准备期，可被取消；
+    // 探测失败保持原样，写事务的非空守卫仍是最终闸门。
+    const destination = await probeRsMigrationDestination(
+      deps.onedrive,
+      vaultName,
+    );
+    if (this.entryCancelController?.signal.aborted) {
+      this.diag.log(
+        "state",
+        "EasySync destination pre-check aborted by the sync-entry cancel",
+        { mutations: 0 },
+      );
+      return "abort";
+    }
     // 只读检测段到此结束：后面的弹框与搬迁写事务一律不可取消（写一半停下比
     // 等一会更危险，2026-10-10 R1 边界）。
     this.endEntryCancellation();
-    if (!detected) return "fresh";
+    if (destination.status === "unknown") {
+      this.diag.warn(
+        "state",
+        "EasySync destination pre-check failed; the migration offer keeps its normal shape",
+        { reason: destination.reason, mutations: 0 },
+      );
+    }
+    if (destination.status === "non-empty") {
+      const unavailable = await new RsMigrationFailureModal(this.app, {
+        title: this.i18n.t("rsMigration.unavailableTitle"),
+        body: this.i18n.t("rsMigration.failureBodyDestination"),
+        freshLabel: this.i18n.t("rsMigration.failureFreshSync"),
+        guideLabel: this.i18n.t("rsMigration.failureGuide"),
+        guideTitle: this.i18n.t("rsMigration.guideTitle"),
+        guideBody: this.i18n.t("rsMigration.guideBodyDestination"),
+        guideOk: this.i18n.t("rsMigration.guideOk"),
+      }).awaitAction();
+      return unavailable.action === "fresh-sync" ? "fresh" : "abort";
+    }
 
     const offer = await new RsMigrationOfferModal(this.app, {
       title: this.i18n.t("rsMigration.offerTitle"),
@@ -4017,18 +4904,28 @@ export default class EasySyncPlugin extends Plugin {
         reason: outcome.reason,
         mutations: 0,
       });
+      const destinationBlocked = outcome.status === "destination-not-empty";
       const failure = await new RsMigrationFailureModal(this.app, {
-        title: this.i18n.t("rsMigration.failureTitle"),
-        // destination-not-empty is persistent, not transient — say so instead
-        // of blaming OneDrive and offering a retry that can never succeed.
-        body: outcome.status === "destination-not-empty"
+        title: this.i18n.t(
+          destinationBlocked
+            ? "rsMigration.unavailableTitle"
+            : "rsMigration.failureTitle",
+        ),
+        // destination-not-empty is persistent, not transient: the pre-check
+        // normally refuses it before the offer; this branch is the race guard,
+        // so it uses the two-exit variant and offers no doomed retry.
+        body: destinationBlocked
           ? this.i18n.t("rsMigration.failureBodyDestination")
           : this.i18n.t("rsMigration.failureBody"),
-        retryLabel: this.i18n.t("rsMigration.failureRetry"),
+        ...(destinationBlocked
+          ? {}
+          : { retryLabel: this.i18n.t("rsMigration.failureRetry") }),
         freshLabel: this.i18n.t("rsMigration.failureFreshSync"),
         guideLabel: this.i18n.t("rsMigration.failureGuide"),
         guideTitle: this.i18n.t("rsMigration.guideTitle"),
-        guideBody: this.i18n.t("rsMigration.guideBody"),
+        guideBody: destinationBlocked
+          ? this.i18n.t("rsMigration.guideBodyDestination")
+          : this.i18n.t("rsMigration.guideBody"),
         guideOk: this.i18n.t("rsMigration.guideOk"),
       }).awaitAction();
       return failure.action === "fresh-sync" ? "fresh" : "abort";
@@ -4130,7 +5027,11 @@ export default class EasySyncPlugin extends Plugin {
       "first",
       "blocked first sync result",
     )) return;
-    if (!await this.checkAccountBindingForSync()) return;
+    if (this.isWebDavSyncActive()) {
+      if (!await this.ensureWebDavSyncReady()) return;
+    } else if (!await this.checkAccountBindingForSync()) {
+      return;
+    }
     const recoverV2RemoteScope =
       this.state?.hasV2RemoteScopeRecovery === true;
     if (this.state?.planReviewActive && !recoverV2RemoteScope) {
@@ -4246,7 +5147,16 @@ export default class EasySyncPlugin extends Plugin {
       const verified = await this.auth.verifyAccountNow({ allowBootstrap: true });
       if (!verified) return;
     }
-    if (!await this.checkAccountBindingForSync()) return;
+    if (this.isWebDavSyncActive()) {
+      // WebDAV 不走 OneDrive 的账号绑定闸（没有 Graph accountId）；改走运行时
+      // 引导，失败即不进入本轮。
+      if (!await this.ensureWebDavSyncReady()) return;
+    } else {
+      // 从 WebDAV 切回 OneDrive：执行器上还挂着 WebDAV provider 时必须换回来，
+      // 否则会用错误的云端跑 OneDrive 配置。
+      if (this.activeSyncProviderKind === "webdav") this.restoreOneDriveProvider();
+      if (!await this.checkAccountBindingForSync()) return;
+    }
 
     // If a plan review is pending, execute it directly — but keep the
     // reviewed bundle in state until SyncExecutor re-validates its digest.
@@ -4430,7 +5340,16 @@ export default class EasySyncPlugin extends Plugin {
     });
   }
 
+  private clearSyncNoticeRevealTimer(): void {
+    if (this.syncNoticeRevealTimer !== null) {
+      compatClearTimeout(this.syncNoticeRevealTimer);
+      this.syncNoticeRevealTimer = null;
+    }
+  }
+
   private clearSyncLifecycleNotice(): void {
+    this.clearSyncNoticeRevealTimer();
+    this.syncNoticeRevealer.reset();
     const activeKey = this.noticeCenter.activeKey;
     this.noticeCenter.clear(SYNC_PROGRESS_NOTICE_KEY);
     if (activeKey?.startsWith("sync-result:")) this.noticeCenter.clear(activeKey);
@@ -4457,7 +5376,7 @@ export default class EasySyncPlugin extends Plugin {
       this.progressStore.state.activityKind === "mutationRecovery";
     const label = this.i18n.t(
       recovering
-        ? "progress.recoveringMutation"
+        ? "progress.recoveringOperations"
         : "notice.sync.start",
     );
     this.syncNoticeSignature = `start:${label}`;
@@ -4481,13 +5400,20 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private renderSyncNoticeProgress(): void {
+    this.clearSyncNoticeRevealTimer();
     if (this.shouldSuppressSyncNotice()) {
       this.syncNoticeSignature = null;
       this.clearSyncLifecycleNotice();
       return;
     }
     const progress = this.progressStore.state;
-    const presentation = resolveSyncProgressNoticePresentation(progress);
+    const now = Date.now();
+    const reveal = this.syncNoticeRevealer.resolve(progress, now);
+    const presentation = resolveSyncProgressNoticePresentation(
+      progress,
+      now,
+      reveal.presentation,
+    );
     const t = this.t;
     const label = formatSyncProgressNoticeLabel(presentation, t);
     const signature = [
@@ -4498,22 +5424,35 @@ export default class EasySyncPlugin extends Plugin {
       presentation.determinate,
       presentation.showProgressBar,
     ].join(":");
-    if (signature === this.syncNoticeSignature) return;
-    this.syncNoticeSignature = signature;
-    this.noticeCenter.show({
-      key: SYNC_PROGRESS_NOTICE_KEY,
-      message: () => createSyncProgressNoticeMessage(
-        label,
-        presentation.percent,
-        presentation.determinate,
-        presentation.showProgressBar,
-      ),
-      priority: NOTICE_PRIORITY.progress,
-      durationMs: 0,
-      className: "easy-sync-notice-progress",
-      resumable: true,
-      category: "ambient",
-    });
+    if (signature !== this.syncNoticeSignature) {
+      this.syncNoticeSignature = signature;
+      this.noticeCenter.show({
+        key: SYNC_PROGRESS_NOTICE_KEY,
+        message: () => createSyncProgressNoticeMessage(
+          label,
+          presentation.percent,
+          presentation.determinate,
+          presentation.showProgressBar,
+        ),
+        priority: NOTICE_PRIORITY.progress,
+        durationMs: 0,
+        className: "easy-sync-notice-progress",
+        resumable: true,
+        category: "ambient",
+      });
+    }
+    // The Notice has no 1s tick of its own. A stage that is still inside its
+    // readable window schedules one delayed re-render; counts, actions and
+    // cancellation are already immediate and never wait here.
+    if (this.syncExecutor?.isRunning && presentation.kind === "stage") {
+      const delay = resolveSyncActivityRevealDelay(progress, now);
+      if (delay > 0) {
+        this.syncNoticeRevealTimer = window.setTimeout(() => {
+          this.syncNoticeRevealTimer = null;
+          this.scheduleSyncNoticeUpdate();
+        }, delay + 16);
+      }
+    }
   }
 
   /** Structured run-fact checks for sync results. Localised-message
@@ -4906,6 +5845,8 @@ export default class EasySyncPlugin extends Plugin {
       // 规则行的「已读」记忆随重置一并清空（2026-10-12 用户裁决）：重置是用户的
       // 大扫除出口，设置页的规则随之重新显示——不再单设恢复入口、零新增文案。
       this.acknowledgedRules = [];
+      // 「今日不再提醒」也随重置清空，让云同步环境提醒按当前事实重新出现。
+      this.vaultCloudClientWarningSnoozeDate = "";
       try {
         await this.saveSyncSettings();
         await this.scanner?.clearScanCache();
@@ -5132,6 +6073,13 @@ export default class EasySyncPlugin extends Plugin {
       newRemaining: 0,
     },
   ): Promise<void> {
+    if (result.stateReloadRequired && !recoveryOnly) {
+      // Settle the recovery tail / advanced-database state before the result
+      // handling below reads `this.state`, so the next round observed by the
+      // user starts from the reconciled authority. Recovery-only runs keep
+      // their own ledger expectations and are left untouched.
+      await this.reloadV2StateAfterFailedRun();
+    }
     const harmlessRejectedRun = result.message === this.i18n.t("result.alreadyRunning");
     const retryableMutationRecovery =
       result.mutationRecovery?.state === "network-unavailable"
@@ -5369,6 +6317,19 @@ export default class EasySyncPlugin extends Plugin {
       await this.saveSyncSettings();
       this.startAutoSync();
     }
+    // F3-c：切换后的第一次手动同步成功跑完（不是暂停待审阅）＝「首轮须手动」
+    // 已履行，放行自动轮。失败的尝试不算：标记留着，下次仍需手动。
+    if (
+      this.activationFirstManualPending
+      && !recoveryOnly
+      && result.success
+      && result.deferred === 0
+      && !pauseAutoSync
+    ) {
+      this.activationFirstManualPending = false;
+      await this.saveSyncSettings();
+      if (this.isAutoSyncMasterEnabled()) this.startAutoSync();
+    }
     // Reset the auto-sync timer after a successful auto-sync so the
     // full interval gap is guaranteed (prevents back-to-back cycles on
     // slow mobile networks where sync duration approaches the interval).
@@ -5480,6 +6441,9 @@ export default class EasySyncPlugin extends Plugin {
         skippedIgnored: result.skippedIgnored,
         skippedInvalidName: result.skippedInvalidName,
         skipPaths: result.skippedPaths,
+        ...(this.excludedFolders.length > 0
+          ? { excludedFolders: [...this.excludedFolders] }
+          : {}),
         // Retryable-observation rounds are presented as neutral entries without
         // failure counts; executor result.errors stays untouched (classifier
         // contract requires errors > 0 on the result itself).
@@ -5904,7 +6868,7 @@ export default class EasySyncPlugin extends Plugin {
             ? "result.v2RecoveryBlocked"
             : recovery.state === "recovered"
               ? "notice.sync.recoveryRecovered"
-              : "progress.recoveringMutation",
+              : "progress.recoveringOperations",
           recovery.state === "recovered"
             ? { settled: recovery.settled }
             : undefined,
@@ -5935,10 +6899,8 @@ export default class EasySyncPlugin extends Plugin {
       key: "sync-result:recovery-waiting",
       message: this.i18n.t("notice.sync.recoveryWaiting", {
         remaining: recovery.remaining,
-        time: new Date(recovery.retryAt).toLocaleTimeString(undefined, {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
+        time: formatUserClockTime(recovery.retryAt, this.i18n.language, {
+          seconds: true,
         }),
       }),
       priority: NOTICE_PRIORITY.action,
@@ -6169,11 +7131,15 @@ export default class EasySyncPlugin extends Plugin {
       !this.isAutoSyncMasterEnabled()
       || (this.autoSyncPaused && !this.pausedBlockedRecoveryLacksManualExit())
       || !this._stateLoaded
-      || !this.auth?.authState.isLoggedIn
-      // Sync authorization is fail-closed until /me binds the account. An
-      // empty id is "still verifying", never "a different account"; letting it
-      // reach the account check would persist a false account-changed block.
-      || !this.auth?.authState.accountId
+      // WebDAV 没有 OneDrive 登录态与 accountId：它的授权由运行时引导负责，
+      // 这里只要求「云端类型已配置」。OneDrive 仍按原闸（登录＋/me 绑定）。
+      || (!this.isWebDavSyncActive()
+        && (!this.auth?.authState.isLoggedIn
+          // Sync authorization is fail-closed until /me binds the account. An
+          // empty id is "still verifying", never "a different account"; letting
+          // it reach the account check would persist a false account-changed
+          // block.
+          || !this.auth?.authState.accountId))
       || !this.state?.isV2StateActive
       || this.state.planReviewActive
     ) return false;
@@ -6228,7 +7194,7 @@ export default class EasySyncPlugin extends Plugin {
     if (
       !this.isAutoSyncMasterEnabled()
       || (this.autoSyncPaused && !this.pausedBlockedRecoveryLacksManualExit())
-      || !this.auth?.authState.isLoggedIn
+      || (!this.isWebDavSyncActive() && !this.auth?.authState.isLoggedIn)
       || !this.syncExecutor
     ) return { state: "inactive" };
     if (this.opLock !== null || this.syncExecutor.isRunning) {
@@ -7036,6 +8002,9 @@ export default class EasySyncPlugin extends Plugin {
       | "startup",
   ): Promise<boolean> {
     if (this.autoSyncPaused) return true;
+    // F3-c：切换活动云端后的第一轮必须由用户手动发起（他自己点、看过计划
+    // 再执行）；成功跑完一轮手动同步后标记才清，见同步收尾处。
+    if (this.activationFirstManualPending) return true;
     if (trigger === "dirty") {
       // Persisted join intents ride the dirty hint as their automatic
       // settlement path; they follow the master switch like every other
@@ -7056,7 +8025,10 @@ export default class EasySyncPlugin extends Plugin {
     } else if (this.syncInterval <= 0) {
       return true;
     }
-    if (!this.auth?.authState.isLoggedIn) return true;
+    // WebDAV 没有 OneDrive 登录态：它的「可用」由运行时引导决定（下面在锁内
+    // 用 `ensureWebDavSyncReady` 判定）。OneDrive 仍按原登录闸直接让路。
+    const webDavActive = this.isWebDavSyncActive();
+    if (!webDavActive && !this.auth?.authState.isLoggedIn) return true;
     if (!this.syncExecutor) return false;
     if (
       this.opLock !== null
@@ -7077,6 +8049,38 @@ export default class EasySyncPlugin extends Plugin {
         `blocked auto sync result (${trigger})`,
       )) {
         dispatched = true;
+        return true;
+      }
+      if (webDavActive) {
+        // WebDAV：引导失败（根不可写、需要接管、密码缺失…）就不进入本轮。
+        // 自动轮不弹通知——用户没在等结果，失败原因留在诊断里，由手动轮或
+        // 状态栏给出一句可读的结论。
+        if (!await this.ensureWebDavSyncReady()) {
+          this.diag.warn(
+            "execute",
+            "auto sync skipped — WebDAV runtime is not ready",
+            { trigger },
+          );
+          return true;
+        }
+        if (
+          trigger !== "recovery-continuation"
+          && this.state?.isV2StateActive
+          && this.state.mutationLedger.length > 0
+        ) {
+          this.requestMutationRecoveryObservation(trigger);
+          return true;
+        }
+        if (this.state?.planReviewActive) {
+          this.diag.log(
+            "execute",
+            `auto sync skipped — plan review pending (${trigger})`,
+          );
+          return true;
+        }
+        this.diag.log("execute", `auto sync started — trigger=${trigger}`);
+        dispatched = true;
+        await this.dispatchSyncRun({ mode: "auto" });
         return true;
       }
       if (!await this.checkAccountBinding()) return true;
@@ -7167,7 +8171,7 @@ export default class EasySyncPlugin extends Plugin {
       || !this.state?.confirmedDescendantFileReconstruction
       || this.state.hasV2StateLoadRecoveryBlock
       || this.state.planReviewActive
-      || !this.auth?.authState.isLoggedIn
+      || (!this.isWebDavSyncActive() && !this.auth?.authState.isLoggedIn)
       // 自动面静默（2026-10-29）：重建续跑是一轮自动同步，与其它自动轮同规
       // ——总开关关或已暂停时不开；检查点与失败重试阶梯原样保留，由下一次
       // 手动轮（计划层会接手）或恢复后的自动轮补完。
@@ -7216,11 +8220,13 @@ export default class EasySyncPlugin extends Plugin {
         !this.state?.confirmedDescendantFileReconstruction
         || this.state.hasV2StateLoadRecoveryBlock
         || this.state.planReviewActive
-        || !this.auth?.authState.isLoggedIn
+        || (!this.isWebDavSyncActive() && !this.auth?.authState.isLoggedIn)
         || this.autoSyncPaused
         || !this.isAutoSyncMasterEnabled()
       ) return;
-      if (!await this.checkAccountBindingForSync()) return;
+      if (this.isWebDavSyncActive()) {
+        if (!await this.ensureWebDavSyncReady()) return;
+      } else if (!await this.checkAccountBindingForSync()) return;
       await this.dispatchSyncRun({
         mode: "auto",
         logLabel: "descendant file baseline continuation result",
@@ -7325,8 +8331,15 @@ export default class EasySyncPlugin extends Plugin {
       && Object.values(participation.pluginsById).some((entry) =>
         entry.phase === "join-requested"
         || entry.phase === "restoring"
+        // Deterministic blocks (a desktop-only bundle on mobile) are not work
+        // that another automatic round can settle: they stay visible on the
+        // plugin row and are rechecked by ordinary/manual rounds through
+        // prepareCommunityPluginJoinsForSync(). Keeping them in this pending
+        // set only makes every automatic-sync path keep re-planning the same
+        // impossible join.
         || (entry.phase === "blocked"
-          && isCommunityPluginJoinBlockRecheckable(entry.blockedReason))
+          && isCommunityPluginJoinBlockRecheckable(entry.blockedReason)
+          && !isCommunityPluginJoinBlockDeterministic(entry.blockedReason))
       );
   }
 
@@ -7340,6 +8353,41 @@ export default class EasySyncPlugin extends Plugin {
    *  switch's derived on/off display). */
   refreshSettingsTab(): void {
     this.settingsTab?.refreshSyncState();
+  }
+
+  /** Status-bar updates are frequent; the settings page is a full re-render.
+   *  A hidden page (the tab stays constructed after close) does not need it at
+   *  all, and a visible one only needs progress facts at human cadence. */
+  private refreshSettingsSyncStateSoon(): void {
+    const tab = this.settingsTab;
+    if (!tab) return;
+    const container = tab.containerEl as HTMLElement | undefined;
+    if (
+      container
+      && typeof container.isShown === "function"
+      && !container.isShown()
+    ) return;
+    const now = Date.now();
+    const wait = 1_000 - (now - this.settingsSyncRefreshAt);
+    if (wait <= 0) {
+      this.settingsSyncRefreshAt = now;
+      tab.refreshSyncState();
+      return;
+    }
+    if (this.settingsSyncRefreshTimer !== null) return;
+    this.settingsSyncRefreshTimer = compatSetTimeout(() => {
+      this.settingsSyncRefreshTimer = null;
+      const current = this.settingsTab;
+      if (!current) return;
+      const currentContainer = current.containerEl as HTMLElement | undefined;
+      if (
+        currentContainer
+        && typeof currentContainer.isShown === "function"
+        && !currentContainer.isShown()
+      ) return;
+      this.settingsSyncRefreshAt = Date.now();
+      current.refreshSyncState();
+    }, wait);
   }
 
   /** 设置页「规则」行是否已被「我知道了」收起（本设备记忆；重置同步状态会一并清空）。 */
@@ -7552,9 +8600,25 @@ export default class EasySyncPlugin extends Plugin {
       if (typeof data[KEY_MOBILE_STATUS_BAR] === "boolean") {
         this.mobileStatusBar = data[KEY_MOBILE_STATUS_BAR];
       }
+      // Explicit saved booleans win: a device that turned the switch off
+      // stays off. A missing key keeps the product default (on since
+      // 2026-11-24); an unknown saved threshold still falls back to 8 MiB.
+      this.lanAccelerationEnabled =
+        typeof data[KEY_LAN_ACCELERATION] === "boolean"
+          ? data[KEY_LAN_ACCELERATION]
+          : DEFAULT_LAN_ACCELERATION_ENABLED;
+      this.lanAccelerationThresholdMb = normalizeLanAccelerationThresholdMb(
+        data[KEY_LAN_ACCELERATION_THRESHOLD_MB],
+      );
       if (Array.isArray(data[KEY_ACKNOWLEDGED_RULES])) {
         this.acknowledgedRules = data[KEY_ACKNOWLEDGED_RULES]
           .filter((ruleId): ruleId is string => typeof ruleId === "string");
+      }
+      if (
+        typeof data[KEY_VAULT_CLOUD_CLIENT_WARNING_SNOOZE_DATE] === "string"
+      ) {
+        this.vaultCloudClientWarningSnoozeDate =
+          data[KEY_VAULT_CLOUD_CLIENT_WARNING_SNOOZE_DATE];
       }
       if (typeof data[KEY_SYNC_PLUGIN_FILES] === "boolean") this.syncPluginFiles = data[KEY_SYNC_PLUGIN_FILES];
       if (typeof data[KEY_DIAG_LOG] === "boolean") this.diagLogEnabled = data[KEY_DIAG_LOG];
@@ -7593,6 +8657,10 @@ export default class EasySyncPlugin extends Plugin {
         getConfigDir(this.app.vault),
       );
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
+      // 切换后的「首轮须手动」标记跟这台设备走：换设备不该因为它替用户
+      // 决定什么时候跑第一轮。
+      this.activationFirstManualPending =
+        data[KEY_ACTIVATION_FIRST_MANUAL] === true;
       this.lastResetFacts = parseDiagnosticResetFacts(data[KEY_LAST_RESET_FACTS]);
       this.rsAdoptionMarker = parseRsAdoptionMarker(data[KEY_RS_ADOPTION_MARKER]);
       this.syncMaxFileSizeMb = normalizeMaxFileSizeMb(data[KEY_MAX_FILE_SIZE_MB]);
@@ -7611,8 +8679,15 @@ export default class EasySyncPlugin extends Plugin {
         data[KEY_AUTOMATIC_HANDLING_POLICY],
         data[KEY_LEGACY_AUTO_MERGE],
       );
-      this.syncDirection = readSyncDirection(data[KEY_SYNC_DIRECTION]);
-    }
+    // `data` 是**当前账本**的视图，而「当前账本」由云端字段决定（F1 分账）。
+    // 所以云端字段必须先读：先读其余账本键会拿到上一本账的视图（切换云端
+    // 后的第一次加载会因此读到另一个云端的同步模式与基线）。
+    this.cloudSettings = readCloudSettings(data, {
+      provider: KEY_CLOUD_PROVIDER,
+      webdav: KEY_CLOUD_WEBDAV,
+    });
+    this.syncDirection = readSyncDirection(data[KEY_SYNC_DIRECTION]);
+  }
     // The read is background work now: a plugin that unloaded while it was in
     // flight must not push settings into a torn-down session.
     if (this.unloaded) return;
@@ -7620,6 +8695,179 @@ export default class EasySyncPlugin extends Plugin {
     this.applyMaxFileSize();
     this.applyDiagnosticSetting();
     this.applyNotificationPopups();
+    // 密码是否在本机：设置页渲染是同步的，读 SecretStorage 是异步的，所以在
+    // 设置加载尾部探测一次（只在已配置 WebDAV 时读，OneDrive 用户零额外读取）。
+    // 走 `cloud-secrets` 的轻量模块（不拉 WebDAV 客户端），默认启动面不增重。
+    if (this.cloudSettings.webdav) {
+      void import("./cloud/cloud-secrets")
+        .then(({ createCloudSecrets }) =>
+          createCloudSecrets(this.app.secretStorage ?? null).readWebDavPassword())
+        .then((password: string | null) => {
+          if (this.unloaded) return;
+          this.hasSavedWebDavPassword = password !== null;
+          this.settingsTab?.refreshSyncState();
+        })
+        .catch(() => undefined);
+    }
+    this.applyLanAccelerationRuntime();
+  }
+
+  /** S4: push the persisted switch/threshold into the live client. */
+  applyLanAccelerationRuntime(): void {
+    this.onedrive?.setLanAcceleration?.({
+      enabled: this.lanAccelerationEnabled,
+      thresholdBytes: lanAccelerationThresholdBytes(
+        this.lanAccelerationThresholdMb,
+      ),
+    });
+    this.applyLanAutoConnectRuntime();
+  }
+
+  /**
+   * Whether this device should prewarm a LAN acquisition.
+   *
+   * Only mobile qualifies. This feature is receive-only and mobile is the
+   * receive-only platform: a desktop that prewarms competes with its own
+   * sender role (one manager, one acquisition slot), and the desktop is the
+   * side that has to stay free to answer. Field evidence 2026-11-20 23:27:
+   * a desktop that had downloaded a diagnostic report prewarmed, blocked its
+   * watcher for 20 s, and the phone's request went unanswered until long
+   * after the phone had already fallen back to a 79 KB/s cloud download.
+   */
+  private expectsDownloads(): boolean {
+    return this.platformFacts.isMobileApp;
+  }
+
+  /**
+   * S5a: start or stop the automatic connection manager with the same switch.
+   *
+   * The manager (watcher + acquirer + WebRTC) is dynamically imported so it
+   * stays out of the startup closure; `getSettingDefinitions()` never reaches
+   * this method. Turning the switch off stops polling and removes any injected
+   * source immediately, restoring the exact cloud download shape.
+   */
+  applyLanAutoConnectRuntime(): void {
+    // `== null` covers harnesses that leave the field undefined before onload
+    // builds the client; production always has an instance here.
+    if (this.unloaded || this.onedrive == null) return;
+    if (!this.lanAccelerationEnabled) {
+      this.lanAutoConnect?.stop();
+      this.lanAutoConnect = null;
+      // Optional call: test harnesses may inject a partial client surface;
+      // production always has the method.
+      this.onedrive.setLanSourceProvider?.(null);
+      return;
+    }
+    if (this.lanAutoConnect !== null || this.lanAutoConnectLoad !== null) return;
+    const load = Promise.all([
+      import("./sync/lan-auto-connect"),
+      import("./onedrive/lan-signal-transport"),
+    ])
+      .then(([{ LanAutoConnectManager }, { createOneDriveLanSignalTransport }]) => {
+        if (this.unloaded || !this.lanAccelerationEnabled) return;
+        const client = this.onedrive;
+        if (client === null) return;
+        const manager = new LanAutoConnectManager({
+          createTransport: () => {
+            const active = this.onedrive;
+            if (active === null) throw new Error("LAN client is not ready");
+            // Same OneDrive-backed control-file adapter the dev modal uses.
+            return createOneDriveLanSignalTransport(
+              active,
+              this.app.vault.getName(),
+            );
+          },
+          serveGate: this.lanServeGateDeps(),
+          injectSource: (source) => {
+            if (this.onedrive === null) return false;
+            this.onedrive.setLanContentSource(source);
+            return true;
+          },
+          clearSource: () => {
+            this.onedrive?.setLanContentSource(null);
+          },
+          platform: this.platformFacts,
+          log: (event, message) => {
+            // Only step/route/bytes/elapsed leave this sink; no secret, IP or
+            // candidate text can reach the diagnostic log.
+            this.diag.log("execute", message, {
+              step: event.step,
+              result: event.result,
+              route: event.route,
+              bytes: event.bytes,
+              elapsedMs: event.elapsedMs,
+            });
+          },
+          savePairing: (raw) => this.saveLanPairingSecret(raw),
+          // The sidebar chip is display-only and shared with the dev modal.
+          // `applyLanTransferPhase` keeps the two owners from clearing each
+          // other's live session when one of them closes.
+          reportPhase: (phase) => this.setLanAutoTransferPhase(phase),
+          reportProgress: (downloaded, total) => {
+            this.reportLanAutoTransferProgress(downloaded, total);
+          },
+        });
+        this.lanAutoConnect = manager;
+        manager.start();
+        client.setLanSourceProvider({
+          acquire: (hint) => manager.acquire(hint),
+          prewarm: () => manager.prewarm(),
+          stop: () => manager.stop(),
+        });
+      })
+      .catch((error: unknown) => {
+        this.diag.warn(
+          "execute",
+          "LAN auto connect module failed to load",
+          describeError(error),
+        );
+      })
+      .finally(() => {
+        this.lanAutoConnectLoad = null;
+      });
+    this.lanAutoConnectLoad = load;
+  }
+
+  /** Shared six-check sender gate deps for both LAN callers. */
+  private lanServeGateDeps(): LanServeGateDeps {
+    return {
+      isReady: () => this.state !== null && this.scanner !== null,
+      getBaseEntry: (path) => this.state?.getBaseEntry(path),
+      shouldSyncPath: (path) => this.scanner?.shouldSyncPath(path) === true,
+      inspectFile: async (path) => {
+        // The gate only reads this when state/scanner are ready (`isReady`);
+        // a missing scanner still fails closed as "not available".
+        if (this.scanner === null) return { status: "missing" };
+        return this.scanner.inspectFile(path);
+      },
+      readRemoteETag: async (path) => {
+        const active = this.onedrive;
+        if (active === null) return null;
+        const remote = await active.getDriveItemMetadata(
+          this.app.vault.getName(),
+          path,
+        );
+        return remote?.eTag ?? null;
+      },
+      readLocalBytes: (path) => this.app.vault.adapter.readBinary(path),
+      hashBytes: (bytes) => sha256Hex(bytes),
+    };
+  }
+
+  /** Dev modal + automatic manager share this exact entry. */
+  private async resolveLanServeFileForHost(
+    request: LanServeRequest,
+  ): Promise<LanServeResult | { error: string }> {
+    return resolveLanServeFile(this.lanServeGateDeps(), request);
+  }
+
+  private async saveLanPairingSecret(raw: string): Promise<void> {
+    this.lanPairingFallbackSecret = raw;
+    try {
+      await this.saveSecret(KEY_LAN_PAIRING_SECRET, raw);
+    } catch {
+      // Session fallback keeps the in-memory copy for this run.
+    }
   }
 
   /** M14: serialized PluginData write. All callers (StateManager, settings,
@@ -7647,8 +8895,18 @@ export default class EasySyncPlugin extends Plugin {
       // The private synchronous mutator never escapes this candidate. Keeping
       // the old cache until saveData succeeds preserves failure atomicity while
       // avoiding a second whole-object clone after the physical write.
-      const data = committed === null ? {} : clonePluginData(committed);
-      mutator(data);
+      //
+      // F1 云端分账：mutator 看到的是**当前账本的视图**，写回的只有当前账
+      // 本那一份。物理对象先深拷一份再摊平，所以失败时缓存原封不动（与
+      // 之前同一条原子性保证）；摊平/压回都只做顶层键的重排，不复制值。
+      const physical = committed === null ? {} : clonePluginData(committed);
+      const bookId = resolveActiveCloudBookId(physical, {
+        provider: KEY_CLOUD_PROVIDER,
+        webdav: KEY_CLOUD_WEBDAV,
+      });
+      const view = liftCloudBookView(physical, bookId);
+      mutator(view);
+      const data = pushCloudBookView(physical, view, bookId);
       const prepareFinishedAt = diagnosticsEnabled ? performance.now() : 0;
       const measurementStartedAt = prepareFinishedAt;
       const measurement = diagnosticsEnabled ? measurePluginDataWrite(data) : null;
@@ -7699,7 +8957,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   async loadPluginData(): Promise<Record<string, unknown> | null> {
-    const data = await this.ensurePluginDataCache();
+    const data = await this.readPluginDataSnapshot();
     return data === null ? null : clonePluginData(data);
   }
 
@@ -7708,9 +8966,56 @@ export default class EasySyncPlugin extends Plugin {
    * read (settings, auth profile cache). Skips the defensive whole-object
    * clone `loadPluginData()` pays on every call; the returned object must not
    * be mutated. Writes go through `updatePluginData`, which clones first.
+   *
+   * F1 云端分账：返回的是**当前活动账本**的视图。账本键（基线、账本、
+   * 历史、同步模式……）来自当前云端自己的那一份；设备键（同步类别、间隔、
+   * 通知、诊断）与云端身份字段在所有账本间共用。视图按账本 id 缓存，只要
+   * 不切换账本，读路径仍然是零拷贝。
    */
   async readPluginDataSnapshot(): Promise<Readonly<Record<string, unknown>> | null> {
-    return this.ensurePluginDataCache();
+    const raw = await this.ensurePluginDataCache();
+    if (raw === null) return null;
+    return this.pluginDataBookView(raw);
+  }
+
+  /**
+   * 当前活动的账本 id（永不显示给用户；只决定读写哪一份账）。
+   *
+   * 判据取**物理数据里持久化的云端字段**，不取内存设置：账本视图是在
+   * 「读磁盘」这条路上摊平的，与 `loadSyncSettings` 的赋值顺序无关。若这里
+   * 反读内存设置，就会形成「设置还没赋值 → 拿了上一本账 → 设置随后从这本
+   * 账里读」的循环。
+   */
+  get activeCloudBookId(): string {
+    return resolveActiveCloudBookId(
+      this.pluginDataCache ?? {},
+      { provider: KEY_CLOUD_PROVIDER, webdav: KEY_CLOUD_WEBDAV },
+    );
+  }
+
+  /** 账本 sidecar 子目录（相对插件目录）；null＝原地（OneDrive）。 */
+  get activeCloudBookDirectory(): string | null {
+    return cloudBookDirectory(this.activeCloudBookId);
+  }
+
+  /**
+   * 缓存视图。键是账本 id：物理形状一变（写盘、切换）就重建。
+   *
+   * 这里刻意不 clone——契约与 `readPluginDataSnapshot` 原来的契约一致
+   * （只读，写走 `updatePluginData`），而多拷一份会让每个设置读取都付一次
+   * 全量浅拷贝。
+   */
+  private pluginDataBookView(
+    raw: Record<string, unknown>,
+  ): Readonly<Record<string, unknown>> {
+    const bookId = this.activeCloudBookId;
+    if (this.pluginDataViewCache?.bookId === bookId
+      && this.pluginDataViewCache.raw === raw) {
+      return this.pluginDataViewCache.view;
+    }
+    const view = liftCloudBookView(raw, bookId);
+    this.pluginDataViewCache = { bookId, raw, view };
+    return view;
   }
 
   private async ensurePluginDataCache(): Promise<Record<string, unknown> | null> {
@@ -7783,13 +9088,23 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_DIAG_LOG] = this.diagLogEnabled;
       this.writeSyncPathSettingsData(data, this.captureSyncPathSettings());
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;
+      data[KEY_ACTIVATION_FIRST_MANUAL] = this.activationFirstManualPending;
       data[KEY_MAX_FILE_SIZE_MB] = this.syncMaxFileSizeMb;
       data[KEY_AUTOMATIC_HANDLING_POLICY] = { ...this.automaticHandlingPolicy };
       data[KEY_SYNC_DIRECTION] = this.syncDirection;
       data[KEY_NOTIFICATION_POPUPS] = this.notificationPopups;
       data[KEY_MOBILE_STATUS_BAR] = this.mobileStatusBar;
+      data[KEY_LAN_ACCELERATION] = this.lanAccelerationEnabled;
+      data[KEY_LAN_ACCELERATION_THRESHOLD_MB] =
+        this.lanAccelerationThresholdMb;
       data[KEY_ACKNOWLEDGED_RULES] = this.acknowledgedRules;
+      data[KEY_VAULT_CLOUD_CLIENT_WARNING_SNOOZE_DATE] =
+        this.vaultCloudClientWarningSnoozeDate;
       data[KEY_LAST_RESET_FACTS] = this.lastResetFacts;
+      writeCloudSettings(data, this.cloudSettings, {
+        provider: KEY_CLOUD_PROVIDER,
+        webdav: KEY_CLOUD_WEBDAV,
+      });
     });
   }
 
@@ -9312,6 +10627,101 @@ export default class EasySyncPlugin extends Plugin {
     return this.transferRateSampler.getReading();
   }
 
+  /** 局域网会话的唯一读数出口。会话不在时返回 null，侧栏速度胶囊随即沿用
+   *  原云读数规则（不另建显示面、不新增文案）。 */
+  getLanTransferIndicator(): LanTransferIndicator | null {
+    return this.lanTransferActivity.getIndicator();
+  }
+
+  /** 会话阶段由实验弹框在生命周期节点上报；`null` 表示会话结束。 */
+  setLanTransferPhase(phase: Parameters<
+    LanTransferActivity["setPhase"]
+  >[0]): void {
+    this.applyLanTransferPhase("modal", phase);
+  }
+
+  /** 传输字节进度（发送端上线字节／接收端已收字节）。只在会话进行时上报。 */
+  reportLanTransferProgress(downloaded: number, total: number): void {
+    // Byte progress only means something for the session that owns the chip.
+    if (this.lanTransferPhaseOwner !== "modal") return;
+    if (this.lanTransferActivity.reportProgress(downloaded, total)) {
+      // The modal reports only pairing/connected; the first byte flips the
+      // activity to `transferring` internally, so the demand ticker must be
+      // armed on that edge (and stopped when the payload settles).
+      this.syncView?.refreshTransferIndicator();
+    }
+  }
+
+  /** 自动连接管理器上报阶段；同一枚胶囊，生命周期与弹框并列。 */
+  setLanAutoTransferPhase(phase: Parameters<
+    LanTransferActivity["setPhase"]
+  >[0]): void {
+    this.applyLanTransferPhase("auto", phase);
+  }
+
+  /** 自动连接管理器上报字节进度。 */
+  reportLanAutoTransferProgress(downloaded: number, total: number): void {
+    if (this.lanTransferPhaseOwner !== "auto") return;
+    if (this.lanTransferActivity.reportProgress(downloaded, total)) {
+      this.syncView?.refreshTransferIndicator();
+    }
+  }
+
+  /**
+   * 局域网胶囊的唯一写入点。
+   *
+   * 两个来源（实验弹框、自动连接）是并列的会话，不是主从关系，但共用一枚
+   * 胶囊就必须有归属规则：
+   *  - 弹框是用户显式打开的诊断窗口，打开期间持有显示权；自动连接的后报只
+   *    更新「弹框关闭后的回退值」，不得抢走图标；
+   *  - 弹框关闭时的 `null` 不得清掉自动连接仍活的会话——显示权交还给自动
+   *    连接最近一次阶段，只有它也为空时才真正熄灭；
+   *  - 任一方报告 `null` 只作用于自己持有的显示权，另一方的会话不受影响。
+   */
+  private applyLanTransferPhase(
+    owner: "modal" | "auto",
+    phase: Parameters<LanTransferActivity["setPhase"]>[0],
+  ): void {
+    if (owner === "auto") {
+      this.lanAutoTransferPhase = phase;
+      if (phase === null) {
+        if (this.lanTransferPhaseOwner !== "auto") return;
+        this.lanTransferPhaseOwner = null;
+        this.applyLanActivityPhase(null);
+        return;
+      }
+      // The open dialog outranks the background session on the shared chip.
+      if (this.lanTransferPhaseOwner === "modal") return;
+      this.lanTransferPhaseOwner = "auto";
+      this.applyLanActivityPhase(phase);
+      return;
+    }
+    if (phase === null) {
+      if (this.lanTransferPhaseOwner !== "modal") return;
+      this.lanTransferPhaseOwner = null;
+      const fallback = this.lanAutoTransferPhase;
+      if (fallback === null) {
+        this.applyLanActivityPhase(null);
+        return;
+      }
+      this.lanTransferPhaseOwner = "auto";
+      this.applyLanActivityPhase(fallback);
+      return;
+    }
+    this.lanTransferPhaseOwner = "modal";
+    this.applyLanActivityPhase(phase);
+  }
+
+  /** Phase changes are rare; the sidebar's live ticker is demand-driven now,
+   *  so each write also refreshes the chip immediately and arms the ticker.
+   *  Per-chunk byte progress keeps riding the ticker that the phase opened. */
+  private applyLanActivityPhase(
+    phase: Parameters<LanTransferActivity["setPhase"]>[0],
+  ): void {
+    this.lanTransferActivity.setPhase(phase);
+    this.syncView?.refreshTransferIndicator();
+  }
+
   /**
    * Pending new-plugin rows for the sidebar. Only returned while the
    * community-plugin files scope is on; the persisted memory itself stays
@@ -10407,6 +11817,7 @@ export default class EasySyncPlugin extends Plugin {
     const historyValues = this.renderDiagnosticSyncHistorySection(renderCtx);
     this.renderDiagnosticFailedFileDetailsSection(renderCtx, historyValues);
     this.renderDiagnosticConnectionSpeedSection(renderCtx, historyValues);
+    this.renderDiagnosticLanSection(renderCtx);
     this.renderDiagnosticDownloadTransferSection(renderCtx, headerValues);
     await this.renderDiagnosticPendingIssuesSection(renderCtx, historyValues);
     await this.renderDiagnosticAnomaliesSection(renderCtx, {
@@ -10643,6 +12054,133 @@ export default class EasySyncPlugin extends Plugin {
     });
   }
 
+  /**
+   * F3 停用：把活动云端交还 OneDrive，**配置与账本都留着**。
+   *
+   * 这是设计稿 §5.1 里唯一没有写入通路的动作。原先只有
+   * `writeConnection(null)`（会连地址密码一起删）和「保存配置即激活」，所以
+   * 「停用」在代码里根本表达不出来。`writeCloudSettings` 本来就支持
+   * `{provider:"onedrive", webdav:{...}}` 这个形状（只有两边都空才删字段），
+   * 缺的只是调用方——就是这里。
+   *
+   * 守卫复用现役谓词（与模式切换同一套）：有轮次在跑／有权锁／有未结算恢复
+   * 都不许切，并按现役文案指名实际阻塞者。停用不弹确认、不写任何账。
+   *
+   * 返回 true＝已停用。
+   */
+  async deactivateCloudAndRestoreOneDrive(): Promise<boolean> {
+    if (this.cloudSettings.provider !== "webdav") return false;
+    return this.switchActiveCloud("onedrive");
+  }
+
+  /**
+   * F3-c 真正切换活动云端（两个方向共用）。
+   *
+   * 与停用的差别只在入口是否弹手输确认；守卫、写入、账本重建完全同一条路。
+   * **必须重建状态**：账本换了，内存里的 `state` 还是旧账的内容；不重读的话
+   * 下一次 `updatePluginData` 会把旧账写进新账本（数据零丢失优先级下这是
+   * 最不能接受的一类污染）。
+   *
+   * 返回 true＝已切换或本来就在目标云端。
+   */
+  private async switchActiveCloud(
+    provider: "onedrive" | "webdav",
+  ): Promise<boolean> {
+    if (this.cloudSettings.provider === provider) return true;
+    if (this.isSyncPathBusy()) {
+      this.showSyncModeBusyNotice();
+      return false;
+    }
+    if (this.hasUnsettledMutationRecovery()) {
+      this.showSyncModePendingWorkNotice();
+      return false;
+    }
+    const previous = this.cloudSettings;
+    const previousFirstManual = this.activationFirstManualPending;
+    this.cloudSettings = { provider, webdav: previous.webdav };
+    // 首轮必须手动：切换后的自动轮一律让路，直到一轮手动同步成功跑完。
+    this.activationFirstManualPending = true;
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.cloudSettings = previous;
+      this.activationFirstManualPending = previousFirstManual;
+      throw error;
+    }
+    // 运行时与执行器换到新云端；账本目录由 provider 派生，随后必须重读。
+    this.invalidateWebDavRuntime();
+    await this.reloadStateForActiveBook();
+    this.settingsTab?.refreshSyncState();
+    return true;
+  }
+
+  /** 换账本后从新账重读状态；失败不抛给调用方（切换本身已落盘）。 */
+  private async reloadStateForActiveBook(): Promise<void> {
+    this._stateLoaded = false;
+    this.stateLoadPromise = null;
+    try {
+      await this.ensureStateLoaded();
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "state reload after cloud switch failed",
+        describeError(error),
+      );
+    }
+    this.updateStatusBar();
+    this.syncView?.render();
+  }
+
+  /**
+   * A8 手输确认的本体（纯确认，不记任何意图）。
+   *
+   * 两个入口共用：WebDAV 侧在打开配置弹窗之前，OneDrive 侧在开始登录之前。
+   * 调用方决定要不要弹（「只在真正要切过去时」）。
+   */
+  async confirmCloudActivation(): Promise<boolean> {
+    const { CloudSwitchGateModal } = await import(
+      "./ui/cloud-switch-gate-modal"
+    );
+    return new CloudSwitchGateModal(
+      this.app,
+      this.i18n.t.bind(this.i18n),
+    ).awaitDecision();
+  }
+
+  /**
+   * 登录入口（`auth-entry-flow`）用的确认：确认后才把「切回 OneDrive」的
+   * 意图记下来，等登录成功那一刻兑换成切换。WebDAV 不在用时无需确认。
+   */
+  async confirmOneDriveActivation(): Promise<boolean> {
+    if (!this.isWebDavSyncActive()) return true;
+    const confirmed = await this.confirmCloudActivation();
+    if (confirmed) this.pendingOneDriveActivation = true;
+    return confirmed;
+  }
+
+  /**
+   * 登录 OneDrive 成功后完成激活（`confirmCloudActivation` 已点过「切换」）。
+   *
+   * 取消／失败时清掉意图：下一次恢复出来的会话不该替用户做切换决定。
+   */
+  private handleOneDriveActivationProgress(): void {
+    if (!this.pendingOneDriveActivation) return;
+    const auth = this.auth;
+    if (!auth) return;
+    if (auth.authState.isLoggedIn && !auth.isSessionPending) {
+      void this.completeOneDriveActivation();
+      return;
+    }
+    if (!auth.isPending) this.pendingOneDriveActivation = false;
+  }
+
+  private async completeOneDriveActivation(): Promise<void> {
+    if (!this.pendingOneDriveActivation) return;
+    this.pendingOneDriveActivation = false;
+    if (!this.isWebDavSyncActive()) return;
+    await this.switchActiveCloud("onedrive");
+  }
+
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
   private async renderDiagnosticHeaderSection(ctx: DiagnosticReportRenderContext): Promise<Pick<DiagnosticReportProvidedValues, "diagAll" | "runSummaries" | "remoteScopeRecoverySummary">> {
     const {
@@ -10676,7 +12214,8 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**生成时间**: ${fmt(now.getTime())}`);
     lines.push(`**插件版本**: ${this.manifest.version}`);
     lines.push(`**仓库名**: ${this.app.vault.getName()}`);
-    lines.push(`**登录账号**: ${auth?.isLoggedIn ? auth.displayName || "已登录" : "未登录"}`);
+    // 昵称为空白／不可见时回退账号名（邮箱/UPN），两者都没有才按「已登录」兜底。
+    lines.push(`**登录账号**: ${auth?.isLoggedIn ? resolveAccountDisplayName(auth.displayName, auth.accountName, "已登录") : "未登录"}`);
     const accountTypeLabel = !auth?.isLoggedIn
       ? "未登录"
       : auth.userType === "Guest"
@@ -11069,6 +12608,23 @@ export default class EasySyncPlugin extends Plugin {
     );
   }
 
+  /**
+   * 诊断报告区块：局域网加速（S5b）。
+   *
+   * 紧邻「连接速度（被动实测）」之后，内容是纯内存事实：最近一次尝试来自
+   * `LanDiagnostics`，次数来自同一实例的只增计数器。不发起网络请求、不读盘、
+   * 不改同步历史 schema。整个区块常开——它是既有的只读证据，不是诊断日志
+   * 的附属项；没有尝试时也写明「未发生局域网尝试」，不让读者猜。
+   */
+  private renderDiagnosticLanSection(ctx: DiagnosticReportRenderContext): void {
+    ctx.lines.push(
+      ...formatLanDiagnosticsSection({
+        last: this.lanDiagnostics.getLast(),
+        counters: this.lanDiagnostics.getCounters(),
+      }),
+    );
+  }
+
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
   private async renderDiagnosticPendingIssuesSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "formatSize">): Promise<void> {
     const {
@@ -11336,9 +12892,20 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("*暂无结构化文件传输摘要。*");
     }
     lines.push("");
+    // S5b: LAN step/result lines are diagnostic evidence too — otherwise a
+    // user-exported report cannot say whether the local network was ever
+    // tried. They are per-file and far more numerous than warnings, so only
+    // the newest lane window enters the shared 200-row cap; without this a
+    // busy LAN round would push every real warning out of the report.
+    const lanLogWindow = new Set(
+      diagAll
+        .filter(isLanDiagnosticLogEntry)
+        .slice(-LAN_DIAGNOSTIC_LOG_LIMIT),
+    );
     const diagEntries = diagAll
       .filter((e) => e.lvl === "warn" || e.lvl === "error"
         || (e.cat === "onedrive" && e.lvl === "log" && e.msg.includes("downloadFile"))
+        || (isLanDiagnosticLogEntry(e) && lanLogWindow.has(e))
       )
       .slice(-200);
     lines.push("## 近期异常日志");
@@ -11350,7 +12917,10 @@ export default class EasySyncPlugin extends Plugin {
       const execFailures = diagEntries.filter(
         (e) => e.cat === "execute" && e.lvl === "error" && e.msg.includes("FAILED:"),
       );
-      const others = diagEntries.filter((e) => !execFailures.includes(e));
+      const lanEntries = diagEntries.filter(isLanDiagnosticLogEntry);
+      const others = diagEntries.filter(
+        (e) => !execFailures.includes(e) && !isLanDiagnosticLogEntry(e),
+      );
 
       if (execFailures.length > 0) {
         lines.push("### 文件传输失败详情");
@@ -11378,6 +12948,20 @@ export default class EasySyncPlugin extends Plugin {
           }
         }
         lines.push("```");
+      }
+
+      if (lanEntries.length > 0) {
+        // S5b: LAN lines are not exceptions. They get their own short block so
+        // the title above stays truthful, and each row is re-projected through
+        // a field whitelist (step/result/route/bytes/elapsedMs) instead of the
+        // raw `data` object — room secrets, endpoints and candidate text have
+        // no path into the report even if a future logger adds them.
+        lines.push(
+          ...formatLanLogSection(
+            lanEntries,
+            (ts) => resetPhasePrefix(ts, resetFacts),
+          ),
+        );
       }
     }
     lines.push("");
@@ -11431,6 +13015,7 @@ export default class EasySyncPlugin extends Plugin {
    */
   private initStatusBar(): void {
     if (!this.statusBarEl) return;
+    this.statusBarRenderSignature = "";
     this.statusBarEl.addClass("easy-sync-status-bar-item");
     this.statusBarEl.addClass("mod-clickable");
     this.statusBarEl.onClickEvent(() => {
@@ -11599,6 +13184,8 @@ export default class EasySyncPlugin extends Plugin {
     group: StatusBarStatusGroup | null,
     text: string,
   ): void {
+    const signature = `${iconId}\u0000${group ?? ""}\u0000${text}`;
+    if (this.statusBarRenderSignature === signature) return;
     el.empty();
     // Must list every StatusBarStatusGroup value: the group class is added
     // below from `group`, so one left behind here keeps tinting the icon after
@@ -11620,6 +13207,8 @@ export default class EasySyncPlugin extends Plugin {
     setIcon(iconEl, iconId);
     setTooltip(el, text);
     el.setAttr("aria-label", text);
+    // Record only after the paint succeeds so a throw retries next time.
+    this.statusBarRenderSignature = signature;
   }
 
   /** Public entry point — merges multiple calls within the same animation
@@ -11637,7 +13226,7 @@ export default class EasySyncPlugin extends Plugin {
 
   private doUpdateStatusBar(): void {
     this.updateRibbon();
-    this.settingsTab?.refreshSyncState();
+    this.refreshSettingsSyncStateSoon();
     if (!this.statusBarEl) return;
     const t = this.t;
     const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
@@ -11646,7 +13235,10 @@ export default class EasySyncPlugin extends Plugin {
 
     // Auth still initializing in background -> show "Connecting…" with a plain
     // cloud icon (no alarming color while the auth outcome is still unknown).
-    if (this.auth?.isInitializing) {
+    // F5：WebDAV 激活时 `initializing` 恒为 false——OneDrive 的会话恢复不该
+    // 让一台走 WebDAV 的设备显示「连接中」。
+    const readiness = this.activeCloudReadiness();
+    if (readiness.initializing) {
       this.renderStatusBarItem(
         this.statusBarEl,
         RIBBON_STATUS_ICONS.ready,
@@ -11656,8 +13248,7 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
 
-    const authState = this.auth?.authState;
-    if (!authState?.isLoggedIn) {
+    if (!readiness.loggedIn) {
       this.renderStatusBarItem(
         this.statusBarEl,
         RIBBON_STATUS_ICONS.loggedOut,
@@ -11671,7 +13262,7 @@ export default class EasySyncPlugin extends Plugin {
     // or refresh failure). Sync authorization is fail-closed until Graph /me
     // binds the account, so do not claim the vault is ready or in sync — reuse
     // the same "connecting" presentation as the initializing state.
-    if (this.auth?.isSessionPending) {
+    if (readiness.sessionPending) {
       this.renderStatusBarItem(
         this.statusBarEl,
         RIBBON_STATUS_ICONS.ready,
@@ -11862,7 +13453,11 @@ export default class EasySyncPlugin extends Plugin {
         this.statusBarEl,
         RIBBON_STATUS_ICONS.ready,
         "ready",
-        t("status.lastSync", { time: new Date(lastSync).toLocaleTimeString() }),
+        t("status.lastSync", {
+          time: formatUserClockTime(lastSync, this.i18n.language, {
+            seconds: true,
+          }),
+        }),
       );
     } else {
       this.renderStatusBarItem(
@@ -11876,7 +13471,11 @@ export default class EasySyncPlugin extends Plugin {
 
   private updateRibbon(): void {
     if (!this.ribbonEl) return;
-    if ((this.auth?.isInitializing ?? true) || !this._stateLoaded) return;
+    // F5：走 WebDAV 时不看 OneDrive 的会话恢复——冷启动期间 Ribbon 也要能
+    // 立刻反映当前云端；OneDrive 下的守卫逐字不变（`auth` 未建好仍跳过）。
+    if (this.activeCloudReadiness().provider === "onedrive"
+      && (this.auth?.isInitializing ?? true)) return;
+    if (!this._stateLoaded) return;
     const status = this.getRibbonStatus();
     const recovery = this.getMutationRecoveryDisplayState();
     const hasHigherPriorityAttention =
@@ -11899,17 +13498,20 @@ export default class EasySyncPlugin extends Plugin {
             this.progressStore.state,
             this.i18n.t.bind(this.i18n),
           );
+    const signature = `${status}\u0000${label}`;
+    if (this.ribbonRenderSignature === signature) return;
     setIcon(this.ribbonEl, RIBBON_STATUS_ICONS[status]);
     setTooltip(this.ribbonEl, label);
     this.ribbonEl.setAttr("aria-label", label);
     this.ribbonEl.dataset.easySyncStatus = status;
+    this.ribbonRenderSignature = signature;
   }
 
   private getRibbonStatus(): RibbonOwnStatus {
     const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
     const sideActionRunning = this.syncExecutor?.hasSideActionsInFlight ?? false;
     return resolveRibbonStatus({
-      loggedIn: this.auth?.authState.isLoggedIn ?? false,
+      loggedIn: this.activeCloudReadiness().loggedIn,
       cancelling: this.progressStore.state.cancelRequested,
       // 同步入口占用（检测/准备期）并入运行档：Ribbon 是「点同步」的入口本身，
       // 整段窗口保持「立即同步」会让用户以为没点上（2026-10-10 拍板）。

@@ -3,6 +3,7 @@ import type { OneDriveClient } from "../src/onedrive/client";
 import type { DriveItem } from "../src/onedrive/types";
 import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
 import {
+  probeRsMigrationDestination,
   REMOTELY_SAVE_METADATA_FILE_PREFIX,
   runRsMigrationTransaction,
   seedBaseEntriesFromRsAdoption,
@@ -419,5 +420,106 @@ describe("runRsMigrationTransaction", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.reason).toBe("metadata-cleanup-failed");
     expect(outcome.marker).toBeNull();
+  });
+});
+
+describe("probeRsMigrationDestination", () => {
+  type ProbeClient = Pick<
+    OneDriveClient,
+    "initVaultScope" | "listFolderChildrenById"
+  >;
+
+  function probeClient(overrides: {
+    scope?: () => Promise<{
+      driveId: string;
+      vaultFolderId: string;
+      filesRootId: string;
+    }>;
+    children?: () => Promise<DriveItem[]>;
+  } = {}): {
+    client: ProbeClient;
+    initVaultScope: ReturnType<typeof vi.fn>;
+    listFolderChildrenById: ReturnType<typeof vi.fn>;
+  } {
+    const initVaultScope = vi.fn(
+      overrides.scope
+        ?? (async () => ({
+          driveId: "drive-1",
+          vaultFolderId: "vault-folder-id",
+          filesRootId: FILES_ROOT_ID,
+        })),
+    );
+    const listFolderChildrenById = vi.fn(
+      overrides.children ?? (async () => []),
+    );
+    return {
+      client: {
+        initVaultScope,
+        listFolderChildrenById,
+      } as unknown as ProbeClient,
+      initVaultScope,
+      listFolderChildrenById,
+    };
+  }
+
+  it("reports an empty destination without creating the vault layout", async () => {
+    const { client, initVaultScope, listFolderChildrenById } = probeClient();
+
+    await expect(
+      probeRsMigrationDestination(client, "测试库"),
+    ).resolves.toEqual({ status: "empty" });
+    expect(initVaultScope).toHaveBeenCalledWith("测试库", {
+      createMissing: false,
+    });
+    expect(listFolderChildrenById).toHaveBeenCalledWith(FILES_ROOT_ID);
+  });
+
+  it("reports a non-empty destination", async () => {
+    const { client } = probeClient({
+      children: async () => [
+        folderItem("existing", "已有内容", FILES_ROOT_ID),
+      ],
+    });
+
+    await expect(
+      probeRsMigrationDestination(client, "测试库"),
+    ).resolves.toEqual({ status: "non-empty" });
+  });
+
+  it("treats a missing vault layout as an empty destination", async () => {
+    const { client, listFolderChildrenById } = probeClient({
+      scope: async () => {
+        throw new OneDriveError(OneDriveErrorType.NotFound, "HTTP 404", 404);
+      },
+    });
+
+    await expect(
+      probeRsMigrationDestination(client, "测试库"),
+    ).resolves.toEqual({ status: "empty" });
+    expect(listFolderChildrenById).not.toHaveBeenCalled();
+  });
+
+  it("treats a vanished files root as empty", async () => {
+    const { client } = probeClient({
+      children: async () => {
+        throw new OneDriveError(OneDriveErrorType.NotFound, "HTTP 404", 404);
+      },
+    });
+
+    await expect(
+      probeRsMigrationDestination(client, "测试库"),
+    ).resolves.toEqual({ status: "empty" });
+  });
+
+  it("reports unknown for a non-404 failure so the offer keeps its shape", async () => {
+    const { client } = probeClient({
+      scope: async () => {
+        throw new Error("network down");
+      },
+    });
+
+    await expect(
+      probeRsMigrationDestination(client, "测试库"),
+    ).resolves.toEqual({ status: "unknown", reason: "network down" });
   });
 });

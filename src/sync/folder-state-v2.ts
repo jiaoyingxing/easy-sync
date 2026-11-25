@@ -96,6 +96,20 @@ interface FolderStatePlanInputV2 {
   includeFolderPath?: (path: string) => boolean;
   /** Remote-only device scope that must not become a folder mutation/conflict. */
   preserveFolderPath?: (path: string) => boolean;
+  /**
+   * 双向模式下，云端已经删掉、本机还在而且子树里仍有本机独有内容的文件夹，
+   * 按「本机内容为准」在云端重建，而不是跟随删除。单向模式不适用（那里由
+   * 执行期的「保留目录」语义承接，本地独有内容不会被自动上传）。
+   * 缺省 false＝保持原有「跟随删除」判定。
+   */
+  recreateRemoteDeletedFolderWithLocalContent?: boolean;
+  /**
+   * 稳定 ID provider 的单侧仅大小写文件夹改名是否按普通文件夹移动执行：
+   * 本机只改大小写、云端未动时发 `move-remote`；云端只改大小写、本机未动时发
+   * `move-local`。后代内容未变时由同一个文件夹回执携带整棵子树；路径身份
+   * provider（WebDAV）与缺省调用保持原来的可见冲突。
+   */
+  allowCaseOnlyFolderRename?: boolean;
 }
 
 interface FolderStatePlanViewInputV2
@@ -714,6 +728,35 @@ function resolveAnchorLocalEvidenceV2({
       && identityEquivalentLocal
       && nfcPath(identityEquivalentLocal) !== nfcPath(anchor.lastPath)
     ) {
+      // A local case-only rename while the cloud still sits at the anchored
+      // spelling is the mirror of the cloud-side case rename: the folder
+      // identity is unchanged, the subtree contents are compared by identity,
+      // and the ordinary folder move receipt carries the new spelling. Only a
+      // local FILE at the old identity keeps the fail-closed conflict.
+      const remotePath = input.state.remotePathById.get(anchor.remoteId);
+      const remoteUnchanged = remotePath !== undefined
+        && remotePath === anchor.lastPath;
+      const localFileAtOldIdentity = input.localFiles.some((entry) =>
+        identityPath(entry.path) === identityPath(anchor.lastPath));
+      const localSubtree = compareLocalSubtreeToAnchors(
+        anchor.lastPath,
+        identityEquivalentLocal,
+        input.state,
+        input.localFiles,
+        input.localFolders,
+        includeFilePath,
+        includeFolderPath,
+      );
+      if (
+        input.allowCaseOnlyFolderRename === true
+        && remoteUnchanged
+        && !localFileAtOldIdentity
+        && localSubtree.topologyMatches
+        && localSubtree.contentMatches
+      ) {
+        inferredLocalByRemoteId.set(anchor.remoteId, identityEquivalentLocal);
+        continue;
+      }
       localEvidenceConflicts.add(anchor.remoteId);
       continue;
     }
@@ -893,6 +936,7 @@ function planAnchoredFolderCandidatesV2(args: {
         anchor,
         inferredLocalPath,
         includeFolderPath,
+        includeFilePath,
         remoteFoldersByIdentity,
         anchoredRemoteIds,
         input,
@@ -1058,7 +1102,10 @@ function planAnchoredFolderLocalMoveV2({
   const targetKey = identityPath(inferredLocalPath);
   const occupiedRemote = remoteFoldersByIdentity.get(targetKey)
     ?? remoteFilesByIdentity.get(targetKey);
-  if (occupiedRemote) {
+  // Case-only rename: the destination identity is the anchored folder itself.
+  const selfOccupied = occupiedRemote?.id === anchor.remoteId
+    && input.allowCaseOnlyFolderRename === true;
+  if (occupiedRemote && !selfOccupied) {
     candidates.push(conflictCandidate(
       anchor.lastPath,
       "target-occupied",
@@ -1221,7 +1268,14 @@ function planAnchoredFolderRemoteMoveV2({
   input, remotePathById, candidates,
 }: AnchoredFolderRemoteMoveInputV2): void {
   const targetKey = identityPath(remotePath);
-  if (localFoldersByIdentity.has(targetKey) || localFilesByIdentity.has(targetKey)) {
+  const localFolderAtTarget = localFoldersByIdentity.get(targetKey);
+  const localFolderIsSource = input.allowCaseOnlyFolderRename === true
+    && localFolderAtTarget !== undefined
+    && identityPath(localFolderAtTarget) === identityPath(anchor.lastPath);
+  if (
+    (!localFolderIsSource && localFoldersByIdentity.has(targetKey))
+    || localFilesByIdentity.has(targetKey)
+  ) {
     candidates.push(conflictCandidate(
       anchor.lastPath,
       "target-occupied",
@@ -1322,6 +1376,7 @@ interface AnchoredFolderMissingRemoteInputV2 {
   anchor: FolderAnchorV2;
   inferredLocalPath: string | undefined;
   includeFolderPath: (path: string) => boolean;
+  includeFilePath: (path: string) => boolean;
   remoteFoldersByIdentity: ReadonlyMap<string, { id: string; path: string }>;
   anchoredRemoteIds: ReadonlySet<string>;
   input: FolderStatePlanViewInputV2;
@@ -1340,7 +1395,7 @@ interface AnchoredFolderMissingRemoteInputV2 {
  * `continue;` 改为返回值，其余逐字符未改）。
  */
 function planAnchoredFolderMissingRemoteV2({
-  anchor, inferredLocalPath, includeFolderPath, remoteFoldersByIdentity, anchoredRemoteIds,
+  anchor, inferredLocalPath, includeFolderPath, includeFilePath, remoteFoldersByIdentity, anchoredRemoteIds,
   input, remotePathById, unresolvedRemoteIdentity, candidates,
 }: AnchoredFolderMissingRemoteInputV2): { unresolvedRemoteIdentity: boolean } {
   if (
@@ -1401,6 +1456,31 @@ function planAnchoredFolderMissingRemoteV2({
       input,
       remotePathById,
     ));
+  } else if (
+    input.recreateRemoteDeletedFolderWithLocalContent === true
+    && inferredLocalPath
+    && subtreeKeepsLocalContentV2(
+      inferredLocalPath,
+      input.localFiles,
+      input.state.fileAnchors,
+      includeFilePath,
+    )
+  ) {
+    // 云端文件夹已被删，但本机这棵子树里还有云端没有的内容（本机新建，或内容
+    // 已经改过）。跟随删除会把那些内容连根拔掉；只保留又会让其中的新内容没有
+    // 云端父目录可挂（上传 404、子文件夹 parent-chain-incomplete）。这里改成
+    // 「按本机内容重建」：先在云端把这条路径建回来，一个文件都不删、不覆盖；
+    // 未改的后代照旧跟随删除，新内容下一轮走普通上传。远端只多一个同名文件夹。
+    candidates.push(actionCandidate(
+      "create-remote",
+      anchor.lastPath,
+      undefined,
+      inferredLocalPath,
+      undefined,
+      [{ side: "local", root: inferredLocalPath }],
+      input,
+      remotePathById,
+    ));
   } else {
     candidates.push(actionCandidate(
       "delete-local",
@@ -1416,6 +1496,38 @@ function planAnchoredFolderMissingRemoteV2({
     ));
   }
   return { unresolvedRemoteIdentity };
+}
+
+/**
+ * 云端文件夹已删时，判断本机子树里是否还有「这一轮不会被跟随删除」的内容：
+ * 没有任何已提交锚点的本机文件（本机新建），或内容已与锚点不同的文件（本机
+ * 改过）。这两种文件会被文件层保留为上传或冲突，所以它们所在的文件夹必须在
+ * 云端继续存在，不能按删除跟随。
+ *
+ * 只在完整本机扫描与完整远端索引下调用；读不到的事实不作推断——`localFiles`
+ * 里没有的文件就是不参与本次判断。
+ */
+function subtreeKeepsLocalContentV2(
+  root: string,
+  localFiles: readonly LocalFileEntry[],
+  fileAnchors: ReadonlyArray<{
+    lastPath: string;
+    remoteId?: string;
+    contentHash: string;
+  }>,
+  includeFilePath: (path: string) => boolean,
+): boolean {
+  const anchorHashByPath = new Map<string, string>();
+  for (const anchor of fileAnchors) {
+    if (!anchor.remoteId) continue;
+    anchorHashByPath.set(identityPath(anchor.lastPath), anchor.contentHash);
+  }
+  return localFiles.some((file) => {
+    if (!isAtOrBelow(file.path, root)) return false;
+    if (!includeFilePath(file.path)) return false;
+    const anchorHash = anchorHashByPath.get(identityPath(file.path));
+    return anchorHash === undefined || anchorHash !== file.hash;
+  });
 }
 
 /**

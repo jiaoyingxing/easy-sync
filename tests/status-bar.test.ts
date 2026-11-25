@@ -189,6 +189,17 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
+  it("renders the last-sync tooltip with the Chinese six-period clock", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin.state as never as { lastSyncTime: number }).lastSyncTime =
+      new Date(2026, 10, 23, 23, 30).getTime();
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+
+    expect(el.attrs["aria-label"]).toBe("上次同步 晚上11:30:00");
+  });
+
   it("maps a retry-pending latest round to the connecting form while the device reports a network", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
@@ -970,5 +981,54 @@ describe("local-only ignore memory in the carriers (片⑤)", () => {
     expect(statusBar).toHaveBeenCalled();
     // 行消失即反馈：不加 Notice（文案稿没有该键）。
     expect(noticeShow).not.toHaveBeenCalled();
+  });
+});
+
+describe("status repaint guards", () => {
+  it("does not rebuild the status segment when the visible tuple is unchanged", () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    const empty = vi.spyOn(el, "empty");
+    // Drive the coalesced paint directly: this test is about the signature
+    // guard, not the rAF coalescing owned by `updateStatusBar`.
+    const paint = (plugin as never as {
+      doUpdateStatusBar: () => void;
+    }).doUpdateStatusBar.bind(plugin);
+
+    paint();
+    const firstSegment = segmentOf(el);
+
+    paint();
+
+    expect(empty).toHaveBeenCalledOnce();
+    expect(segmentOf(el)).toBe(firstSegment);
+  });
+
+  it("skips a hidden settings page and coalesces a visible one", () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    const refresh = vi.fn();
+    const refreshSoon = (plugin as never as {
+      refreshSettingsSyncStateSoon: () => void;
+    }).refreshSettingsSyncStateSoon.bind(plugin);
+
+    (plugin as never as { settingsTab: unknown }).settingsTab = {
+      containerEl: { isShown: () => false },
+      refreshSyncState: refresh,
+    };
+    refreshSoon();
+    expect(refresh).not.toHaveBeenCalled();
+
+    (plugin as never as { settingsTab: unknown }).settingsTab = {
+      containerEl: { isShown: () => true },
+      refreshSyncState: refresh,
+    };
+    refreshSoon();
+    expect(refresh).toHaveBeenCalledOnce();
+
+    // A second status update inside the same second must not re-render the
+    // settings page again; the trailing timer owns the next repaint.
+    refreshSoon();
+    expect(refresh).toHaveBeenCalledOnce();
   });
 });

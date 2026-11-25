@@ -20,6 +20,9 @@ export interface AuthState {
   accountId: string;
   /** Display name for the logged-in user */
   displayName: string;
+  /** Account name from Graph (`mail`, else `userPrincipalName`). Display-only
+   *  fallback for a blank/invisible display name; never used for identity. */
+  accountName: string;
   /** Whether a valid refresh token exists */
   isLoggedIn: boolean;
   /** OAuth scopes actually granted by the provider for the current token.

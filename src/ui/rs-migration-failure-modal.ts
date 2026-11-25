@@ -4,6 +4,11 @@
  * and the user gets three real exits — retry later (aborts this round, the
  * adoption choice survives), a plain fresh sync (closes the adoption
  * window), or the manual guide (opened on top; this modal stays).
+ *
+ * The destination-not-empty variant is persistent rather than transient (and
+ * is normally refused by the pre-check before the offer), so it omits
+ * `retryLabel`: the fresh sync takes the CTA slot and no doomed retry is
+ * offered.
  */
 import { type App } from "obsidian";
 import {
@@ -20,7 +25,8 @@ type RsMigrationFailureResult =
 interface RsMigrationFailureViews {
   title: string;
   body: string;
-  retryLabel: string;
+  /** Omitted by the persistent destination-not-empty variant. */
+  retryLabel?: string;
   freshLabel: string;
   guideLabel: string;
   guideTitle: string;
@@ -93,8 +99,11 @@ export class RsMigrationFailureModal extends EasySyncModal<RsMigrationFailureRes
       cls: "setting-item-description",
     });
 
-    // DOM order: the guide link and the plain alternative first, the CTA
-    // retry last — phones show the retry on top via the host's column-reverse.
+    // DOM order: secondary exits first, primary last — phones show the
+    // primary on top via the host's column-reverse. Without a retry (the
+    // persistent destination-not-empty variant), the fresh sync becomes the
+    // primary action instead of the doomed retry.
+    const retryLabel = this.views.retryLabel;
     const btnRow = createEasySyncModalFooter(contentEl);
     addEasySyncFooterButton(btnRow, {
       label: this.views.guideLabel,
@@ -109,17 +118,20 @@ export class RsMigrationFailureModal extends EasySyncModal<RsMigrationFailureRes
     });
     addEasySyncFooterButton(btnRow, {
       label: this.views.freshLabel,
+      variant: retryLabel === undefined ? "cta" : "plain",
       onClick: () => {
         this.settle({ action: "fresh-sync" });
       },
     });
-    addEasySyncFooterButton(btnRow, {
-      label: this.views.retryLabel,
-      variant: "cta",
-      onClick: () => {
-        this.settle({ action: "retry" });
-      },
-    });
+    if (retryLabel !== undefined) {
+      addEasySyncFooterButton(btnRow, {
+        label: retryLabel,
+        variant: "cta",
+        onClick: () => {
+          this.settle({ action: "retry" });
+        },
+      });
+    }
   }
 
   override onClose(): void {

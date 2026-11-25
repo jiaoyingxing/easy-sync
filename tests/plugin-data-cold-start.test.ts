@@ -1488,6 +1488,54 @@ describe("plugin data persistence and cold-start cache", () => {
     }));
   });
 
+  it("defaults LAN acceleration on, honors an explicit off, and round-trips the switch and threshold", async () => {
+    const defaultPlugin = new EasySyncPlugin();
+    vi.spyOn(defaultPlugin, "loadData").mockResolvedValue({});
+    const defaultSave = vi.spyOn(defaultPlugin, "saveData").mockResolvedValue(undefined);
+
+    await defaultPlugin.loadSyncSettings();
+
+    expect(defaultPlugin.lanAccelerationEnabled).toBe(true);
+    expect(defaultPlugin.lanAccelerationThresholdMb).toBe(8);
+    expect(defaultSave).not.toHaveBeenCalled();
+
+    defaultPlugin.lanAccelerationEnabled = true;
+    defaultPlugin.lanAccelerationThresholdMb = 64;
+    await defaultPlugin.saveSyncSettings();
+    expect(defaultSave).toHaveBeenCalledWith(expect.objectContaining({
+      "lan-acceleration": true,
+      "lan-acceleration-threshold-mb": 64,
+    }));
+
+    const loadedPlugin = new EasySyncPlugin();
+    vi.spyOn(loadedPlugin, "loadData").mockResolvedValue({
+      "lan-acceleration": true,
+      "lan-acceleration-threshold-mb": 64,
+    });
+    await loadedPlugin.loadSyncSettings();
+    expect(loadedPlugin.lanAccelerationEnabled).toBe(true);
+    expect(loadedPlugin.lanAccelerationThresholdMb).toBe(64);
+
+    // A hand-edited value outside the offered choices falls back to 8 MiB
+    // instead of widening the feature silently.
+    const invalidPlugin = new EasySyncPlugin();
+    vi.spyOn(invalidPlugin, "loadData").mockResolvedValue({
+      "lan-acceleration": true,
+      "lan-acceleration-threshold-mb": 16,
+    });
+    await invalidPlugin.loadSyncSettings();
+    expect(invalidPlugin.lanAccelerationThresholdMb).toBe(8);
+
+    // A saved explicit false wins over the new product default: a device that
+    // turned the switch off is not flipped back on by the default change.
+    const offPlugin = new EasySyncPlugin();
+    vi.spyOn(offPlugin, "loadData").mockResolvedValue({
+      "lan-acceleration": false,
+    });
+    await offPlugin.loadSyncSettings();
+    expect(offPlugin.lanAccelerationEnabled).toBe(false);
+  });
+
   it("loads the remembered auto sync settings for the master switch without a cold-start write", async () => {
     const rememberedPlugin = new EasySyncPlugin();
     vi.spyOn(rememberedPlugin, "loadData").mockResolvedValue({

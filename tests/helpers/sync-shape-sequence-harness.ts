@@ -23,6 +23,7 @@ import { expect, vi } from "vitest";
 import { TFile, TFolder, type DataAdapter } from "obsidian";
 import type { DriveItem } from "../../src/onedrive/types";
 import type { OneDriveClient } from "../../src/onedrive/client";
+import { ONEDRIVE_CAPABILITIES } from "../../src/onedrive/capabilities";
 import { isEasySyncInternalPath } from "../../src/sync/local-scanner";
 import type { LocalScanner } from "../../src/sync/local-scanner";
 import { SyncExecutor, type SyncResult } from "../../src/sync/sync-executor";
@@ -1015,6 +1016,7 @@ export async function addShapeDevice(
   });
 
   const client = {
+    capabilities: ONEDRIVE_CAPABILITIES,
     downloadBaseline: vi.fn(async () => null),
     initVaultScope: vi.fn(async () => ({
       driveId: SHAPE_SCOPE.driveId,

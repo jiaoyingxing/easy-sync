@@ -16,6 +16,7 @@ import {
 import { parseLocalArchiveStampV1 } from "../src/sync/local-archive";
 import type { DeletionLedgerEntryV1 } from "../src/sync/deletion-ledger";
 import type { DriveItemVersion } from "../src/onedrive/types";
+import { formatUserDateTimeFull } from "../src/ui/user-time-format";
 
 const PLUGIN_DIR = ".obsidian/plugins/easy-sync";
 const TMP_DIR = `${PLUGIN_DIR}/tmp`;
@@ -406,7 +407,7 @@ describe("RecoveryModal list", () => {
       byClass(rows[1], "easy-sync-recovery-source")?.textContent,
     ).toBe(i18n.t("recovery.source.localArchive"));
     expect(byClass(rows[1], "easy-sync-recovery-time")?.textContent)
-      .toBe(new Date(STAMP_AT).toLocaleString());
+      .toBe(formatUserDateTimeFull(STAMP_AT, i18n.language));
     expect(byClass(rows[1], "easy-sync-recovery-size")?.textContent).toBe("12 B");
     // 行主体不是按钮：动作用户看得见的只有详情头部 .easy-sync-recovery-header-actions。
     expect(rows[0].__tag).toBe("div");
@@ -619,9 +620,10 @@ describe("RecoveryModal detail", () => {
     expect(byClass(content, "easy-sync-content-preview")).toBeUndefined();
     // 图例按定案＝只写真时间戳：红＝现文件最后写入（假 mtime＝NOW）、
     // 绿＝所选版本时刻＋（历史）后缀；措辞句不再出现。
-    expect(textOf(content)).toContain(new Date(NOW).toLocaleString());
     expect(textOf(content))
-      .toContain(`${new Date(STAMP_AT).toLocaleString()}（历史）`);
+      .toContain(formatUserDateTimeFull(NOW, i18n.language));
+    expect(textOf(content))
+      .toContain(`${formatUserDateTimeFull(STAMP_AT, i18n.language)}（历史）`);
     expect(textOf(content)).not.toContain("只在当前文件里");
     expect(textOf(content)).not.toContain("左＝");
   });
@@ -645,7 +647,7 @@ describe("RecoveryModal detail", () => {
     const legend = allByClass(content, "easy-sync-recovery-diff-legend");
     expect(legend).toHaveLength(1);
     expect(textOf(legend[0]).trim())
-      .toBe(`${new Date(STAMP_AT).toLocaleString()}（历史）`);
+      .toBe(`${formatUserDateTimeFull(STAMP_AT, i18n.language)}（历史）`);
   });
 
   it("keeps the diff toggle on when switching entries in the same session", async () => {

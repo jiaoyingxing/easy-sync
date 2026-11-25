@@ -26,7 +26,10 @@ import {
   makeDownloadLocalStore,
   makeMockOneDrive,
 } from "./helpers/sync-safety-harness";
-import { SyncProgressStore } from "../src/sync/sync-progress";
+import {
+  resolveRoundProgressCurrent,
+  SyncProgressStore,
+} from "../src/sync/sync-progress";
 
 const CONTENT = new Uint8Array(18).fill(7).buffer;
 const GROUP = 8;
@@ -515,6 +518,60 @@ describe("download group verify/commit pipeline (2026-11-08)", () => {
     // pushed-up count; settlement later walks the count per file.
     expect(result.downloaded).toBe(GROUP);
     expect(progressStore.state.current).toBe(GROUP);
+  });
+
+  it("raises the visible counter per downloaded file without waiting for the group commit", async () => {
+    // The original symptom: the counter sits at 0/x until a whole verify
+    // group commits, then jumps. The transfer lane now raises the existing
+    // x/y through the presentation-only lookahead as each file's bytes land;
+    // the settled count and checkpoint semantics are unchanged.
+    Platform.isMobileApp = false;
+    const entries = makeEntries(GROUP);
+    const secondTransferStarted = deferred();
+    const releaseSecondTransfer = deferred();
+    let downloadCalls = 0;
+    const downloadFile = vi.fn(async (
+      _vault: string,
+      _path: string,
+      _url: string,
+      _driveId: string,
+      _size: number,
+      report?: (downloaded: number, total: number) => void,
+    ) => {
+      downloadCalls++;
+      if (downloadCalls === 2) {
+        secondTransferStarted.resolve();
+        await within(releaseSecondTransfer.promise, "second transfer released");
+      }
+      report?.(CONTENT.byteLength, CONTENT.byteLength);
+      return CONTENT.slice(0);
+    });
+    const progressStore = new SyncProgressStore();
+    const fixture = makeFixture({
+      entries,
+      downloadFile,
+      getDriveItemMetadataByIds: vi.fn(async (ids: readonly string[]) =>
+        metadataReader(entries)(ids)),
+      progressStore,
+    });
+
+    const runPromise = fixture.executor.run("manual", {});
+    await within(secondTransferStarted.promise, "second transfer starts");
+
+    // One file is downloaded, the second is still in flight, and nothing has
+    // settled: the visible counter is already 1/8.
+    expect(progressStore.state.current).toBe(0);
+    expect(progressStore.state.processedCurrent).toBe(1);
+    expect(resolveRoundProgressCurrent(progressStore.state)).toBe(1);
+    expect(progressStore.state.phaseMetric).toBeUndefined();
+
+    releaseSecondTransfer.resolve();
+    const result = await within(runPromise, "round finishes");
+    expect(result.downloaded).toBe(GROUP);
+    expect(progressStore.state.current).toBe(GROUP);
+    // The lookahead is gone at the result; settled items own the final count.
+    expect(progressStore.state.processedCurrent).toBeUndefined();
+    expect(resolveRoundProgressCurrent(progressStore.state)).toBe(GROUP);
   });
 
   it("leaves at most one group of intent-only downloads when the round cancels inside it", async () => {

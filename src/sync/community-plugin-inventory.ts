@@ -21,6 +21,10 @@ export interface CommunityPluginInventoryItem {
   dataLocally: boolean;
   dataRemotely: boolean;
   desktopOnly: boolean;
+  /** True only when the local physical bundle has both `main.js` and a readable
+   *  `manifest.json`. Absence means "not proven complete"; the mobile manager
+   *  uses this to keep an impossible desktop-only join from being created. */
+  localBundleComplete?: true;
   manifestIssue: boolean;
   /** Current device intent. Absent only before the one-time V2 migration. */
   participationPhase?: DeviceCommunityPluginPhase;
@@ -103,6 +107,9 @@ export async function buildCommunityPluginInventory(
         (locallyIgnoredIds.has(id) || mobileDesktopOnlyIds.has(id))
         && manifest === null
       );
+    const localMainExists = local && manifest !== null
+      ? await adapter.exists(`${pluginRoot}/${id}/main.js`)
+      : false;
     const remoteFact = remoteManifestFacts.get(id);
     return {
       id,
@@ -120,6 +127,7 @@ export async function buildCommunityPluginInventory(
         || (!local && remoteFact
           ? remoteFact.isDesktopOnly
           : mobileDesktopOnlyIds.has(id)),
+      ...(localMainExists ? { localBundleComplete: true as const } : {}),
       manifestIssue: local && manifest === null,
       ...(historicalDataIds.has(id)
         ? { dataHistoricallyPresent: true }

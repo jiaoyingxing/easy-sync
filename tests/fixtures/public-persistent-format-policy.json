@@ -76,6 +76,33 @@
       "compatibility": "strict per-item evidence only; failure falls back to canonical verification, never to guessed equality"
     },
     {
+      "id": "lan-signaling-v1",
+      "class": "remote-ephemeral-signaling",
+      "owner": "src/sync/lan-signaling.ts",
+      "currentVersion": 1,
+      "members": [
+        ".easy-sync/lan-pairing-v1.json",
+        ".easy-sync/lan-signal/",
+        ".easy-sync/lan-signal/active.json",
+        ".easy-sync/lan-signal/<sessionId>/offer.json",
+        ".easy-sync/lan-signal/<sessionId>/answer.json",
+        ".easy-sync/lan-signal/<sessionId>/host-candidates.json",
+        ".easy-sync/lan-signal/<sessionId>/joiner-candidates.json",
+        ".easy-sync/lan-signal/<sessionId>/closed.json"
+      ],
+      "compatibility": "first version; no predecessor exists and no migration is warranted. Strict schema plus HMAC binding; missing, stale, replayed, wrong-room or invalid records are rejected and never repaired in place; bounded TTL cleanup removes only exact known files. Any LAN failure falls back to the ordinary cloud download path"
+    },
+    {
+      "id": "lan-presence-v1",
+      "class": "remote-ephemeral-signaling",
+      "owner": "src/sync/lan-presence.ts",
+      "currentVersion": 1,
+      "members": [
+        ".easy-sync/lan-presence/request.json"
+      ],
+      "compatibility": "first version; no predecessor exists and no migration is warranted. Strict schema plus HMAC-SHA-256 bound to the existing room secret; expired, replayed, future-dated, wrong-room or malformed requests are rejected and never repaired in place; a failed acquire falls back to the ordinary cloud download path; bounded TTL cleanup deletes only this exact file"
+    },
+    {
       "id": "community-plugin-participation",
       "class": "device-local-feature-authority",
       "owner": "src/sync/community-plugin-participation.ts",

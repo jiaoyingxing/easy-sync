@@ -375,6 +375,106 @@ describe("production-capable IndexedDB active state owner", () => {
     },
   );
 
+  it(
+    "retires an uncommitted future delta on the same-session retry",
+    async () => {
+      const source = createLargeV2Envelope(20);
+      const abandoned = nextEnvelope(
+        source,
+        "b".repeat(64),
+        "etag-abandoned",
+      );
+      const replacement = nextEnvelope(
+        source,
+        "c".repeat(64),
+        "etag-replacement",
+      );
+      const harness = createHarness();
+      const completionFault = injectActiveCommitCompletionFault("AbortError");
+      try {
+        await harness.store.initialize(source);
+        await expect(
+          harness.store.commit(source, abandoned),
+        ).rejects.toMatchObject({
+          name: "AbortError",
+        });
+        completionFault.restore();
+
+        // The failed transaction never committed, so the delta record it
+        // published is a proven orphan. The restart path retires it; the same
+        // store must be able to do so without an app restart, otherwise every
+        // later retry collides on different bytes for the same sequence.
+        expect(
+          harness.adapter.files.has(
+            harness.recovery.deltaPath(abandoned.meta.commitSeq),
+          ),
+        ).toBe(true);
+
+        const retried = await harness.store.commit(source, replacement);
+        expect(retried).toMatchObject({
+          alreadyCommitted: false,
+          commitSeq: replacement.meta.commitSeq,
+          stateDigest:
+            await stateV2IndexedDbRecoveryEnvelopeDigest(replacement),
+        });
+        expect(await harness.store.load()).toEqual(replacement);
+        expect(await harness.store.rebuildRecoveryEnvelope()).toEqual(
+          replacement,
+        );
+      } finally {
+        completionFault.restore();
+        await harness.store.delete();
+      }
+    },
+  );
+
+  it(
+    "rejects a stale candidate against an advanced database without republishing records",
+    async () => {
+      const source = createLargeV2Envelope(20);
+      const committed = nextEnvelope(
+        source,
+        "b".repeat(64),
+        "etag-committed",
+      );
+      const staleCandidate = nextEnvelope(
+        source,
+        "c".repeat(64),
+        "etag-stale",
+      );
+      const harness = createHarness();
+      try {
+        await harness.store.initialize(source);
+        harness.adapter.failBeforeWrite.add(
+          `${harness.recovery.commitWitnessPath(committed.meta.commitSeq)}.next`,
+        );
+        await expect(
+          harness.store.commit(source, committed),
+        ).rejects.toThrow("injected write failure");
+
+        // The database transaction committed; only the witness is missing.
+        // The in-memory base is now behind the authority, so the candidate
+        // cannot be applied and must not be mistaken for a recovery-record
+        // collision (which would publish a second, conflicting delta).
+        await expect(
+          harness.store.commit(source, staleCandidate),
+        ).rejects.toMatchObject({
+          name: "StateV2IndexedDbActiveStateError",
+          reason: "revision-mismatch",
+        });
+        expect(await harness.store.load()).toEqual(committed);
+        await expect(
+          harness.store.reconcileLoadedRecoveryDelta(),
+        ).resolves.toBe("witness-confirmed");
+        expect(await harness.store.rebuildRecoveryEnvelope()).toEqual(
+          committed,
+        );
+      } finally {
+        await harness.store.delete();
+      }
+    },
+  );
+
   it("retries witness publication without rewriting the committed database", async () => {
     const source = createLargeV2Envelope(20);
     const next = nextEnvelope(source, "b".repeat(64), "etag-next");

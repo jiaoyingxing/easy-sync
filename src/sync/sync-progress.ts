@@ -17,17 +17,66 @@ import {
   type SyncActionProgressStatus,
 } from "./sync-action-presentation";
 
-/** High-level phase the sync is currently in */
+/** High-level phase the sync is currently in.
+ *
+ *  `recovering` / `planningRecords` / `savingPlan` / `committing` are UI
+ *  progress phases, not additional round metrics: the round-level
+ *  `SyncRunPhase` in executor-metrics.ts stays coarse. */
 type SyncPhase =
   | "idle"
   | "scanning"
+  | "recovering"
   | "baseline"
   | "preparing"
   | "checking"
+  | "planningRecords"
   | "planning"
+  | "savingPlan"
+  | "establishingSync"
   | "verifying"
   | "executing"
+  | "preparingAction"
+  | "committing"
   | "done";
+
+/** Every stage count must name what it counts. A unit-less metric can only
+ *  render a bare number, which is never useful next to a stage phrase
+ *  (2026-11-20 user reports for the remote check and local scan). */
+export type SyncPhaseMetricUnit = "items" | "batches";
+
+/**
+ * One phase's numeric reading for the existing status counter slot.
+ *
+ * It is deliberately not `current`/`total` on the round: those two mean
+ * "settled plan items" and drive the body progress bar. Phase metrics are
+ * counts of the current stage (batches written, recovery records settled) and
+ * never mount a progress bar.
+ */
+interface SyncPhaseMetric {
+  /** Settled or observed count so far. */
+  current: number;
+  /** Known total for this phase, when the source can provide one. */
+  total?: number;
+  /** Unit suffix for the counter. Required: the counter never renders a bare
+   *  number without a stage phrase owning its meaning. */
+  unit: SyncPhaseMetricUnit;
+}
+
+/** Phases whose numeric slot may fall back to elapsed time when no count is
+ *  available. Executing/verifying keep the round's `current/total`; committing
+ *  keeps the last settled count. */
+export function isPreExecutionSyncPhase(phase: SyncPhase): boolean {
+  return phase === "scanning"
+    || phase === "recovering"
+    || phase === "baseline"
+    || phase === "preparing"
+    || phase === "checking"
+    || phase === "planningRecords"
+    || phase === "planning"
+    || phase === "savingPlan"
+    || phase === "establishingSync"
+    || phase === "preparingAction";
+}
 
 /** Per-file completion status (for the completed-files list in the view) */
 export interface FileProgress {
@@ -78,11 +127,27 @@ export interface SyncProgressState {
   /** Which user-visible workflow owns the current progress/result snapshot. */
   activityKind?: "fullSync" | "sideAction" | "mutationRecovery";
   phase: SyncPhase;
+  /** Epoch ms when the current contiguous phase started; a repeated setPhase
+   *  with the same phase keeps it. Drives the counter's elapsed reading and the
+   *  UI stage reveal window. Optional for state snapshots created before this
+   *  field. */
+  phaseStartedAt?: number;
+  /** Current phase's numeric reading for the existing status counter slot.
+   *  Never participates in the round's `current`/`total` or the progress bar. */
+  phaseMetric?: SyncPhaseMetric;
   /** Settled item count while executing (an item counts once it finishes,
    *  whatever its outcome — the pool keeps several in flight at once, so
    *  counting starts made the number jump in whole batches); 0 for phase-only
-   *  steps. */
+   *  steps. The visible round counter uses `max(current, processedCurrent)`:
+   *  `current` remains the durable settlement count and is not changed by the
+   *  presentation lookahead. */
   current: number;
+  /** Presentation-only lookahead for items whose content work is already done
+   *  while their batch checkpoint is still pending (the download pipeline).
+   *  It only raises the visible counter/bar and is cleared when the round ends,
+   *  so it can never overstate the final result. Optional for callers that do
+   *  not prefetch content. */
+  processedCurrent?: number;
   /** Total items in the current phase */
   total: number;
   /** File path being processed, or an i18n phase key for phase transitions */
@@ -120,15 +185,25 @@ export function isAnySyncActivityRunning(
   return fullSyncRunning || sideActionRunning || isProgressActivityRunning(state);
 }
 
+/** Visible round position: the durable settled count, raised by the download
+ *  pipeline's presentation-only processed lookahead. It never decreases within
+ *  a round and is cleared with the run, so the final result still comes from
+ *  `current`. */
+export function resolveRoundProgressCurrent(
+  state: Readonly<SyncProgressState>,
+): number {
+  return Math.max(0, state.current, state.processedCurrent ?? 0);
+}
+
 /**
  * Whole-run progress with the current file's byte fraction folded in.
- * `current` counts settled items (a settled item is done regardless of its
- * outcome), so the completed share is `current` itself; the item still in
- * flight contributes only its byte fraction.
+ * The completed share is the visible round position (settled, or the
+ * download lookahead when it is ahead); the item still in flight contributes
+ * only its byte fraction.
  */
 export function syncProgressPercent(state: Readonly<SyncProgressState>): number {
   if (state.total <= 0) return 0;
-  const completedItems = Math.max(0, state.current);
+  const completedItems = resolveRoundProgressCurrent(state);
   const currentFraction = state.currentItemComplete
     ? 0
     : state.currentItemTotalBytes > 0
@@ -197,20 +272,61 @@ export class SyncProgressStore {
     };
   }
 
-  /** Set the current phase (also resets progress counters for the new phase) */
-  setPhase(phase: SyncPhase): void {
+  /** Set the current phase (also resets progress counters for the new phase).
+   *
+   *  A repeated call with the same phase keeps `phaseStartedAt`: the reveal
+   *  window and elapsed reading belong to the contiguous phase, not to the
+   *  call. `markStarted`/`finish` clear it, so a new round still forces a
+   *  fresh start even when its first phase has the same name.
+   *
+   *  `keepCounts` is only for the post-transfer commit phase: the round's
+   *  settled `current/total` must stay visible while the last file is no
+   *  longer "current", so the file/byte slots are cleared but the counter is
+   *  preserved.
+   *
+   *  `keepCompleted` is for switching a side-action batch from its preparation
+   *  phase to its action phase: earlier rows in the same batch must stay. */
+  setPhase(
+    phase: SyncPhase,
+    options?: { keepCounts?: boolean; keepCompleted?: boolean },
+  ): void {
+    const phaseChanged = this._state.phase !== phase;
     this._state.phase = phase;
-    this._state.current = 0;
-    this._state.total = 0;
+    if (phaseChanged || !this._state.phaseStartedAt) {
+      this._state.phaseStartedAt = Date.now();
+    }
+    if (options?.keepCounts !== true) {
+      this._state.current = 0;
+      this._state.total = 0;
+    }
     this._state.currentFile = "";
     this._state.currentItemBytes = 0;
     this._state.currentItemTotalBytes = 0;
     this._state.currentItemComplete = false;
     this._state.currentActionType = undefined;
-    if (phase === "executing") {
+    this._state.phaseMetric = undefined;
+    this._state.processedCurrent = undefined;
+    if (phase === "executing" && options?.keepCompleted !== true) {
       this._state.completedFiles = [];
       this._state.completedCount = 0;
     }
+  }
+
+  /** Publish the current phase's numeric reading into the existing counter
+   *  slot. Values are clamped to non-negative integers; a total below the
+   *  current count is lifted so the visible `x/y` never reads backwards. */
+  setPhaseMetric(metric: SyncPhaseMetric): void {
+    const current = Number.isFinite(metric.current)
+      ? Math.max(0, Math.floor(metric.current))
+      : 0;
+    const total = metric.total !== undefined && Number.isFinite(metric.total)
+      ? Math.max(current, Math.floor(metric.total))
+      : undefined;
+    this._state.phaseMetric = {
+      current,
+      ...(total !== undefined ? { total } : {}),
+      unit: metric.unit,
+    };
   }
 
   /** Update progress within the current phase.
@@ -228,6 +344,9 @@ export class SyncProgressStore {
     currentActionType?: SyncActionType,
     knownTotalBytes?: number,
   ): void {
+    // A phase that reports real plan-item progress owns the counter now;
+    // drop any stage count left over from the preceding pre-execution phase.
+    this._state.phaseMetric = undefined;
     const itemChanged = this._state.current !== current
       || this._state.currentFile !== currentFile
       || this._state.currentActionType !== currentActionType;
@@ -247,17 +366,35 @@ export class SyncProgressStore {
     this._state.currentActionType = currentActionType;
   }
 
+  /** Raise the visible round counter ahead of settlement for content that is
+   *  already downloaded (download pipeline). Presentation only: `current`
+   *  stays the durable settled count, the lookahead never decreases and is
+   *  cleared with the phase/run, so the final result cannot overstate. */
+  setProcessedCurrent(count: number): void {
+    const next = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+    const bounded = this._state.total > 0
+      ? Math.min(next, this._state.total)
+      : next;
+    this._state.processedCurrent = Math.max(
+      this._state.processedCurrent ?? 0,
+      bounded,
+    );
+  }
+
   requestCancel(): void {
     this._state.cancelRequested = true;
   }
 
   finish(): void {
     this._state.phase = "done";
+    this._state.phaseStartedAt = 0;
     this._state.currentFile = "";
     this._state.currentItemBytes = 0;
     this._state.currentItemTotalBytes = 0;
     this._state.currentItemComplete = false;
     this._state.currentActionType = undefined;
+    this._state.phaseMetric = undefined;
+    this._state.processedCurrent = undefined;
     this._state.cancelRequested = false;
   }
 
@@ -326,21 +463,27 @@ export class SyncProgressStore {
   ): void {
     this._state.activityKind = activityKind;
     this._state.startedAt = Date.now();
+    this._state.phaseStartedAt = 0;
     this._state.cancelRequested = false;
     this._state.completedFiles = [];
     this._state.completedCount = 0;
     this._state.recoveryVerification = undefined;
+    this._state.phaseMetric = undefined;
+    this._state.processedCurrent = undefined;
   }
 
   /** Resume the visible side-action result batch without erasing earlier decisions. */
   resumeSideActionBatch(): void {
     this._state.activityKind = "sideAction";
     this._state.phase = "executing";
+    this._state.phaseStartedAt = Date.now();
     this._state.currentFile = "";
     this._state.currentItemBytes = 0;
     this._state.currentItemTotalBytes = 0;
     this._state.currentItemComplete = false;
     this._state.currentActionType = undefined;
+    this._state.phaseMetric = undefined;
+    this._state.processedCurrent = undefined;
     this._state.cancelRequested = false;
     if (this._state.startedAt === 0) this._state.startedAt = Date.now();
   }

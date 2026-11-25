@@ -8,6 +8,7 @@ import {
   getSettingsFooterLinks,
 } from "../src/ui/settings-tab";
 import { I18n } from "../src/i18n";
+import { LanDiagnostics } from "../src/sync/lan-diagnostics";
 import type EasySyncPlugin from "../src/main";
 
 // The reset definition opens a ConfirmModal before clearing state. Mock it so
@@ -49,6 +50,10 @@ function createMockPlugin(): EasySyncPlugin {
     autoSyncOnStartup: true,
     notificationPopups: "all",
     mobileStatusBar: true,
+    lanAccelerationEnabled: false,
+    lanAccelerationThresholdMb: 8,
+    lanDiagnostics: new LanDiagnostics(),
+    applyLanAccelerationRuntime: vi.fn(),
     diagLogEnabled: false,
     syncDirection: "two-way",
     autoSyncPaused: false,
@@ -90,7 +95,7 @@ function createMockPlugin(): EasySyncPlugin {
     getIgnoredLocalOnlyCount: () => 0,
     clearLocalOnlyIgnores: vi.fn().mockResolvedValue(undefined),
     auth: {
-      authState: { isLoggedIn: false, displayName: undefined },
+      authState: { isLoggedIn: false, displayName: undefined, accountName: "" },
       isInitializing: false,
       isPending: false,
       deviceAttempt: null,
@@ -192,6 +197,13 @@ describe("buildSettingDefinitions", () => {
       // 双向模式，所以渲染时隐藏、行名仍在登记表里。
       t("settings.localOnlyIgnored.name"),
       t("settings.reset.name"),
+      // 实验性组放在「高级」之后，不新增顶层页；只放设置项，运行诊断
+      // 归诊断报告与 lan-connect 弹框（2026-11-23 移除设置页诊断行）。
+      // WebDAV 入口暂放这里（2026-11-24 用户拍板，达到主流可用前不占登录页）。
+      t("settings.experimental.heading"),
+      t("settings.webdav.connection.name"),
+      t("settings.lanAcceleration.name"),
+      t("settings.lanAccelerationThreshold.name"),
     ]);
     // 全案只有三个分组标题（每页第一分组不加标题，2026-10-12 拍板）。
     expect(labels(pageItems(t("settings.syncScope.name"))))
@@ -458,6 +470,7 @@ describe("buildLoginPage", () => {
     expect((page as { name?: string }).name).toBe(i18n.t("settings.loginPage.name"));
     const items = (page as { items: Array<{ name?: string }> }).items;
     // 2026-11-10：账号行与同步模式行原样搬进「登录」页；同步面板行已升根级动作行。
+    // 2026-11-24：WebDAV 入口暂移「维护 → 实验性」，登录页只保留 OneDrive 账号与同步模式。
     expect(items.length).toBe(2);
     expect(items[0].name).toBe(i18n.t("settings.account.name"));
     expect(items[1].name).toBe(i18n.t("settings.syncMode.name"));
@@ -627,6 +640,56 @@ describe("buildLoginPage", () => {
       }
     }
   });
+
+  it("falls back to the account name for invisible nicknames", () => {
+    const plugin = createMockPlugin();
+    const i18n = new I18n("zh-cn");
+    const auth = plugin.auth as unknown as {
+      authState: {
+        isLoggedIn: boolean;
+        displayName?: string;
+        accountName?: string;
+      };
+    };
+    auth.authState.isLoggedIn = true;
+    const readRows = () => {
+      const page = buildLoginPage(i18n.t.bind(i18n), plugin) as unknown as {
+        displayValue?: string;
+        items: Array<{ desc?: string }>;
+      };
+      return { value: page.displayValue, desc: page.items[0].desc };
+    };
+    // 纯空白／零宽／填充字符昵称在界面上等于空白：行尾与说明都回退账号名
+    // （邮箱/UPN），不再留下看起来像没加载的空值（2026-11-19 用户反馈）。
+    for (const invisible of [" ", "　", "\u200B\u3164"]) {
+      auth.authState.displayName = invisible;
+      auth.authState.accountName = "jiaor@outlook.com";
+      expect(readRows()).toEqual({
+        value: "jiaor@outlook.com",
+        desc: i18n.t("settings.account.desc.loggedIn", {
+          name: "jiaor@outlook.com",
+        }),
+      });
+    }
+    // 账号名也缺失时才用「未知」兜底。
+    auth.authState.displayName = " ";
+    auth.authState.accountName = "";
+    expect(readRows()).toEqual({
+      value: i18n.t("general.unknown"),
+      desc: i18n.t("settings.account.desc.loggedIn", {
+        name: i18n.t("general.unknown"),
+      }),
+    });
+    // 正常昵称（含非中文）原样透出，不做字符过滤。
+    for (const visible of ["Jiao Yingxing", "山田太郎"]) {
+      auth.authState.displayName = visible;
+      auth.authState.accountName = "jiaor@outlook.com";
+      expect(readRows()).toEqual({
+        value: visible,
+        desc: i18n.t("settings.account.desc.loggedIn", { name: visible }),
+      });
+    }
+  });
 });
 
 describe("root navigation (2026-11-10 窄列表)", () => {
@@ -748,12 +811,20 @@ describe("root navigation (2026-11-10 窄列表)", () => {
     expect(picksGroup?.items?.map((item) => item.name)).toEqual([
       t("settings.supportPage.resojot.name"),
       t("settings.supportPage.openplug.name"),
+      t("settings.supportPage.storageCleanup.name"),
+      t("settings.supportPage.aiCodingPlanCheck.name"),
     ]);
     expect(picksGroup?.items?.[0].desc).toBe(
       t("settings.supportPage.resojot.desc"),
     );
     expect(picksGroup?.items?.[1].desc).toBe(
       t("settings.supportPage.openplug.desc"),
+    );
+    expect(picksGroup?.items?.[2].desc).toBe(
+      t("settings.supportPage.storageCleanup.desc"),
+    );
+    expect(picksGroup?.items?.[3].desc).toBe(
+      t("settings.supportPage.aiCodingPlanCheck.desc"),
     );
 
     const noteGroup = supportPage.items?.[2];
@@ -765,11 +836,13 @@ describe("root navigation (2026-11-10 窄列表)", () => {
     );
     expect(noteGroup?.items?.[0].searchable).toBe(false);
 
-    // 顶部行、两条插件行与页底小字都能在声明式行里渲染。
+    // 顶部行、四条插件行与页底小字都能在声明式行里渲染。
     for (const item of [
       aboutGroup?.items?.[0],
       picksGroup?.items?.[0],
       picksGroup?.items?.[1],
+      picksGroup?.items?.[2],
+      picksGroup?.items?.[3],
       noteGroup?.items?.[0],
     ]) {
       const setting = new Setting({} as HTMLElement) as never;
@@ -906,6 +979,77 @@ describe("declarative reset button", () => {
     confirmResult.value = false;
     await clickHandler!();
     expect(resetSyncState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("declarative LAN acceleration rows (S4)", () => {
+  function findRow(
+    defs: ReturnType<typeof buildSettingDefinitions>,
+    name: string,
+  ): {
+    name?: string;
+    visible?: () => boolean;
+    render?: (s: never) => void;
+  } | undefined {
+    const walk = (def: unknown): Array<{
+      name?: string;
+      visible?: () => boolean;
+      render?: (s: never) => void;
+    }> => {
+      const typed = def as {
+        items?: unknown[];
+        name?: string;
+        visible?: () => boolean;
+        render?: (s: never) => void;
+      };
+      if (Array.isArray(typed.items)) return typed.items.flatMap((item) => walk(item));
+      return typed.render ? [typed] : [];
+    };
+    return defs.flatMap((def) => walk(def)).find((row) => row.name === name);
+  }
+
+  it("persists the switch and applies it without a restart", async () => {
+    const plugin = createMockPlugin();
+    const i18n = new I18n("zh-cn");
+    const t = i18n.t.bind(i18n);
+    const defs = buildSettingDefinitions(t, plugin);
+    const item = findRow(defs, t("settings.lanAcceleration.name"));
+    expect(item).toBeDefined();
+    expect(item!.visible).toBeUndefined();
+
+    const setting = new Setting({} as HTMLElement) as never;
+    let change: ((value: boolean) => Promise<void>) | null = null;
+    const toggle = {
+      setValue: vi.fn().mockReturnThis(),
+      onChange: vi.fn((cb: (value: boolean) => Promise<void>) => {
+        change = cb;
+        return toggle;
+      }),
+    };
+    vi.spyOn(setting as never, "addToggle").mockImplementation(
+      (cb: (component: unknown) => void) => { cb(toggle); return setting; },
+    );
+    item!.render!(setting);
+
+    expect(toggle.setValue).toHaveBeenCalledWith(false);
+    await change!(true);
+    expect(plugin.lanAccelerationEnabled).toBe(true);
+    expect(plugin.saveSyncSettings).toHaveBeenCalled();
+    expect(plugin.applyLanAccelerationRuntime).toHaveBeenCalled();
+    expect(plugin.lanAccelerationThresholdMb).toBe(8);
+  });
+
+  it("shows the threshold row only while the switch is on", () => {
+    const plugin = createMockPlugin();
+    const i18n = new I18n("zh-cn");
+    const t = i18n.t.bind(i18n);
+    const item = findRow(
+      buildSettingDefinitions(t, plugin),
+      t("settings.lanAccelerationThreshold.name"),
+    );
+    expect(item?.visible?.()).toBe(false);
+    plugin.lanAccelerationEnabled = true;
+    expect(item?.visible?.()).toBe(true);
   });
 });
 

@@ -155,6 +155,35 @@ describe("RsMigrationFailureModal", () => {
     expect(buttons[2].textContent).toBe(t("rsMigration.failureRetry"));
     expect(buttons[2].classList.contains("mod-cta")).toBe(true);
   });
+
+  it("renders the persistent destination variant with two exits and no retry", () => {
+    const plugin = createMockPlugin();
+    const t = plugin.i18n.t.bind(plugin.i18n);
+    const modal = new RsMigrationFailureModal(plugin, {
+      title: t("rsMigration.unavailableTitle"),
+      body: t("rsMigration.failureBodyDestination"),
+      freshLabel: t("rsMigration.failureFreshSync"),
+      guideLabel: t("rsMigration.failureGuide"),
+      guideTitle: t("rsMigration.guideTitle"),
+      guideBody: t("rsMigration.guideBodyDestination"),
+      guideOk: t("rsMigration.guideOk"),
+    });
+    captureDom(modal.contentEl);
+    modal.onOpen();
+
+    const children = modal.contentEl.children as unknown as RecordedEl[];
+    expect(children).toHaveLength(2);
+    const btnRow = children[1];
+    const buttons = btnRow.children as unknown as RecordedEl[];
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].textContent).toBe(t("rsMigration.failureGuide"));
+    expect(buttons[0].classList.contains("mod-link")).toBe(true);
+    expect(buttons[1].textContent).toBe(t("rsMigration.failureFreshSync"));
+    expect(buttons[1].classList.contains("mod-cta")).toBe(true);
+    expect(buttons.map((button) => button.textContent)).not.toContain(
+      t("rsMigration.failureRetry"),
+    );
+  });
 });
 
 describe("RsMigrationGuideModal", () => {

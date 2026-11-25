@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  collectHistoryExcludedFolders,
   countProgressPlanItems,
   isConfigurationSkipAction,
+  MAX_HISTORY_EXCLUDED_FOLDERS,
   MAX_HISTORY_SKIP_PATHS,
   MAX_SIZE_EXCLUSION_BASELINE_PATHS,
+  normalizeHistoryExcludedFolders,
   normalizeHistorySkipPaths,
   normalizeSizeExclusionBaseline,
 } from "../src/sync/skip-baseline";
@@ -56,6 +59,63 @@ describe("history skip paths", () => {
     );
     expect(normalizeHistorySkipPaths(many)).toHaveLength(MAX_HISTORY_SKIP_PATHS);
     expect(MAX_HISTORY_SKIP_PATHS).toBeLessThan(MAX_SIZE_EXCLUSION_BASELINE_PATHS);
+  });
+});
+
+describe("history folder-exclusion snapshot", () => {
+  it("normalizes the retained folder paths and tolerates dirty data", () => {
+    expect(normalizeHistoryExcludedFolders(["Archive/", "Media"])).toEqual({
+      paths: ["Archive/", "Media"],
+      total: 2,
+    });
+    expect(normalizeHistoryExcludedFolders(["A", "A", "B"])).toEqual({
+      paths: ["A", "B"],
+      total: 2,
+    });
+    expect(normalizeHistoryExcludedFolders(undefined)).toEqual({
+      paths: [],
+      total: 0,
+    });
+    expect(normalizeHistoryExcludedFolders("A")).toEqual({
+      paths: [],
+      total: 0,
+    });
+    expect(normalizeHistoryExcludedFolders([1, "", null, "A"])).toEqual({
+      paths: ["A"],
+      total: 1,
+    });
+  });
+
+  it("caps retained paths but keeps the true configured count", () => {
+    const many = Array.from(
+      { length: MAX_HISTORY_EXCLUDED_FOLDERS + 25 },
+      (_, i) => `folder-${i}`,
+    );
+    const normalized = normalizeHistoryExcludedFolders(many);
+    expect(normalized.paths).toHaveLength(MAX_HISTORY_EXCLUDED_FOLDERS);
+    expect(normalized.total).toBe(MAX_HISTORY_EXCLUDED_FOLDERS + 25);
+  });
+
+  it("reports omitted paths from the persisted count and degrades old entries", () => {
+    expect(collectHistoryExcludedFolders({
+      excludedFolders: ["A", "B"],
+      excludedFoldersTotal: 5,
+    })).toEqual({ paths: ["A", "B"], total: 5, omitted: 3 });
+    expect(collectHistoryExcludedFolders({})).toEqual({
+      paths: [],
+      total: 0,
+      omitted: 0,
+    });
+    // 老条目只有路径、没有总数时按路径数报，不伪造省略。
+    expect(collectHistoryExcludedFolders({ excludedFolders: ["A"] })).toEqual({
+      paths: ["A"],
+      total: 1,
+      omitted: 0,
+    });
+    expect(collectHistoryExcludedFolders({
+      excludedFolders: ["A"],
+      excludedFoldersTotal: 1,
+    })).toEqual({ paths: ["A"], total: 1, omitted: 0 });
   });
 });
 

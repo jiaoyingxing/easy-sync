@@ -1922,6 +1922,27 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     return `${pluginDir}/archive/${stamp}/${path}`;
   }
 
+  /** 留档戳记的是「留档这一刻」，不跟被留档文件的修改时间走（2026-11-22：桌面
+   *  下载会还原远端 mtime，沿用文件时间会让刚留下的旧版本一落盘就被 30 天摘除
+   *  机制当成过期文件删掉）。所以按结构定位：留档夹里这个路径的那一份。 */
+  function archivedCopyOf(
+    files: Map<string, ArrayBuffer>,
+    path: string,
+  ): ArrayBuffer | null {
+    const pluginDir = getEasySyncPaths(".obsidian").pluginDir;
+    const prefix = `${pluginDir}/archive/`;
+    for (const [key, bytes] of files) {
+      if (!key.startsWith(prefix)) continue;
+      // `<pluginDir>/archive/<stamp>/<path>`：戳段之后必须正好是本路径。
+      const relative = key.slice(prefix.length);
+      const separator = relative.indexOf("/");
+      if (separator < 0) continue;
+      if (relative.slice(separator + 1) !== path) continue;
+      return bytes;
+    }
+    return null;
+  }
+
   it("keepRemote feeds byte progress into the shared progress store", async () => {
     const progressStore = new SyncProgressStore();
     const snapshots: Array<{
@@ -3046,10 +3067,12 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     // 覆盖照常发生：留档是复制，不是把这次覆盖换掉。
     expect(recordMutationReceipt).toHaveBeenCalledTimes(1);
     expect(new Uint8Array(store.files.get(path)!)).toEqual(new Uint8Array(remoteBytes));
-    // 留档逐字节等于「审阅时的本机版本」，落在插件目录的留档夹里。
-    const archivePath = expectedArchiveFilePath(path, local.mtime);
-    expect(store.files.has(archivePath)).toBe(true);
-    expect(new Uint8Array(store.files.get(archivePath)!)).toEqual(new Uint8Array(localBytes));
+    // 留档逐字节等于「审阅时的本机版本」，落在插件目录的留档夹里；戳记留档
+    // 当时，不是被留档文件自己的修改时间。
+    const archived = archivedCopyOf(store.files, path);
+    expect(archived).not.toBeNull();
+    expect(new Uint8Array(archived!)).toEqual(new Uint8Array(localBytes));
+    expect(store.files.has(expectedArchiveFilePath(path, local.mtime))).toBe(false);
     // 暂存文件不残留（留档是改名的，不是复制两份）。
     expect([...store.files.keys()].filter((key) => key.endsWith(".part"))).toEqual([]);
     expect(notice.center.activeKey).toBe(`side-action:notice.conflict.keptRemote:${path}`);
@@ -3147,10 +3170,11 @@ describe("Conflict resolution actions report standalone transfer progress", () =
 
     // 本机这份已经被删，但它不是全世界唯一一份了：删除之前先留了档。
     expect(store.files.has(path)).toBe(false);
-    const archivePath = expectedArchiveFilePath(path, local.mtime);
-    expect(store.files.has(archivePath)).toBe(true);
-    expect(new Uint8Array(store.files.get(archivePath)!))
-      .toEqual(new Uint8Array(localBytes));
+    const archived = archivedCopyOf(store.files, path);
+    expect(archived).not.toBeNull();
+    expect(new Uint8Array(archived!)).toEqual(new Uint8Array(localBytes));
+    // 戳记留档当时：沿用文件 mtime 会让新留档落进「过期」目录被下一轮清掉。
+    expect(store.files.has(expectedArchiveFilePath(path, local.mtime))).toBe(false);
     // 跟随云端删除：删除成功之后、checkpoint 提交（归约删锚点）之前补记一条，
     // 身份取自己提交的锚点。
     expect(remoteIdForPath).toHaveBeenCalledWith(path);

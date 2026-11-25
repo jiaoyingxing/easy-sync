@@ -267,3 +267,182 @@ export function bindModalKeyboardDismissal(modal: Modal): () => void {
   return () => root.removeEventListener("click", releaseFocusedField);
 }
 
+/**
+ * 手机软键盘：只把**被盖住的聚焦输入框**滚到可视区下沿，其余一概不动。
+ *
+ * 用户 2026-11-22 真机反馈并逐条落实：
+ * - **点没被盖住的框，弹窗纹丝不动、不留空白**：让位量按「聚焦框底边超出
+ *   可视区下沿多少」实测，超出为零就什么都不写、什么都不滚。
+ * - **点被盖住的框（通常是最后一行），框底落在键盘上沿上方一个呼吸位**
+ *   （8px，不贴边——2026-11-22 真机第三轮用户复核后加）：滚动空间由
+ *   `--easy-sync-keyboard-inset` 锚（styles.css 的 `::after`）补出后，**由
+ *   这里自己把框滚上去**——浏览器自己的聚焦滚动在空间补出之前就已跑完，
+ *   补完再等等于永远等不到（真机最后一行整行被盖）。
+ * - **卡片位置与高度始终不变**：锚是绝对定位、不参与文档流，只扩大「能滚
+ *   多远」；收起归零也不引起可见位移。
+ *
+ * **可见区下沿＝三种宿主键盘行为里最保守的一条**（2026-11-22 真机两轮定论）：
+ * - **悬浮型**（iOS Obsidian 实测：视口高度与 visualViewport 都**不动**，
+ *   宿主只写 `--keyboard-height`；第二版只靠可视区变化判断，在真机上完全
+ *   读不到键盘、聚焦后纹丝不动）：上沿＝无键盘视口底 − 宿主键盘高度；
+ * - **压矮型**（Android resize）：视口底就是键盘上沿，不再减键盘高度
+ *   （「视口高 − 键盘高」在这型上是双算，是空白与位移的来源）；
+ * - **可视区收缩型**（Safari 系）：visualViewport 自己报的下沿。
+ *
+ * 悬浮型的键盘动画**没有任何事件可听**（视口不动、变量不是事件源），所以
+ * 聚焦期间逐帧盯 `--keyboard-height`，收起后停表；压矮/收缩型有事件，事件
+ * 只负责立即重算与启动盯表。键盘收起把滚动退回自然区、锚归零。
+ * 只在手机端生效；桌面端不挂类、不监听。
+ */
+export function bindModalKeyboardInset(
+  scrollEl: HTMLElement,
+  options: { fieldsSelector?: string } = {},
+): () => void {
+  if (!hostPlatformFacts.isMobile) return () => undefined;
+  scrollEl.addClass("easy-sync-keyboard-inset");
+  const doc = scrollEl.ownerDocument ?? document;
+  const win = doc.defaultView;
+  if (!win) return () => undefined;
+  const fieldSelector = options.fieldsSelector ?? "input, textarea";
+
+  /**
+   * 宿主写入的键盘高度（px）；取不到按 0。悬浮型宿主（iOS Obsidian 实测）
+   * 只有它知道键盘上沿——视口高度与 visualViewport 都不变。
+   */
+  const readKeyboardHeight = (): number => {
+    const raw = win.getComputedStyle(doc.documentElement)
+      .getPropertyValue("--keyboard-height")
+      .trim();
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  };
+
+  /** 键盘未开时的视口高：悬浮型拿它减键盘高度得键盘上沿；键盘收起的那帧
+   *  重新锚定，转屏等引起的全高变化随之生效。 */
+  let noKeyboardInnerHeight = win.innerHeight;
+
+  /**
+   * 可见区下沿（视口坐标）＝三种宿主行为里最保守的一条。
+   * - 压矮型：当前视口底就是键盘上沿（**不再减键盘高度**——「视口高 − 键盘
+   *   高」在这型上是双算，是空白与位移的来源）；
+   * - 悬浮型：无键盘视口底 − 宿主键盘高度，与 visualViewport 报的下沿取低；
+   * - 可视区收缩型：visualViewport 报的下沿。
+   */
+  const readVisibleBottom = (): number => {
+    const innerHeight = win.innerHeight;
+    const keyboardHeight = readKeyboardHeight();
+    if (keyboardHeight <= 0) noKeyboardInnerHeight = innerHeight;
+    if (innerHeight < noKeyboardInnerHeight - 0.5) return innerHeight;
+    const viewport = win.visualViewport;
+    const viewportBottom = viewport
+      ? viewport.offsetTop + viewport.height
+      : innerHeight;
+    if (keyboardHeight > 0) {
+      return Math.min(noKeyboardInnerHeight - keyboardHeight, viewportBottom);
+    }
+    return Math.min(viewportBottom, noKeyboardInnerHeight);
+  };
+
+  let applied = 0;
+  let poll = 0;
+  let previousVisibleBottom = Number.POSITIVE_INFINITY;
+  let seenKeyboardHeight = -1;
+  let pendingWrite = false;
+  /** 被盖住的框滚到位后，框底与键盘上沿之间保留的呼吸位（px）。 */
+  const KEYBOARD_INSET_BREATH_PX = 8;
+
+  const writeInset = (): void => {
+    const visibleBottom = readVisibleBottom();
+    // 可见区下沿回升＝键盘正在收：把滚动退回自然区，锚随之归零。
+    const closing = visibleBottom > previousVisibleBottom + 0.5;
+    previousVisibleBottom = visibleBottom;
+
+    const active = doc.activeElement;
+    const field = active instanceof HTMLElement
+      && scrollEl.contains(active)
+      && active.matches(fieldSelector)
+      ? active
+      : null;
+
+    // 不挂锚时的可滚上限；锚按「目标位置超出的那段」补，不超前补。
+    const nativeMaxScroll = scrollEl.scrollHeight - applied - scrollEl.clientHeight;
+    // 目标滚动位置：只为当前聚焦框前滚（框底落在可见区下沿上方一个呼吸位，
+    // 不贴边——2026-11-22 真机第三轮用户复核「有点贴边，适当再上浮一点点」），
+    // 从不回滚——除非键盘在收，那时退回自然区。没有聚焦框时保持原位。
+    let target = scrollEl.scrollTop;
+    if (closing) {
+      target = Math.min(scrollEl.scrollTop, nativeMaxScroll);
+    } else if (field) {
+      const overlap = field.getBoundingClientRect().bottom - visibleBottom;
+      if (overlap > 0) target = scrollEl.scrollTop + overlap + KEYBOARD_INSET_BREATH_PX;
+    }
+
+    const inset = Math.max(0, Math.ceil(target - nativeMaxScroll));
+    if (inset !== applied) {
+      applied = inset;
+      // 只写自定义属性，锚的盒模型在 styles.css 的 `.easy-sync-keyboard-inset`
+      // 规则里——TS 不直接写盒模型样式（主题与可维护性都归样式层）。
+      scrollEl.style.setProperty("--easy-sync-keyboard-inset", `${inset}px`);
+    }
+    // 锚已就位，目标位置必在可滚范围内；与锚写入同帧执行，无中间态。
+    if (target !== scrollEl.scrollTop) scrollEl.scrollTop = target;
+  };
+
+  /** 键盘是否开着：三条信号线（宿主变量／视口压矮／可视区收缩）任一生效。 */
+  const keyboardOpen = (): boolean => {
+    const viewport = win.visualViewport;
+    const viewportBottom = viewport
+      ? viewport.offsetTop + viewport.height
+      : win.innerHeight;
+    return seenKeyboardHeight > 0
+      || win.innerHeight < noKeyboardInnerHeight - 0.5
+      || viewportBottom < win.innerHeight - 0.5;
+  };
+
+  /**
+   * 悬浮型宿主的键盘动画只改 `--keyboard-height`：视口与 visualViewport 都
+   * 不动、变量也不是事件源——**没有任何事件可听**，聚焦期间逐帧盯表。
+   * 高度没变的帧只读一个变量不做布局测量（打字期间零布局成本）；聚焦未
+   * 释放或键盘仍开着都继续盯，两者皆否（键盘已收且无聚焦）才停表。
+   */
+  const tick = (): void => {
+    poll = 0;
+    const keyboardHeight = readKeyboardHeight();
+    if (pendingWrite || keyboardHeight !== seenKeyboardHeight) {
+      pendingWrite = false;
+      seenKeyboardHeight = keyboardHeight;
+      writeInset();
+    }
+    const active = doc.activeElement;
+    const fieldFocused = active instanceof HTMLElement
+      && scrollEl.contains(active)
+      && active.matches(fieldSelector);
+    if (fieldFocused || keyboardOpen()) poll = win.requestAnimationFrame(tick);
+  };
+
+  const schedule = (): void => {
+    pendingWrite = true;
+    if (poll === 0) poll = win.requestAnimationFrame(tick);
+  };
+
+  schedule();
+  const viewport = win.visualViewport;
+  viewport?.addEventListener("resize", schedule);
+  viewport?.addEventListener("scroll", schedule);
+  win.addEventListener("resize", schedule);
+  // 输入法候选条出现/收起会改变键盘高度；切换字段也要重算。
+  doc.addEventListener("focusin", schedule, true);
+  doc.addEventListener("focusout", schedule, true);
+
+  return () => {
+    if (poll !== 0) win.cancelAnimationFrame(poll);
+    viewport?.removeEventListener("resize", schedule);
+    viewport?.removeEventListener("scroll", schedule);
+    win.removeEventListener("resize", schedule);
+    doc.removeEventListener("focusin", schedule, true);
+    doc.removeEventListener("focusout", schedule, true);
+    scrollEl.removeClass("easy-sync-keyboard-inset");
+    scrollEl.style.removeProperty("--easy-sync-keyboard-inset");
+  };
+}
+

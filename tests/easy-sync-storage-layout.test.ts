@@ -145,4 +145,23 @@ describe("EasySync local storage layout registry", () => {
     // 兄弟缓存（扫描缓存）在映射表里，两者必须同档——这就是"漏项"的判据来源。
     expect(EASY_SYNC_LAYOUT_DIRECT_MIGRATION_KEYS).toContain("scanCacheFile");
   });
+
+  it("reuses one frozen path set per key", () => {
+    // The scan loop asks for these per path; a per-call rebuild was pure host
+    // CPU. Identical keys must share the immutable result, and the book
+    // directory must stay part of the key.
+    const first = getEasySyncPaths(".obsidian", "easy-sync", "profile-a");
+    const second = getEasySyncPaths(".obsidian", "easy-sync", "profile-a");
+    const otherBook = getEasySyncPaths(".obsidian", "easy-sync", "profile-b");
+
+    expect(first).toBe(second);
+    expect(first).not.toBe(otherBook);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(first.stateV2File).toBe(
+      ".obsidian/plugins/easy-sync/profile-a/state/v2/state-v2.json",
+    );
+    expect(otherBook.stateV2File).toBe(
+      ".obsidian/plugins/easy-sync/profile-b/state/v2/state-v2.json",
+    );
+  });
 });

@@ -3,6 +3,7 @@ import { public113BackupSnapshotSemanticallyMatches } from "./public-1-1-3-state
 import type { DriveItem } from "../onedrive/types";
 import { isRecord } from "../obsidian-compat";
 import { buildRemoteIndexV2 } from "./remote-index-v2";
+import { toRemoteScanFactsV1 } from "./remote-facts-adapter";
 import {
   isSyncScope,
   sameSyncScope,
@@ -371,7 +372,12 @@ export function buildStateV2MigrationCandidate(
 
   let projection: ReturnType<typeof buildRemoteIndexV2>;
   try {
-    projection = buildRemoteIndexV2(input.remoteItems, input.scope.filesRootId, null, 1);
+    projection = buildRemoteIndexV2(
+      toRemoteScanFactsV1(input.remoteItems),
+      input.scope.filesRootId,
+      null,
+      1,
+    );
   } catch {
     return {
       ...baseResult,

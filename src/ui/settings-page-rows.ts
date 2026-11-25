@@ -33,6 +33,10 @@ import {
   UNLIMITED_MAX_FILE_SIZE_MB,
 } from "../sync/types";
 import {
+  LAN_ACCELERATION_THRESHOLD_OPTIONS_MB,
+  normalizeLanAccelerationThresholdMb,
+} from "../sync/lan-acceleration";
+import {
   isPathExcludedByFolders,
   normalizeExcludedFolders,
 } from "../sync/local-scanner";
@@ -913,6 +917,76 @@ export function applyMobileStatusBarRow(
             return;
           }
           plugin.applyMobileStatusBar();
+        });
+    });
+}
+
+/**
+ * S4 维护页「实验性」组：局域网加速开关。开关只改下载字节来源，默认关；
+ * 关掉后已注入的 dev 下载源也不会被使用（运行时门在客户端与执行器各一道）。
+ */
+export function applyLanAccelerationRow(
+  setting: Setting,
+  host: SettingsPageRowHost,
+): void {
+  const { plugin, t } = host;
+  setting.controlEl.empty();
+  setting
+    .setName(t("settings.lanAcceleration.name"))
+    .setDesc(t("settings.lanAcceleration.desc"))
+    .addToggle((toggle) => {
+      toggle.setValue(plugin.lanAccelerationEnabled).onChange(async (value) => {
+        const previous = plugin.lanAccelerationEnabled;
+        plugin.lanAccelerationEnabled = value;
+        try {
+          await plugin.saveSyncSettings();
+        } catch {
+          plugin.lanAccelerationEnabled = previous;
+          toggle.setValue(previous);
+          new Notice(t("notice.settingsSaveFailed"));
+          return;
+        }
+        plugin.applyLanAccelerationRuntime();
+        // 阈值行按开关显隐：结构性变化走宿主 update()。
+        host.refresh();
+      });
+    });
+}
+
+/** S4 触发文件大小下拉；开关关闭时整行由声明侧 visible 隐藏。 */
+export function applyLanAccelerationThresholdRow(
+  setting: Setting,
+  host: SettingsPageRowHost,
+): void {
+  const { plugin, t } = host;
+  setting.controlEl.empty();
+  setting
+    .setName(t("settings.lanAccelerationThreshold.name"))
+    .setDesc(t("settings.lanAccelerationThreshold.desc"))
+    .addDropdown((dropdown) => {
+      for (const option of LAN_ACCELERATION_THRESHOLD_OPTIONS_MB) {
+        dropdown.addOption(
+          String(option),
+          option === 0
+            ? t("settings.lanAccelerationThreshold.optionAll")
+            : t("settings.lanAccelerationThreshold.optionMb", { size: option }),
+        );
+      }
+      dropdown
+        .setValue(String(plugin.lanAccelerationThresholdMb))
+        .onChange(async (value) => {
+          const previous = plugin.lanAccelerationThresholdMb;
+          const next = normalizeLanAccelerationThresholdMb(Number(value));
+          plugin.lanAccelerationThresholdMb = next;
+          try {
+            await plugin.saveSyncSettings();
+          } catch {
+            plugin.lanAccelerationThresholdMb = previous;
+            dropdown.setValue(String(previous));
+            new Notice(t("notice.settingsSaveFailed"));
+            return;
+          }
+          plugin.applyLanAccelerationRuntime();
         });
     });
 }

@@ -370,9 +370,11 @@ describe("Cloud baseline bootstrap and download write safety", () => {
       12,
       expect.anything(),
     );
+    // 桌面：暂存文件带上远端修改时间（改名会把它原样带到目标路径）。
     expect(writeBinary).toHaveBeenCalledWith(
       `${EASY_SYNC_TMP_DIR}/downloads/note.md.part.ready`,
       expect.any(ArrayBuffer),
+      { mtime: 1_783_468_800_000 },
     );
     expect(adapter.rename).toHaveBeenCalledWith(
       `${EASY_SYNC_TMP_DIR}/downloads/note.md.part.ready`,
@@ -669,6 +671,277 @@ describe("Cloud baseline bootstrap and download write safety", () => {
       Platform.isDesktop = previousDesktop;
     }
   });
+
+  it("uses the LAN streaming method on mobile when the provider offers it", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
+    const previousDesktop = Platform.isDesktop;
+    Platform.isMobile = true;
+    Platform.isMobileApp = true;
+    Platform.isDesktop = false;
+    const hash = "aa".repeat(32);
+    const size = 9 * 1024 * 1024;
+    const downloadFile = vi.fn();
+    const downloadFileToPath = vi.fn();
+    const downloadFileToPathWithLan = vi.fn().mockResolvedValue({ size, hash });
+    const rename = vi.fn().mockResolvedValue(undefined);
+    const adapter = makeMockAdapter({
+      appendBinary: vi.fn().mockResolvedValue(undefined),
+      rename,
+      stat: vi.fn(async (path: string) => path === "recording.m4a" ? { size, mtime: 1 } : null),
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile,
+        downloadFileToPath,
+        downloadFileToPathWithLan,
+        shouldAttemptLan: vi.fn().mockReturnValue(true),
+        getDelta: vi.fn().mockResolvedValue({
+          value: [{
+            id: "item-recording",
+            name: "recording.m4a",
+            size,
+            eTag: "etag-recording",
+            cTag: "ctag-recording",
+            parentReference: {
+              id: "files-root-id",
+              path: "/drives/x/root:/Apps/EasySync/vaults/testVault/files",
+            },
+            file: { hashes: { sha256Hash: hash } },
+          }],
+          "@odata.deltaLink": "tok",
+        }),
+      }),
+      {
+        vault: {
+          adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+        }),
+        getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      makeActiveV2State([], []),
+      "testVault",
+    );
+
+    try {
+      const result = await executor.run("manual", {});
+
+      expect(result.downloaded).toBe(1);
+      expect(downloadFileToPathWithLan).toHaveBeenCalledWith(
+        "testVault",
+        "recording.m4a",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        expect.any(Object),
+        undefined,
+        "item-recording",
+        size,
+        hash,
+        expect.anything(),
+        {
+          path: "recording.m4a",
+          eTag: "etag-recording",
+          size,
+          expectedSha256: hash,
+        },
+      );
+      expect(downloadFileToPath).not.toHaveBeenCalled();
+      expect(downloadFile).not.toHaveBeenCalled();
+      expect(rename).toHaveBeenCalledWith(
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        "recording.m4a",
+      );
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
+      Platform.isDesktop = previousDesktop;
+    }
+  });
+
+  it("falls back to the cloud path method when the LAN streaming method throws", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
+    const previousDesktop = Platform.isDesktop;
+    Platform.isMobile = true;
+    Platform.isMobileApp = true;
+    Platform.isDesktop = false;
+    const hash = "aa".repeat(32);
+    const size = 9 * 1024 * 1024;
+    const downloadFile = vi.fn();
+    const downloadFileToPath = vi.fn().mockResolvedValue({ size, hash });
+    const downloadFileToPathWithLan = vi.fn().mockRejectedValue(new Error("LAN failed"));
+    const rename = vi.fn().mockResolvedValue(undefined);
+    const adapter = makeMockAdapter({
+      appendBinary: vi.fn().mockResolvedValue(undefined),
+      rename,
+      stat: vi.fn(async (path: string) => path === "recording.m4a" ? { size, mtime: 1 } : null),
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile,
+        downloadFileToPath,
+        downloadFileToPathWithLan,
+        shouldAttemptLan: vi.fn().mockReturnValue(true),
+        getDelta: vi.fn().mockResolvedValue({
+          value: [{
+            id: "item-recording",
+            name: "recording.m4a",
+            size,
+            eTag: "etag-recording",
+            cTag: "ctag-recording",
+            parentReference: {
+              id: "files-root-id",
+              path: "/drives/x/root:/Apps/EasySync/vaults/testVault/files",
+            },
+            file: { hashes: { sha256Hash: hash } },
+          }],
+          "@odata.deltaLink": "tok",
+        }),
+      }),
+      {
+        vault: {
+          adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+        }),
+        getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      makeActiveV2State([], []),
+      "testVault",
+    );
+
+    try {
+      const result = await executor.run("manual", {});
+
+      expect(result.downloaded).toBe(1);
+      expect(downloadFileToPathWithLan).toHaveBeenCalledTimes(1);
+      expect(downloadFileToPath).toHaveBeenCalledWith(
+        "testVault",
+        "recording.m4a",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        expect.any(Object),
+        undefined,
+        "item-recording",
+        size,
+        hash,
+        expect.anything(),
+      );
+      expect(downloadFile).not.toHaveBeenCalled();
+      expect(rename).toHaveBeenCalledWith(
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        "recording.m4a",
+      );
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
+      Platform.isDesktop = previousDesktop;
+    }
+  });
+
+  it("keeps the exact cloud streaming call when the LAN gate is off", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
+    const previousDesktop = Platform.isDesktop;
+    Platform.isMobile = true;
+    Platform.isMobileApp = true;
+    Platform.isDesktop = false;
+    const hash = "bb".repeat(32);
+    const size = 9 * 1024 * 1024;
+    const downloadFile = vi.fn();
+    const downloadFileToPath = vi.fn().mockResolvedValue({ size, hash });
+    const downloadFileToPathWithLan = vi.fn();
+    const shouldAttemptLan = vi.fn().mockReturnValue(false);
+    const rename = vi.fn().mockResolvedValue(undefined);
+    const adapter = makeMockAdapter({
+      appendBinary: vi.fn().mockResolvedValue(undefined),
+      rename,
+      stat: vi.fn(async (path: string) => path === "recording.m4a" ? { size, mtime: 1 } : null),
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile,
+        downloadFileToPath,
+        downloadFileToPathWithLan,
+        shouldAttemptLan,
+        getDelta: vi.fn().mockResolvedValue({
+          value: [{
+            id: "item-recording",
+            name: "recording.m4a",
+            size,
+            eTag: "etag-recording",
+            cTag: "ctag-recording",
+            parentReference: {
+              id: "files-root-id",
+              path: "/drives/x/root:/Apps/EasySync/vaults/testVault/files",
+            },
+            file: { hashes: { sha256Hash: hash } },
+          }],
+          "@odata.deltaLink": "tok",
+        }),
+      }),
+      {
+        vault: {
+          adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+        }),
+        getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      makeActiveV2State([], []),
+      "testVault",
+    );
+
+    try {
+      const result = await executor.run("manual", {});
+
+      expect(result.downloaded).toBe(1);
+      expect(shouldAttemptLan).toHaveBeenCalledWith(size);
+      expect(downloadFileToPathWithLan).not.toHaveBeenCalled();
+      expect(downloadFileToPath).toHaveBeenCalledWith(
+        "testVault",
+        "recording.m4a",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        expect.any(Object),
+        undefined,
+        "item-recording",
+        size,
+        hash,
+        expect.anything(),
+      );
+      expect(downloadFile).not.toHaveBeenCalled();
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
+      Platform.isDesktop = previousDesktop;
+    }
+  });
 });
 
 describe("File download failure isolation", () => {
@@ -909,6 +1182,125 @@ describe("Download integrity gate", () => {
       Platform.isDesktop = previousDesktop;
     }
   }
+
+  it("uses the optional LAN method for a prefetched download and commits the bytes", async () => {
+    const content = new TextEncoder().encode("lan prefetch").buffer;
+    const hash = await sha256Hex(content);
+    const lanDownload = vi.fn().mockResolvedValue(content);
+    const cloudDownload = vi.fn().mockRejectedValue(
+      new Error("cloud download should not run"),
+    );
+    const store = makeDownloadLocalStore();
+    const remote: RemoteFileEntry = {
+      path: "note.bin",
+      driveId: "lan-note-id",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: content.byteLength,
+      mtime: 1,
+      eTag: "lan-note-etag",
+      cTag: "lan-note-ctag",
+      sha256Hash: hash,
+    };
+    const state = makeActiveV2State([remote], []);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile: cloudDownload,
+        downloadFileWithLan: lanDownload,
+        shouldAttemptLan: vi.fn().mockReturnValue(true),
+      }),
+      {
+        vault: {
+          adapter: store.adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: store.inspectFile,
+        getMaxFileSize: vi.fn().mockReturnValue(100 * 1024 * 1024),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(lanDownload).toHaveBeenCalledOnce();
+    expect(cloudDownload).not.toHaveBeenCalled();
+    expect(result.errors).toBe(0);
+    expect(await sha256Hex(store.files.get("note.bin")!)).toBe(hash);
+  });
+
+  it("keeps the exact buffered cloud call when the LAN gate is off", async () => {
+    const content = new TextEncoder().encode("cloud prefetch").buffer;
+    const hash = await sha256Hex(content);
+    const lanDownload = vi.fn();
+    const cloudDownload = vi.fn().mockResolvedValue(content);
+    const shouldAttemptLan = vi.fn().mockReturnValue(false);
+    const store = makeDownloadLocalStore();
+    const remote: RemoteFileEntry = {
+      path: "note.bin",
+      driveId: "lan-note-id",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: content.byteLength,
+      mtime: 1,
+      eTag: "lan-note-etag",
+      cTag: "lan-note-ctag",
+      sha256Hash: hash,
+    };
+    const state = makeActiveV2State([remote], []);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile: cloudDownload,
+        downloadFileWithLan: lanDownload,
+        shouldAttemptLan,
+      }),
+      {
+        vault: {
+          adapter: store.adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: store.inspectFile,
+        getMaxFileSize: vi.fn().mockReturnValue(100 * 1024 * 1024),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(shouldAttemptLan).toHaveBeenCalledWith(content.byteLength);
+    expect(lanDownload).not.toHaveBeenCalled();
+    expect(cloudDownload).toHaveBeenCalledWith(
+      "testVault",
+      "note.bin",
+      undefined,
+      "lan-note-id",
+      content.byteLength,
+      expect.anything(),
+    );
+    expect(result.errors).toBe(0);
+    expect(await sha256Hex(store.files.get("note.bin")!)).toBe(hash);
+  });
 
   it("defers a truncated in-memory response instead of replacing the local file", async () => {
     const result = await runIntegrityCase({

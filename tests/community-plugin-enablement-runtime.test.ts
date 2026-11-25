@@ -4293,7 +4293,7 @@ describe("community plugin enablement runtime", () => {
     }
   });
 
-  it("surfaces a same-directory manifest identity drift as identity-changed", async () => {
+  it("routes a same-directory manifest identity drift to whole-bundle review", async () => {
     const manifestPath = ".obsidian/plugins/calendar/manifest.json";
     const mainPath = ".obsidian/plugins/calendar/main.js";
     const localManifestText = JSON.stringify({
@@ -4349,14 +4349,37 @@ describe("community plugin enablement runtime", () => {
 
     const result = await executor.run("manual");
 
-    expect(result.errors).toBeGreaterThan(0);
-    expect(result.identityBlockedErrors).toBe(result.errors);
-    const logText = (diag.error as unknown as ReturnType<typeof vi.fn>)
+    // Identity drift takes the review lane (2026-11-23): the bundle's items
+    // leave the pools and become ordinary conflict rows carrying the drift
+    // reason, so the user can open the whole-bundle review and keep one side.
+    // No file moves either way, and the round is not an identity-blocked
+    // failure any more.
+    expect(result.identityBlockedErrors ?? 0).toBe(0);
+    const driftRows = state.pendingConflicts.filter(
+      (candidate) => candidate.reason === "reason.pluginIdentityDrift",
+    );
+    expect(driftRows.map((row) => row.path).sort()).toEqual([
+      ".obsidian/plugins/calendar/main.js",
+      ".obsidian/plugins/calendar/manifest.json",
+    ]);
+    const driftLog = (diag.log as unknown as ReturnType<typeof vi.fn>)
       .mock.calls
-      .map((call) => String(call[1]))
-      .join("\n");
-    expect(logText).toContain("identity changed within directory: calendar");
-    expect(logText).not.toContain("identity is ambiguous");
+      .find((call) => String(call[1]).includes("identity drift deferred"));
+    expect(driftLog).toBeDefined();
+    expect(driftLog?.[2]).toMatchObject({
+      localIdentity: "calendar",
+      remoteIdentity: "calendar-ng",
+      files: 2,
+    });
+    expect(memory.binary.get(mainPath) && new TextDecoder().decode(memory.binary.get(mainPath)!))
+      .toBe("local-main");
+    // The guard reads the cloud manifest once to compare identities; no plugin
+    // code is transferred (main.js stays untouched on both sides).
+    expect(
+      downloadFile.mock.calls
+        .map((call) => String(call[1]))
+        .filter((path) => path.endsWith("/main.js")),
+    ).toEqual([]);
   });
 
   it("blocks every directory in a same-id collision and surfaces identity-ambiguous", async () => {

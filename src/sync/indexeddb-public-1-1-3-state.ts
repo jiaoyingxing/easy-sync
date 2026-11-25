@@ -115,6 +115,8 @@ interface Public113IndexedDbCandidateStore {
       now?: number;
       batchSize?: number;
       signal?: AbortSignal;
+      /** Reports completed write batches out of the total batch count. */
+      onProgress?: (current: number, total: number) => void;
     },
   ): Promise<IndexedDbPublic113StageResult>;
   loadPreparedPlannerView?(
@@ -168,6 +170,8 @@ implements Public113IndexedDbCandidateStore {
       now?: number;
       batchSize?: number;
       signal?: AbortSignal;
+      /** Reports completed write batches out of the total batch count. */
+      onProgress?: (current: number, total: number) => void;
     },
   ): Promise<IndexedDbPublic113StageResult> {
     const normalizedCandidate = normalizeCandidate(candidate);
@@ -191,6 +195,9 @@ implements Public113IndexedDbCandidateStore {
       Object.values(normalizedCandidate.folderAnchors?.byAnchorId ?? {}),
     );
     const expectedCounts = envelopeCounts(normalizedCandidate);
+    const totalBatches = Math.ceil(expectedCounts.remoteNodes / batchSize)
+      + Math.ceil(expectedCounts.anchors / batchSize)
+      + Math.ceil(expectedCounts.folderAnchors / batchSize);
     const existing = await this.readMeta();
     if (
       existing?.phase === "prepared"
@@ -204,6 +211,9 @@ implements Public113IndexedDbCandidateStore {
     ) {
       try {
         await this.loadPreparedPlannerView(options.sourceStateDigest);
+        if (totalBatches > 0) {
+          options.onProgress?.(totalBatches, totalBatches);
+        }
         return {
           reused: true,
           candidateDigest,
@@ -247,6 +257,11 @@ implements Public113IndexedDbCandidateStore {
     throwIfAborted(options.signal, "IndexedDB candidate staging aborted");
 
     let batches = 0;
+    let reportedBatches = 0;
+    const onBatch = (): void => {
+      reportedBatches += 1;
+      options.onProgress?.(reportedBatches, totalBatches);
+    };
     batches += await putBatches(
       db,
       "remoteNodes",
@@ -254,6 +269,7 @@ implements Public113IndexedDbCandidateStore {
       (node) => node.id,
       batchSize,
       options.signal,
+      onBatch,
     );
     batches += await putBatches(
       db,
@@ -262,6 +278,7 @@ implements Public113IndexedDbCandidateStore {
       (anchor) => anchor.anchorId,
       batchSize,
       options.signal,
+      onBatch,
     );
     batches += await putBatches(
       db,
@@ -272,6 +289,7 @@ implements Public113IndexedDbCandidateStore {
       (anchor) => anchor.anchorId,
       batchSize,
       options.signal,
+      onBatch,
     );
 
     const storedCounts = await this.countRecords();
@@ -636,6 +654,7 @@ async function putBatches<
   keyOf: (value: Value) => string,
   batchSize: number,
   signal?: AbortSignal,
+  onBatch?: () => void,
 ): Promise<number> {
   let batches = 0;
   for (let offset = 0; offset < values.length; offset += batchSize) {
@@ -648,6 +667,7 @@ async function putBatches<
       .map((value) => tx.store.put(value, keyOf(value)));
     await Promise.all([...requests, tx.done]);
     batches += 1;
+    onBatch?.();
   }
   throwIfAborted(signal, "IndexedDB candidate staging aborted");
   return batches;

@@ -1,4 +1,5 @@
 import type { DriveItem } from "../../src/onedrive/types";
+import { toRemoteScanFactsV1 } from "../../src/sync/remote-facts-adapter";
 import {
   buildRemoteIndexV2,
   projectRemoteIndexV2,
@@ -115,7 +116,7 @@ export function compareV1WithV2Shadow(input: V2ReadOnlyShadowInput): V2ReadOnlyS
   let projection: ReturnType<typeof buildRemoteIndexV2>;
   try {
     projection = buildRemoteIndexV2(
-      [...input.remoteItems],
+      toRemoteScanFactsV1(input.remoteItems),
       input.v2Scope.filesRootId,
       null,
     );

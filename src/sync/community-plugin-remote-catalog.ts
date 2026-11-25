@@ -15,6 +15,7 @@ import {
   type RemoteIndexV2,
   type RemoteNodeV2,
 } from "./remote-index-v2";
+import { toRemoteScanFactsV1 } from "./remote-facts-adapter";
 import {
   isSyncScope,
   sameSyncScope,
@@ -110,7 +111,7 @@ export async function buildRemoteCommunityPluginCatalog(
     .filter((item) => item.id !== input.scope.filesRootId)
     .map((item) => structuredClone(item));
   const projection = buildRemoteIndexV2(
-    projectedItems,
+    toRemoteScanFactsV1(projectedItems),
     input.scope.filesRootId,
     null,
   );

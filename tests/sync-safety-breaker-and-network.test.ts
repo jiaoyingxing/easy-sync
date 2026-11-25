@@ -1359,7 +1359,7 @@ describe("T2 server-authoritative convergence — per-id lastModifiedBy evidence
     expect(harness.state.mutationLedger).toHaveLength(1);
   });
 
-  it("keeps an unreceipted upload fail-closed even when the current remote was rewritten by EasySync", async () => {
+  it("settles an unreceipted upload as superseded when the current remote is a third value (P1)", async () => {
     const harness = await makeT2Harness({
       version: 1,
       operationId: "op-upload-t2",
@@ -1378,21 +1378,24 @@ describe("T2 server-authoritative convergence — per-id lastModifiedBy evidence
       createdAt: 1,
     });
 
-    await expect(harness.recover()).rejects.toThrow(
-      "Mutation outcome requires manual review",
-    );
-    // Upload convergence was removed (planned boundary: both sides changed →
-    // T3). No per-id evidence request may be issued for uploads.
+    // P1（2026-11-24）：远端 C 完整可读、既不是意图前状态 A 也不是本机目标 B，
+    // 且已进入本轮提交的远端观察。upload intent 退休为「未发生」，下一轮由
+    // 计划层产出冲突；不再整轮停摆。判定只用内容事实，不请求 per-id 证据。
+    await harness.recover();
     expect(harness.onedrive.getDriveItemMetadataById).not.toHaveBeenCalled();
-    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.state.mutationLedger).toEqual([]);
   });
 });
 
 describe("M19 anti-downgrade guard version comparison (finding ③)", () => {
-  function makeM19Executor(localVersion: string, remoteVersion: string) {
-    const manifestFile = getEasySyncPaths(
+  function makeM19Executor(
+    localVersion: string,
+    remoteVersion: string,
+    ownPluginDir = getEasySyncPaths(
       { configDir: ".obsidian" } as never,
-    ).manifestFile;
+    ).pluginDir,
+  ) {
+    const manifestFile = `${ownPluginDir}/manifest.json`;
     const adapter = makeMockAdapter({
       read: vi.fn().mockResolvedValue(
         JSON.stringify({ id: "easy-sync", version: localVersion }),
@@ -1423,6 +1426,8 @@ describe("M19 anti-downgrade guard version comparison (finding ③)", () => {
           complete: true,
         }),
         shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        ownPluginDir,
+        pluginId: "easy-sync",
       } as unknown as LocalScanner,
       state,
       "testVault",
@@ -1470,6 +1475,24 @@ describe("M19 anti-downgrade guard version comparison (finding ③)", () => {
     const skipped = await guard(items);
 
     expect(skipped).toBe(items.length);
+  });
+
+  it("guards a manually renamed install folder as the running bundle", async () => {
+    // Manual installs can live in `.obsidian/plugins/EasySync` while the
+    // manifest id stays `easy-sync`; the reviewed download is addressed by
+    // that real folder, so the guard must recognize it there too.
+    const { guard, downloadFile, items } = makeM19Executor(
+      "1.4.10",
+      "1.4.9",
+      ".obsidian/plugins/EasySync",
+    );
+
+    expect(items[0].path).toBe(".obsidian/plugins/EasySync/manifest.json");
+
+    const skipped = await guard(items);
+
+    expect(skipped).toBe(items.length);
+    expect(downloadFile).toHaveBeenCalled();
   });
 });
 

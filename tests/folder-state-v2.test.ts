@@ -12,6 +12,7 @@ import {
   buildFolderSubtreeReviewSnapshotV1,
 } from "../src/sync/empty-folder-resolution";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import { buildSharedFolderIdentityResolutionSnapshotV1 } from "../src/sync/shared-folder-identity-resolution";
 import {
   projectFolderIdentitiesForMove as projectCanonicalIdentitiesForMove,
@@ -91,7 +92,12 @@ function envelope(input: {
       committedAt: 1,
     },
     scope,
-    remoteIndex: buildRemoteIndexV2(remoteItems, scope.filesRootId, null, 1).index,
+    remoteIndex: buildRemoteIndexV2(
+      toRemoteScanFactsV1(remoteItems),
+      scope.filesRootId,
+      null,
+      1,
+    ).index,
     anchors: {
       schemaVersion: 2,
       byAnchorId: Object.fromEntries(
@@ -248,6 +254,63 @@ describe("V2 folder anchors and pure planner", () => {
         folderAnchors: [folderAnchor("inbox-old", "Inbox")],
       }),
       localFiles: [],
+      localFolders: localFolders("Inbox"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-local",
+      path: "Inbox",
+      remoteId: "inbox-old",
+    })]);
+  });
+
+  it("re-creates a cloud-deleted folder that still holds a local-only file", () => {
+    // 云端把这棵文件夹删了，本机还在，而且里面多了一篇云端没有的笔记：跟随删除
+    // 会连笔记一起删掉，保留又会让笔记没有云端父目录可挂。按本机内容重建这条
+    // 路径，零内容删除。
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+      }),
+      localFiles: [localFile("Inbox/new-note.md", hashB, 5)],
+      localFolders: localFolders("Inbox"),
+      localFolderScanComplete: true,
+      recreateRemoteDeletedFolderWithLocalContent: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "create-remote",
+      path: "Inbox",
+    })]);
+    expect(report.items.some((item) => item.type === "delete-local")).toBe(false);
+  });
+
+  it("re-creates the folder when the surviving file was edited after the deletion", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+        fileAnchors: [fileAnchor("note-old", "Inbox/note.md", hashA, 10)],
+      }),
+      localFiles: [localFile("Inbox/note.md", hashB, 12)],
+      localFolders: localFolders("Inbox"),
+      localFolderScanComplete: true,
+      recreateRemoteDeletedFolderWithLocalContent: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "create-remote",
+      path: "Inbox",
+    })]);
+  });
+
+  it("keeps the follow-deletion when every surviving file still matches its anchor", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+        fileAnchors: [fileAnchor("note-old", "Inbox/note.md", hashA, 10)],
+      }),
+      localFiles: [localFile("Inbox/note.md", hashA, 10)],
       localFolders: localFolders("Inbox"),
       localFolderScanComplete: true,
     });

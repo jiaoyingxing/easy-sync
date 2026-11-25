@@ -87,12 +87,41 @@ function isVaultRelativeFilePath(path: string): boolean {
  */
 function isFileNameSpellingAlias(path: string, sourcePath: string): boolean {
   if (path === sourcePath) return false;
-  const parent = (value: string): string => {
-    const slash = value.lastIndexOf("/");
-    return slash === -1 ? "" : value.slice(0, slash);
-  };
-  return parent(path) === parent(sourcePath)
+  return parentPath(path) === parentPath(sourcePath)
     && normalizeRemotePathKey(path) === normalizeRemotePathKey(sourcePath);
+}
+
+/**
+ * True only when a move's two paths share the exact file name and differ solely
+ * in the PARENT's spelling (case / NFC). A case-only folder rename can make
+ * the identity planner plan such a local move; its receipt can never commit
+ * (the parent spelling is not the committed one), so the plan layer now
+ * withholds those moves and recovery must be able to retire the legacy
+ * intent-only records zero-write once the planned result is already present.
+ */
+export function isParentSpellingAlias(
+  path: string,
+  sourcePath: string,
+): boolean {
+  if (path === sourcePath) return false;
+  if (normalizeRemotePathKey(path) !== normalizeRemotePathKey(sourcePath)) {
+    return false;
+  }
+  const sourceBase = parentPath(sourcePath);
+  const targetBase = parentPath(path);
+  return targetBase !== sourceBase
+    && normalizeRemotePathKey(targetBase) === normalizeRemotePathKey(sourceBase)
+    && baseName(path) === baseName(sourcePath);
+}
+
+function parentPath(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash === -1 ? "" : path.slice(0, slash);
+}
+
+function baseName(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash === -1 ? path : path.slice(slash + 1);
 }
 
 function conservativeResetReceiptMatchesIntent(
@@ -194,11 +223,14 @@ function conservativeResetRenameOrMoveReceiptMatchesIntent(args: {
     contentAlignedFromRemote,
   } = args;
   if (!intent.expectedLocal.exists || !intent.expectedRemote.exists) return false;
+  const pathIdentity = intent.identityMode === "path";
   if (
     !base
     || !remote
     || base.eTag !== remote.eTag
-    || remote.driveId !== intent.expectedRemote.driveId
+    || (pathIdentity
+      ? remote.driveId !== intent.path
+      : remote.driveId !== intent.expectedRemote.driveId)
   ) return false;
   // The host-rename hint shape rewires which bytes the base describes: the
   // hint proves the remote identity moved while the local bytes were edited,
@@ -344,11 +376,19 @@ export function isOrdinaryFileRecoveryRecord(
   )
     && intent.sourcePath !== undefined
     && isFileNameSpellingAlias(intent.path, intent.sourcePath);
+  // A legacy intent-only parent-spelling moveLocal (case-only folder rename on
+  // a case-sensitive host) is admitted so the recovery classifier can retire
+  // it zero-write once the planned result is already present. New plans never
+  // mint this shape; a receipted record keeps the strict rejection.
+  const parentSpellingMove = intent.action === "moveLocal"
+    && intent.sourcePath !== undefined
+    && isParentSpellingAlias(intent.path, intent.sourcePath);
   if (
     sourceBound !== Boolean(intent.sourcePath)
     || (
       intent.sourcePath !== undefined
       && !fileNameSpellingAlias
+      && !parentSpellingMove
       && normalizeRemotePathKey(intent.sourcePath)
         === normalizeRemotePathKey(intent.path)
     )

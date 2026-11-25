@@ -3,7 +3,7 @@
  *
  * `SyncPlanItem.reason` / `PlanReviewItem.reason` 此前是自由字符串。本表是
  * 计划项 reason 字面值的来源，`PlanReason` 封闭联合由 tsc 仲裁
- * （39 值＝24 直产＋12 folder 派生＋3 熔断）。仍有裸字面量消费点
+ * （40 值＝25 直产＋12 folder 派生＋3 熔断）。仍有裸字面量消费点
  * （如 sync-executor 的 plannerIssueCodeForReason switch，契约门只扫
  * `.reason ===/!==` 比较），改表值时须一并核对。
  *
@@ -21,6 +21,7 @@ export const PLAN_REASON = {
   newFileBothSides: "reason.newFileBothSides",
   bothSidesModified: "reason.bothSidesModified",
   pluginDowngradeRemote: "reason.pluginDowngradeRemote",
+  pluginIdentityDrift: "reason.pluginIdentityDrift",
   renameIdentityAmbiguous: "reason.renameIdentityAmbiguous",
   localDeletedRemoteModified: "reason.localDeletedRemoteModified",
   remoteDeletedLocalModified: "reason.remoteDeletedLocalModified",

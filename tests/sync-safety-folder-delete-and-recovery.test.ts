@@ -32,6 +32,7 @@ import { SyncExecutor, assertConfirmDeleteWaveWithinCheckpointLimit } from "../s
 import type { SyncResult } from "../src/sync/sync-executor";
 import { OneDriveClient, ResponseByteBudgetError } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
+import { IncrementalRemoteHierarchyError } from "../src/sync/executor-errors";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
@@ -191,9 +192,11 @@ describe("batch remote-delete absence verification", () => {
     // paths so it can delete immediately; the 9 leftovers follow as a second
     // read. A single 25-path read was the old "front porch".
     expect(harness.getFileMetadataByPaths).toHaveBeenCalledTimes(2);
+    // The proof itself now rides two 20-path lanes (2026-11-19); the wave
+    // boundary is unchanged.
     expect(harness.getFileMetadataByPaths.mock.calls).toEqual([
-      ["testVault", [...paths].sort().slice(0, 16)],
-      ["testVault", [...paths].sort().slice(16)],
+      ["testVault", [...paths].sort().slice(0, 16), "other", { chunkConcurrency: 2 }],
+      ["testVault", [...paths].sort().slice(16), "other", { chunkConcurrency: 2 }],
     ]);
     expect(harness.getFileMetadata).not.toHaveBeenCalled();
     expect(harness.removedPaths.sort()).toEqual([...paths].sort());
@@ -1214,7 +1217,7 @@ describe("folder confirm-delete batch absence verification", () => {
 
     expect(harness.getFileMetadataByPaths).toHaveBeenCalledTimes(1);
     expect(harness.getFileMetadataByPaths.mock.calls).toEqual([
-      ["testVault", [...paths].sort()],
+      ["testVault", [...paths].sort(), "other", { chunkConcurrency: 2 }],
     ]);
     expect(harness.getFileMetadata).not.toHaveBeenCalled();
     expect(harness.trashFile).toHaveBeenCalledTimes(25);
@@ -2092,6 +2095,169 @@ describe("recovery observation reviewed-cursor preservation", () => {
     const before = harness.state.getCommittedV2Envelope();
 
     await observe(harness, before.meta.commitSeq, false);
+
+    expect(harness.setRemoteState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("planning remote refresh keeps the sealed plan cursor on rebuild exits (2026-11-19)", () => {
+  const scope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+
+  const makeSyncResult = (): SyncResult => ({
+    success: false,
+    uploaded: 0,
+    downloaded: 0,
+    foldersCreated: 0,
+    foldersMoved: 0,
+    foldersDeleted: 0,
+    filesMoved: 0,
+    deleted: 0,
+    conflicts: 0,
+    deferred: 0,
+    skippedLarge: 0,
+    skippedIgnored: 0,
+    errors: 0,
+    authExpired: false,
+    message: "",
+    runFacts: {
+      termination: "normal",
+      ordinaryPlanning: "not-entered",
+      userFileChanges: "unknown",
+    },
+  });
+
+  interface PlanningRefreshHarness {
+    executor: SyncExecutor;
+    state: StateManager;
+    setRemoteState: ReturnType<typeof vi.fn>;
+    getDelta: ReturnType<typeof vi.fn>;
+  }
+
+  // Same committed shape as the 2026-09-12 observation harness above: one
+  // file at "note.md", envelope complete at commitSeq 1 with cursor
+  // "delta-token". The incremental token page always fails the hierarchy
+  // validation; the token-less rebuild feed carries the same tree (or a
+  // changed eTag) plus a NEW cursor — so a fact-identical rebuild is the
+  // no-change case and must defer exactly like the incremental persist.
+  const makePlanningRefreshHarness = async (
+    input: { rebuildETag?: string } = {},
+  ): Promise<PlanningRefreshHarness> => {
+    const path = "note.md";
+    const localHash = "a".repeat(64);
+    const committedEntry: RemoteFileEntry = {
+      path,
+      driveId: "note-id",
+      parentId: scope.filesRootId,
+      size: 5,
+      mtime: 1,
+      eTag: "etag-1",
+      cTag: "ctag-1",
+      sha256Hash: localHash,
+    };
+    const rebuildItem = (eTag: string): DriveItem => ({
+      id: "note-id",
+      name: path,
+      size: 5,
+      eTag,
+      cTag: "ctag-1",
+      lastModifiedDateTime: new Date(1).toISOString(),
+      parentReference: { id: scope.filesRootId, driveId: scope.driveId },
+      file: { hashes: { sha256Hash: localHash } },
+    });
+    const getDelta = vi.fn(async (_vault: string, token?: string) => {
+      if (token) {
+        throw new IncrementalRemoteHierarchyError(
+          "Remote hierarchy incomplete: missing parent identity for note-id",
+        );
+      }
+      return {
+        value: [rebuildItem(input.rebuildETag ?? "etag-1")],
+        "@odata.deltaLink": "delta-token-2",
+      };
+    });
+    const onedrive = makeMockOneDrive({ getDelta });
+    const state = makeActiveV2State([committedEntry], []);
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter: makeMockAdapter(),
+          getAbstractFileByPath: vi.fn().mockReturnValue(null),
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const setRemoteState = state.setRemoteState as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    return { executor, state, setRemoteState, getDelta };
+  };
+
+  const runPlanningRefresh = async (
+    harness: PlanningRefreshHarness,
+    preserveSeq?: number,
+  ): Promise<{ entries: RemoteFileEntry[]; scope: SyncScope }> => {
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    return await (harness.executor as unknown as {
+      tryDeltaOrFullScan(
+        operationEpoch: number,
+        result: SyncResult,
+        syncScope: SyncScope,
+        localEntries: LocalFileEntry[],
+        forceCompleteIdentitySnapshot: boolean,
+        persistPreparedState: boolean,
+        preserveReviewedSourceCommitSeq?: number,
+      ): Promise<{ entries: RemoteFileEntry[]; scope: SyncScope }>;
+    }).tryDeltaOrFullScan(
+      epoch,
+      makeSyncResult(),
+      scope,
+      [],
+      false,
+      true,
+      preserveSeq,
+    );
+  };
+
+  it("defers a fact-identical hierarchy-failure rebuild while a reviewed plan is sealed", async () => {
+    // The four full-rebuild exits inside the incremental-cache refresh sit on
+    // the same sealed planning round as the incremental persist itself. A
+    // transient hierarchy failure followed by an unchanged full feed must not
+    // advance commitSeq — otherwise the fresh plan seals at a new commit and
+    // re-pauses the plan the user just confirmed (2026-09-12 loop, planning
+    // variant surfaced by the 2026-11-19 review).
+    const harness = await makePlanningRefreshHarness();
+    const before = harness.state.getCommittedV2Envelope();
+
+    const outcome = await runPlanningRefresh(harness, before.meta.commitSeq);
+
+    expect(outcome.entries).toHaveLength(1);
+    expect(harness.setRemoteState).not.toHaveBeenCalled();
+    const after = harness.state.getCommittedV2Envelope();
+    expect(after.meta.commitSeq).toBe(before.meta.commitSeq);
+    expect(after.remoteIndex.deltaLink).toBe(before.remoteIndex.deltaLink);
+  });
+
+  it("still commits the hierarchy-failure rebuild when no reviewed plan is sealed", async () => {
+    const harness = await makePlanningRefreshHarness();
+
+    await runPlanningRefresh(harness, undefined);
+
+    expect(harness.setRemoteState).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits the hierarchy-failure rebuild when the rebuild sees a fact change even while sealed", async () => {
+    const harness = await makePlanningRefreshHarness({ rebuildETag: "etag-2" });
+    const before = harness.state.getCommittedV2Envelope();
+
+    await runPlanningRefresh(harness, before.meta.commitSeq);
 
     expect(harness.setRemoteState).toHaveBeenCalledTimes(1);
   });

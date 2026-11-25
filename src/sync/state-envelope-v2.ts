@@ -21,6 +21,7 @@ type SyncAnchorConfirmationV2 =
   | "download-cas"
   | "rename-cas"
   | "folder-move-cas"
+  | "folder-spelling-convergence"
   | "merge-cas"
   | "user-resolution";
 
@@ -1245,6 +1246,7 @@ function isAnchorConfirmation(
     "download-cas",
     "rename-cas",
     "folder-move-cas",
+    "folder-spelling-convergence",
     "merge-cas",
     "user-resolution",
   ].includes(String(value));

@@ -136,10 +136,20 @@ export interface AuthPluginContext {
   ): void;
   /** Open a URL in the system browser */
   openUrl(url: string): void;
-  /** Cache for user profile (displayName, accountId) to avoid network call on every startup */
+  /** Cache for user profile (displayName, accountName, accountId) to avoid a
+   *  network call on every startup. `accountName` is optional so caches written
+   *  before it existed stay readable. */
   profileCache?: {
-    get(): Promise<{ displayName: string; accountId: string } | null>;
-    set(profile: { displayName: string; accountId: string }): Promise<void>;
+    get(): Promise<{
+      displayName: string;
+      accountName?: string;
+      accountId: string;
+    } | null>;
+    set(profile: {
+      displayName: string;
+      accountName: string;
+      accountId: string;
+    }): Promise<void>;
     clear(): Promise<void>;
   };
   /** Vault-local persistence for the verified-account binding. The record
@@ -170,6 +180,7 @@ export class AuthModule {
     accessTokenExpiry: 0,
     accountId: "",
     displayName: "",
+    accountName: "",
     isLoggedIn: false,
     grantedScopes: "",
     userType: "",
@@ -1343,6 +1354,7 @@ export class AuthModule {
       accessTokenExpiry: 0,
       accountId: "",
       displayName: "",
+      accountName: "",
       isLoggedIn: false,
       grantedScopes: "",
       userType: "",
@@ -1451,9 +1463,25 @@ export class AuthModule {
     }
   }
 
-  /** Fetch user profile from Microsoft Graph to populate displayName and accountId.
-   *  Cached profile data is display-only: account authorization must always be
-   *  anchored to /me for the current access token. */
+  /**
+   * 账号名（展示兜底）：Graph `mail` 优先，其次 `userPrincipalName`。只用于
+   * displayName 为空白／不可见时给用户一个可识别的账号，绝不参与身份判定。
+   */
+  private static resolveGraphAccountName(data: {
+    mail?: string | null;
+    userPrincipalName?: string | null;
+  }): string {
+    for (const candidate of [data.mail, data.userPrincipalName]) {
+      if (typeof candidate === "string" && candidate.trim().length > 0) {
+        return candidate.trim();
+      }
+    }
+    return "";
+  }
+
+  /** Fetch user profile from Microsoft Graph to populate displayName, accountName
+   *  and accountId. Cached profile data is display-only: account authorization
+   *  must always be anchored to /me for the current access token. */
   private fetchUserProfile(
     generation: number,
     accessToken: string,
@@ -1486,6 +1514,7 @@ export class AuthModule {
     this.assertGeneration(generation);
     if (cached) {
       this.state.displayName = cached.displayName;
+      this.state.accountName = cached.accountName ?? "";
       this.diag?.log("auth", `profile display cache hit: ${cached.displayName}`);
     }
     this.state.accountId = "";
@@ -1495,7 +1524,7 @@ export class AuthModule {
     try {
       const response = await withAuthRequestTimeout(
         requestUrl({
-          url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id,userType",
+          url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id,userType,userPrincipalName,mail",
           method: "GET",
           headers: {
             Authorization: `Bearer ${accessToken}`,
@@ -1511,10 +1540,13 @@ export class AuthModule {
           displayName?: string;
           id?: string;
           userType?: string;
+          userPrincipalName?: string | null;
+          mail?: string | null;
         };
         if (data.displayName) {
           this.state.displayName = data.displayName;
         }
+        this.state.accountName = AuthModule.resolveGraphAccountName(data);
         if (typeof data.userType === "string") {
           this.state.userType = data.userType;
         }
@@ -1541,11 +1573,13 @@ export class AuthModule {
           this.state.accountId
           && (
             cached?.displayName !== this.state.displayName
+            || (cached?.accountName ?? "") !== this.state.accountName
             || cached.accountId !== this.state.accountId
           )
         ) {
           const profile = {
             displayName: this.state.displayName,
+            accountName: this.state.accountName,
             accountId: this.state.accountId,
           };
           await this.enqueueProfileCache(async () => {

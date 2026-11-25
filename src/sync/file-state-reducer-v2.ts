@@ -113,10 +113,13 @@ export function inspectReceiptedRenameAnchorCollisionV2(
 
   const base = receipt.checkpoint.baseUpserts[0];
   const moved = receipt.checkpoint.remoteUpserts[0];
+  const pathIdentity = intent.identityMode === "path";
   if (
     !base
     || !moved
-    || moved.driveId !== intent.expectedRemote.driveId
+    || (pathIdentity
+      ? moved.driveId !== intent.path
+      : moved.driveId !== intent.expectedRemote.driveId)
     || moved.sha256Hash?.toLowerCase() !== base.hash.toLowerCase()
     || moved.size !== base.size
     || intent.expectedLocal.hash.toLowerCase() !== base.hash.toLowerCase()

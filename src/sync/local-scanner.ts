@@ -17,6 +17,7 @@ import {
   getEasySyncLegacyPaths,
   isEasySyncSelfSyncFilePath,
   isRecord,
+  normalizeVaultPathKey,
 } from "../obsidian-compat";
 import {
   type LocalFileEntry,
@@ -33,7 +34,16 @@ import {
 import type { DiagnosticLogger } from "./diagnostic-logger";
 const SCAN_CACHE_FORMAT = 2;
 const SCAN_CACHE_LEGACY_FORMAT = 1;
-const SCAN_CACHE_HISTORY_LIMIT = 16;
+/** Per-path prior-observation chain cap.
+ *
+ *  Nothing in production reads `pathHistory` today (only the public accessor
+ *  and its tests); the chain is speculative evidence kept for a future
+ *  identity/conflict use. Four entries keep the recent chain available while
+ *  cutting the cache's dominant byte share, which every mid-scan checkpoint
+ *  rewrites whole. Raise it only together with a real consumer.
+ *  (2026-11-23 user decision; supersedes the 16-entry size of 2026-10-23 D1A,
+ *  not its global caps or no-prune rule.) */
+const SCAN_CACHE_HISTORY_LIMIT = 4;
 /** Aggregate bounds across every path's history. The per-path cap alone
  *  cannot bound deleted/renamed paths, whose histories are kept by design. */
 const SCAN_CACHE_HISTORY_GLOBAL_ENTRY_LIMIT = 20_000;
@@ -42,6 +52,20 @@ const SCAN_CACHE_HISTORY_GLOBAL_BYTE_LIMIT = 8 * 1024 * 1024;
  *  does not trigger the full cross-path prune again on the next append. */
 const SCAN_CACHE_HISTORY_GLOBAL_LOW_WATER = 0.9;
 const SCAN_SLEEP_EVERY = 50;
+/** Report scan progress at most every N examined files; the loop still yields
+ *  to the UI on the existing 50-file cadence. */
+const SCAN_PROGRESS_EVERY = 100;
+/** Persist the entries hashed so far after this many newly hashed files, so a
+ *  host freeze mid-scan costs at most this many files' work instead of all of
+ *  it. Only entries are upserted; pruning stays exclusive to a completed scan
+ *  (`DECISIONS` 2026-11-23.03 keeps `cachePrune` there). */
+const SCAN_CACHE_CHECKPOINT_EVERY = 200;
+/** Time-based companion to the file count: a vault dominated by a few huge
+ *  media files may hash for minutes without reaching the count. The interval
+ *  doubles after each checkpoint, so a long scan does not rewrite a large
+ *  cache every few seconds; worst-case rework stays bounded by the cap. */
+const SCAN_CACHE_CHECKPOINT_MIN_INTERVAL_MS = 5_000;
+const SCAN_CACHE_CHECKPOINT_MAX_INTERVAL_MS = 60_000;
 
 interface ScanCacheEntry {
   mtime: number;
@@ -67,6 +91,21 @@ function scanCacheHistoryEntryBytes(entry: ScanCacheHistoryEntry): number {
   return JSON.stringify(entry).length;
 }
 
+/** Per-scan cost facts for the diagnostic run summary. Observation only: no
+ *  decision reads these back, and they are not part of the scan cache. */
+export interface LocalScanMetrics {
+  /** In-scope files recorded (cache hits + fresh hashes). */
+  files: number;
+  /** Sum of those files' recorded sizes. */
+  bytes: number;
+  /** Entries served from the mtime+size cache without a content read. */
+  cacheHits: number;
+  /** Total wall time spent in `readBinary` across the walk. */
+  readMs: number;
+  /** Total wall time spent hashing (SHA-256 + QuickXor). */
+  hashMs: number;
+}
+
 interface LocalScanResult {
   entries: LocalFileEntry[];
   /** Read-only folder topology. It does not authorize folder mutations. */
@@ -78,11 +117,19 @@ interface LocalScanResult {
   failedPaths: string[];
   skippedCount: number;
   complete: boolean;
+  /** True when the round's cancel signal interrupted the walk. An aborted
+   *  scan is *not* an incomplete scan: it stops before anything is published,
+   *  so callers must end the round as cancelled instead of reporting a scan
+   *  failure (`result.scanIncomplete`) or reading a partial entry list. */
+  aborted?: boolean;
   /** Orphaned `${target}.easy-sync-recovery` copies encountered during the
    *  scan (target-side download-replacement backups whose journal intent is
    *  already gone). They are excluded from sync; the executor clears them in
    *  the same round after the ordinary journal recovery already ran. */
   recoveryCopies: string[];
+  /** Diagnostic cost facts for this walk; absent on snapshots from callers
+   *  that do not build a full scan. */
+  metrics?: LocalScanMetrics;
 }
 export type LocalFileInspection =
   | { status: "missing" }
@@ -161,58 +208,77 @@ export function isPathExcludedByFolders(
   });
 }
 
+/** Case-folded copy of a path set, for identity comparisons only.
+ *
+ *  Host file systems treat case variants (`EasySync` vs `easysync`) as the
+ *  same directory, so every "is this EasySync's own path" rule folds case too;
+ *  actual reads and writes keep using the original set. A folder whose name
+ *  differs beyond case is handled by the explicit `ownPluginDir` override. */
+function pathKeySet(
+  paths: ReturnType<typeof getEasySyncPaths>,
+): ReturnType<typeof getEasySyncPaths> {
+  return Object.fromEntries(
+    Object.entries(paths).map(([key, value]) => [
+      key,
+      typeof value === "string" ? normalizeVaultPathKey(value) : value,
+    ]),
+  ) as ReturnType<typeof getEasySyncPaths>;
+}
+
 function isEasySyncInternalPathForPaths(
   path: string,
   paths: ReturnType<typeof getEasySyncPaths>,
 ): boolean {
-  return path.endsWith(EASY_SYNC_RECOVERY_SUFFIX)
-    || path === paths.dataFile
+  const pathKey = normalizeVaultPathKey(path);
+  const keys = pathKeySet(paths);
+  return pathKey.endsWith(EASY_SYNC_RECOVERY_SUFFIX)
+    || pathKey === keys.dataFile
     || (
-      path.startsWith(`${paths.pluginDirPrefix}data.sync-conflict-`)
-      && path.endsWith(".json")
+      pathKey.startsWith(`${keys.pluginDirPrefix}data.sync-conflict-`)
+      && pathKey.endsWith(".json")
     )
-    || path === paths.remoteStateFile
-    || path === paths.stateV2File
-    || path === paths.stateV2NextFile
-    || path === paths.stateV2PreviousFile
-    || path === paths.stateV2RecoveryFile
-    || path === paths.stateV2ManifestFile
-    || path === paths.stateV2ManifestNextFile
-    || path === paths.stateV2AuthorityWitnessFile
-    || path === paths.stateV2AuthorityWitnessNextFile
-    || path === paths.stateV2IndexedDbRecoveryDir
-    || path.startsWith(`${paths.stateV2IndexedDbRecoveryDir}/`)
-    || path === paths.stateV2RetiredManifestFile
-    || path === paths.stateV2RollbackFile
-    || path === paths.stateV2MigrationHoldFile
-    || path === paths.stateV2MigrationHoldNextFile
-    || path === paths.stateV2ScopeTransitionFile
-    || path === paths.stateV2ScopeTransitionNextFile
+    || pathKey === keys.remoteStateFile
+    || pathKey === keys.stateV2File
+    || pathKey === keys.stateV2NextFile
+    || pathKey === keys.stateV2PreviousFile
+    || pathKey === keys.stateV2RecoveryFile
+    || pathKey === keys.stateV2ManifestFile
+    || pathKey === keys.stateV2ManifestNextFile
+    || pathKey === keys.stateV2AuthorityWitnessFile
+    || pathKey === keys.stateV2AuthorityWitnessNextFile
+    || pathKey === keys.stateV2IndexedDbRecoveryDir
+    || pathKey.startsWith(`${keys.stateV2IndexedDbRecoveryDir}/`)
+    || pathKey === keys.stateV2RetiredManifestFile
+    || pathKey === keys.stateV2RollbackFile
+    || pathKey === keys.stateV2MigrationHoldFile
+    || pathKey === keys.stateV2MigrationHoldNextFile
+    || pathKey === keys.stateV2ScopeTransitionFile
+    || pathKey === keys.stateV2ScopeTransitionNextFile
     || (
-      path.startsWith(paths.stateV2CorruptSourcePrefix)
-      && (path.endsWith(".json") || path.endsWith(".json.next"))
+      pathKey.startsWith(keys.stateV2CorruptSourcePrefix)
+      && (pathKey.endsWith(".json") || pathKey.endsWith(".json.next"))
     )
-    || path === paths.stateV2CorruptRecoveryFile
-    || path === paths.stateV2CorruptRecoveryNextFile
-    || path === paths.stateV2CorruptPublicationFile
-    || path === paths.stateV2CorruptPublicationNextFile
+    || pathKey === keys.stateV2CorruptRecoveryFile
+    || pathKey === keys.stateV2CorruptRecoveryNextFile
+    || pathKey === keys.stateV2CorruptPublicationFile
+    || pathKey === keys.stateV2CorruptPublicationNextFile
     || (
-      path.startsWith(paths.stateV2ReactivationArchivePrefix)
-      && (path.endsWith(".json") || path.endsWith(".json.next"))
+      pathKey.startsWith(keys.stateV2ReactivationArchivePrefix)
+      && (pathKey.endsWith(".json") || pathKey.endsWith(".json.next"))
     )
-    || path === paths.stateV1BackupFile
-    || path === paths.baseContentFile
-    || path === paths.deletionLedgerFile
-    || path === `${paths.deletionLedgerFile}.next`
-    || path === paths.ancestorManifestV2File
-    || path === paths.ancestorManifestV2NextFile
-    || path === paths.ancestorsV2Dir
-    || path.startsWith(`${paths.ancestorsV2Dir}/`)
-    || path === paths.scanCacheFile
-    || path === paths.logsDir
-    || path.startsWith(`${paths.logsDir}/`)
-    || path === paths.tmpDir
-    || path.startsWith(`${paths.tmpDir}/`);
+    || pathKey === keys.stateV1BackupFile
+    || pathKey === keys.baseContentFile
+    || pathKey === keys.deletionLedgerFile
+    || pathKey === `${keys.deletionLedgerFile}.next`
+    || pathKey === keys.ancestorManifestV2File
+    || pathKey === keys.ancestorManifestV2NextFile
+    || pathKey === keys.ancestorsV2Dir
+    || pathKey.startsWith(`${keys.ancestorsV2Dir}/`)
+    || pathKey === keys.scanCacheFile
+    || pathKey === keys.logsDir
+    || pathKey.startsWith(`${keys.logsDir}/`)
+    || pathKey === keys.tmpDir
+    || pathKey.startsWith(`${keys.tmpDir}/`);
 }
 
 export function isEasySyncInternalPath(
@@ -253,17 +319,210 @@ function isDefaultExcludedFileName(fileName: string): boolean {
   return DEFAULT_EXCLUDED_FILE_BASENAMES.has(name);
 }
 
-/** Check if a path should be excluded based on config.
- *  includePaths override excludePaths — a path matching any includePath is never excluded,
- *  except for plugin data.json files which would cause self-referential sync writes. */
-function isExcluded(path: string, config: ScanConfig, configDir: string, pluginId: string): boolean {
-  const paths = getEasySyncPaths(configDir, pluginId);
-  if (isEasySyncInternalPath(path, configDir, pluginId)) return true;
-  if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
+/**
+ * Per-config exclusion facts, built once and reused across every path in a
+ * scan (and across `shouldSyncPath` calls between scans).
+ *
+ * `isExcluded` used to derive four path sets and re-normalize every excluded
+ * folder for every file; on a large vault that is pure host CPU inside the
+ * periodic background scan. These facts depend only on the config generation
+ * and the vault's config dir, so one build per `setConfig` is equivalent.
+ */
+interface ScanExclusionIndex {
+  paths: ReturnType<typeof getEasySyncPaths>;
+  pluginId: string;
+  /** Case-folded identity of EasySync's own plugin directory. */
+  ownPluginDirKey: string;
+  ownPluginDirPrefixKey: string;
+  /** Installed plugin folder as passed to the self-sync predicate. */
+  ownPluginDir: string;
+  internalExact: Set<string>;
+  internalPrefixes: string[];
+  internalPrefixSuffixes: Array<{
+    prefix: string;
+    suffixes: readonly string[];
+  }>;
+  internalDirectoryExact: Set<string>;
+  internalDirectoryPrefixes: string[];
+  excludedFoldersLower: string[];
+  pluginCodeSelection: PluginScopeSelection;
+  pluginDataSelection: PluginScopeSelection;
+}
 
-  if (path === paths.pluginDir || path.startsWith(paths.pluginDirPrefix)) {
+function buildScanExclusionIndex(
+  config: ScanConfig,
+  configDir: string,
+  pluginId: string,
+  ownPluginDir = getEasySyncPaths(configDir, pluginId).pluginDir,
+): ScanExclusionIndex {
+  const paths = getEasySyncPaths(configDir, pluginId);
+  const legacyPaths = getEasySyncLegacyPaths(configDir, pluginId);
+  const internalExact = new Set<string>();
+  const internalPrefixes: string[] = [];
+  const internalPrefixSuffixes: ScanExclusionIndex["internalPrefixSuffixes"] = [];
+  const internalDirectoryExact = new Set<string>();
+  const internalDirectoryPrefixes: string[] = [];
+  const key = normalizeVaultPathKey;
+
+  for (const candidate of [paths, legacyPaths]) {
+    for (const exact of [
+      candidate.dataFile,
+      candidate.remoteStateFile,
+      candidate.stateV2File,
+      candidate.stateV2NextFile,
+      candidate.stateV2PreviousFile,
+      candidate.stateV2RecoveryFile,
+      candidate.stateV2ManifestFile,
+      candidate.stateV2ManifestNextFile,
+      candidate.stateV2AuthorityWitnessFile,
+      candidate.stateV2AuthorityWitnessNextFile,
+      candidate.stateV2IndexedDbRecoveryDir,
+      candidate.stateV2RetiredManifestFile,
+      candidate.stateV2RollbackFile,
+      candidate.stateV2MigrationHoldFile,
+      candidate.stateV2MigrationHoldNextFile,
+      candidate.stateV2ScopeTransitionFile,
+      candidate.stateV2ScopeTransitionNextFile,
+      candidate.stateV2CorruptRecoveryFile,
+      candidate.stateV2CorruptRecoveryNextFile,
+      candidate.stateV2CorruptPublicationFile,
+      candidate.stateV2CorruptPublicationNextFile,
+      candidate.stateV1BackupFile,
+      candidate.baseContentFile,
+      candidate.deletionLedgerFile,
+      `${candidate.deletionLedgerFile}.next`,
+      candidate.ancestorManifestV2File,
+      candidate.ancestorManifestV2NextFile,
+      candidate.ancestorsV2Dir,
+      candidate.scanCacheFile,
+      candidate.logsDir,
+      candidate.tmpDir,
+    ]) {
+      internalExact.add(key(exact));
+    }
+    internalPrefixes.push(
+      key(`${candidate.stateV2IndexedDbRecoveryDir}/`),
+      key(`${candidate.ancestorsV2Dir}/`),
+      key(`${candidate.logsDir}/`),
+      key(`${candidate.tmpDir}/`),
+    );
+    internalPrefixSuffixes.push(
+      {
+        prefix: key(`${candidate.pluginDirPrefix}data.sync-conflict-`),
+        suffixes: [".json"],
+      },
+      {
+        prefix: key(candidate.stateV2CorruptSourcePrefix),
+        suffixes: [".json", ".json.next"],
+      },
+      {
+        prefix: key(candidate.stateV2ReactivationArchivePrefix),
+        suffixes: [".json", ".json.next"],
+      },
+    );
+    internalDirectoryExact.add(key(candidate.logsDir));
+    internalDirectoryExact.add(key(candidate.tmpDir));
+    internalDirectoryExact.add(key(candidate.ancestorsV2Dir));
+    internalDirectoryExact.add(key(candidate.stateV2IndexedDbRecoveryDir));
+    internalDirectoryPrefixes.push(
+      key(`${candidate.logsDir}/`),
+      key(`${candidate.tmpDir}/`),
+      key(`${candidate.ancestorsV2Dir}/`),
+      key(`${candidate.stateV2IndexedDbRecoveryDir}/`),
+    );
+  }
+
+  return {
+    paths,
+    pluginId,
+    ownPluginDir,
+    ownPluginDirKey: key(ownPluginDir),
+    ownPluginDirPrefixKey: key(`${ownPluginDir.replace(/\/+$/, "")}/`),
+    internalExact,
+    internalPrefixes,
+    internalPrefixSuffixes,
+    internalDirectoryExact,
+    internalDirectoryPrefixes,
+    excludedFoldersLower: (config.excludedFolders ?? []).map(
+      (folder) => normalizeVaultRelativePath(folder).toLowerCase(),
+    ),
+    pluginCodeSelection: normalizePluginScopeSelection(
+      config.pluginCodeSelection,
+      config.includePluginCode,
+      pluginId,
+    ),
+    pluginDataSelection: normalizePluginScopeSelection(
+      config.pluginDataSelection,
+      config.includePluginData,
+      pluginId,
+    ),
+  };
+}
+
+/** `pathKey` must already be case-folded by `normalizeVaultPathKey`; the
+ *  index stores its internal paths in the same form. */
+function isInternalPathWithIndex(
+  pathKey: string,
+  index: ScanExclusionIndex,
+): boolean {
+  if (pathKey.endsWith(EASY_SYNC_RECOVERY_SUFFIX)) return true;
+  if (index.internalExact.has(pathKey)) return true;
+  for (const prefix of index.internalPrefixes) {
+    if (pathKey.startsWith(prefix)) return true;
+  }
+  for (const entry of index.internalPrefixSuffixes) {
+    if (!pathKey.startsWith(entry.prefix)) continue;
+    for (const suffix of entry.suffixes) {
+      if (pathKey.endsWith(suffix)) return true;
+    }
+  }
+  return false;
+}
+
+/** Same result as `isPathExcludedByFolders`, with the folder list normalized
+ *  once by the index instead of once per path. */
+function isPathExcludedByNormalizedFolders(
+  path: string,
+  excludedFoldersLower: readonly string[],
+): boolean {
+  if (excludedFoldersLower.length === 0) return false;
+  const normalizedPath = normalizeVaultRelativePath(path).toLowerCase();
+  for (const folder of excludedFoldersLower) {
+    if (
+      normalizedPath === folder
+      || normalizedPath.startsWith(`${folder}/`)
+    ) return true;
+  }
+  return false;
+}
+
+/** Decide exclusion for one path from the cached per-config index.
+ *  includePaths override excludePaths — a path matching any includePath is
+ *  never excluded, except for plugin data.json files which would cause
+ *  self-referential sync writes. */
+function isExcludedWithIndex(
+  path: string,
+  index: ScanExclusionIndex,
+  config: ScanConfig,
+): boolean {
+  const paths = index.paths;
+  const pathKey = normalizeVaultPathKey(path);
+  if (isInternalPathWithIndex(pathKey, index)) return true;
+  if (isPathExcludedByNormalizedFolders(path, index.excludedFoldersLower)) {
+    return true;
+  }
+
+  if (
+    pathKey === index.ownPluginDirKey
+    || pathKey.startsWith(index.ownPluginDirPrefixKey)
+  ) {
     return config.includeOwnPluginCode !== true
-      || !isEasySyncSelfSyncFilePath(path, configDir, pluginId);
+      || !isEasySyncSelfSyncFilePath(
+        path,
+        paths.configDir,
+        index.pluginId,
+        index.ownPluginDir,
+      );
   }
 
   if (
@@ -275,25 +534,15 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
     if (parts.length !== 2) return true;
     const communityPluginId = parts[0];
     const fileName = parts[1];
-    const pluginCodeSelection = normalizePluginScopeSelection(
-      config.pluginCodeSelection,
-      config.includePluginCode,
-      pluginId,
-    );
-    const pluginDataSelection = normalizePluginScopeSelection(
-      config.pluginDataSelection,
-      config.includePluginData,
-      pluginId,
-    );
     if (fileName === "data.json") {
       return !isPluginDataSelected(
-        pluginCodeSelection,
-        pluginDataSelection,
+        index.pluginCodeSelection,
+        index.pluginDataSelection,
         communityPluginId,
       );
     }
     return !isPluginSelected(
-      pluginCodeSelection,
+      index.pluginCodeSelection,
       communityPluginId,
     )
       || !COMMUNITY_PLUGIN_CODE_FILES.has(fileName);
@@ -311,25 +560,25 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
   return false;
 }
 
-function isExcludedDirectory(path: string, config: ScanConfig, configDir: string, pluginId: string): boolean {
-  const paths = getEasySyncPaths(configDir, pluginId);
-  const legacyPaths = getEasySyncLegacyPaths(configDir, pluginId);
-  const isInternalDirectory = (candidate: ReturnType<typeof getEasySyncPaths>): boolean =>
-    path === candidate.logsDir
-    || path.startsWith(`${candidate.logsDir}/`)
-    || path === candidate.tmpDir
-    || path.startsWith(`${candidate.tmpDir}/`)
-    || path === candidate.ancestorsV2Dir
-    || path.startsWith(`${candidate.ancestorsV2Dir}/`)
-    || path === candidate.stateV2IndexedDbRecoveryDir
-    || path.startsWith(`${candidate.stateV2IndexedDbRecoveryDir}/`);
-  if (isInternalDirectory(paths) || isInternalDirectory(legacyPaths)) return true;
-  if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
+function isExcludedDirectoryWithIndex(
+  path: string,
+  index: ScanExclusionIndex,
+  config: ScanConfig,
+): boolean {
+  const paths = index.paths;
+  const pathKey = normalizeVaultPathKey(path);
+  if (index.internalDirectoryExact.has(pathKey)) return true;
+  for (const prefix of index.internalDirectoryPrefixes) {
+    if (pathKey.startsWith(prefix)) return true;
+  }
+  if (isPathExcludedByNormalizedFolders(path, index.excludedFoldersLower)) {
+    return true;
+  }
 
-  if (path === paths.pluginDir) {
+  if (pathKey === index.ownPluginDirKey) {
     return config.includeOwnPluginCode !== true;
   }
-  if (path.startsWith(paths.pluginDirPrefix)) return true;
+  if (pathKey.startsWith(index.ownPluginDirPrefixKey)) return true;
 
   if (
     path.startsWith(paths.pluginRoot)
@@ -339,22 +588,12 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
     const parts = path.slice(paths.pluginRoot.length).split("/");
     if (parts.length > 1) return true;
     const communityPluginId = parts[0];
-    const pluginCodeSelection = normalizePluginScopeSelection(
-      config.pluginCodeSelection,
-      config.includePluginCode,
-      pluginId,
-    );
-    const pluginDataSelection = normalizePluginScopeSelection(
-      config.pluginDataSelection,
-      config.includePluginData,
-      pluginId,
-    );
-    return !isPluginSelected(pluginCodeSelection, communityPluginId)
+    return !isPluginSelected(index.pluginCodeSelection, communityPluginId)
       && !isPluginDataSelected(
-        pluginCodeSelection,
-        pluginDataSelection,
-      communityPluginId,
-    );
+        index.pluginCodeSelection,
+        index.pluginDataSelection,
+        communityPluginId,
+      );
   }
 
   const prefix = `${path.replace(/\/+$/, "")}/`;
@@ -364,6 +603,21 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
   if (relatedInclude) return false;
 
   return config.excludePaths.some((exclude) => prefix.startsWith(exclude));
+}
+
+/** Standalone wrapper mirroring the pre-index signature; snapshot helpers
+ *  call it once, while the scan loop uses the cached index. */
+function isExcludedDirectory(
+  path: string,
+  config: ScanConfig,
+  configDir: string,
+  pluginId: string,
+): boolean {
+  return isExcludedDirectoryWithIndex(
+    path,
+    buildScanExclusionIndex(config, configDir, pluginId),
+    config,
+  );
 }
 
 export interface FolderSyncScopeSnapshotV1 {
@@ -486,6 +740,8 @@ export function isFolderPathInSyncScopeSnapshot(
 export class LocalScanner {
   /** Public accessor for SyncExecutor file I/O (readBinary, writeBinary, remove, mkdir) */
   readonly vault: Vault;
+  /** Installed plugin folder (vault path), used only for identity rules. */
+  readonly ownPluginDir: string;
   private readonly configDir: string;
   private config: ScanConfig;
   private diag?: DiagnosticLogger;
@@ -494,6 +750,10 @@ export class LocalScanner {
    *  First warning per path is kept; the entry re-arms when the file is
    *  observed again so a later absence warns fresh. */
   private statNullSinglePathWarned = new Set<string>();
+  /** Derived exclusion facts for the current config object. `setConfig`
+   *  replaces the config, so identity is the generation marker. */
+  private exclusionIndex: ScanExclusionIndex | null = null;
+  private exclusionIndexConfig: ScanConfig | null = null;
   private scanCache: ScanCache = {
     format: SCAN_CACHE_FORMAT,
     entries: {},
@@ -501,6 +761,20 @@ export class LocalScanner {
   };
   private scanCacheLoaded = false;
   private scanCacheDirty = false;
+  /** Files hashed since the last mid-scan cache checkpoint. Reset on every
+   *  checkpoint and at scan start; a completed scan's tail save supersedes it. */
+  private hashedSinceCheckpoint = 0;
+  /** Wall clock of the last checkpoint and the interval currently in use. The
+   *  interval doubles per checkpoint so a long scan does not rewrite a large
+   *  cache every few seconds. */
+  private lastCacheCheckpointAt = 0;
+  private cacheCheckpointIntervalMs = SCAN_CACHE_CHECKPOINT_MIN_INTERVAL_MS;
+  /** This walk's cost counters (observation only; reset at scan start). A
+   *  concurrent settings scan can share them, which at worst skews a
+   *  diagnostic number — no decision reads them. */
+  private scanCacheHits = 0;
+  private scanReadMs = 0;
+  private scanHashMs = 0;
   /** Running totals for the global history caps (bytes are approximate). */
   private historyEntryCount = 0;
   private historyApproxBytes = 0;
@@ -508,10 +782,19 @@ export class LocalScanner {
   constructor(
     vault: Vault,
     config: Partial<ScanConfig> = {},
-    private pluginId = "easy-sync",
+    readonly pluginId = "easy-sync",
+    /** The installed plugin folder as the host reports it (`manifest.dir`).
+     *  A manual install may live in a folder that is not named after the
+     *  manifest id (`EasySync` vs `easy-sync`); identity rules must follow the
+     *  real folder or the plugin's own `data.json` would look like an ordinary
+     *  community-plugin file and self-trigger a sync plan loop. */
+    ownPluginDir?: string,
   ) {
     this.vault = vault;
     this.configDir = getConfigDir(vault);
+    this.ownPluginDir = ownPluginDir?.trim()
+      ? normalizeVaultRelativePath(ownPluginDir)
+      : getEasySyncPaths(this.configDir, this.pluginId).pluginDir;
     this.config = {
       ...DEFAULT_SCAN_CONFIG,
       ...config,
@@ -553,13 +836,42 @@ export class LocalScanner {
   }
 
   shouldSyncPath(path: string): boolean {
-    return !isExcluded(path, this.config, this.configDir, this.pluginId);
+    return !this.isExcludedPath(path);
   }
 
   shouldSyncFolderPath(path: string): boolean {
     const normalized = normalizeVaultRelativePath(path);
-    return Boolean(normalized)
-      && !isExcludedDirectory(normalized, this.config, this.configDir, this.pluginId);
+    return Boolean(normalized) && !this.isExcludedDirectoryPath(normalized);
+  }
+
+  /** Exclusion facts are a pure function of the current config object; build
+   *  them once per config generation instead of once per scanned path. */
+  private getExclusionIndex(): ScanExclusionIndex {
+    if (
+      this.exclusionIndex === null
+      || this.exclusionIndexConfig !== this.config
+    ) {
+      this.exclusionIndex = buildScanExclusionIndex(
+        this.config,
+        this.configDir,
+        this.pluginId,
+        this.ownPluginDir,
+      );
+      this.exclusionIndexConfig = this.config;
+    }
+    return this.exclusionIndex;
+  }
+
+  private isExcludedPath(path: string): boolean {
+    return isExcludedWithIndex(path, this.getExclusionIndex(), this.config);
+  }
+
+  private isExcludedDirectoryPath(path: string): boolean {
+    return isExcludedDirectoryWithIndex(
+      path,
+      this.getExclusionIndex(),
+      this.config,
+    );
   }
 
   // ---- Scan Cache ----
@@ -836,6 +1148,35 @@ export class LocalScanner {
     }
     this.scanCache.entries[path] = { mtime, size, hash, quickXorHash, binary };
     this.scanCacheDirty = true;
+    this.hashedSinceCheckpoint += 1;
+  }
+
+  /** Persist the hashes paid for so far when a whole-cache write is due.
+   *
+   *  Two triggers share one rule — bound the work a host freeze can throw
+   *  away without rewriting a large cache on every file: SCAN_CACHE_CHECKPOINT_EVERY
+   *  new hashes (many-small-file vaults), or the current interval since the
+   *  last checkpoint (a few huge media files can hash for minutes without
+   *  reaching the count). The interval doubles per checkpoint up to the cap,
+   *  so a long scan writes a handful of times, not every few seconds.
+   *
+   *  Upserts only: `cachePrune` stays exclusive to a completed scan, because
+   *  deleted-path inference is the one thing a partial walk cannot support
+   *  (DECISIONS 2026-11-23.03). Best-effort — a failed write keeps
+   *  the dirty flag set, so the next trigger or the tail save retries. */
+  private async maybeCheckpointScanCache(): Promise<void> {
+    if (this.hashedSinceCheckpoint === 0) return;
+    const now = Date.now();
+    const dueByCount = this.hashedSinceCheckpoint >= SCAN_CACHE_CHECKPOINT_EVERY;
+    const dueByTime = now - this.lastCacheCheckpointAt >= this.cacheCheckpointIntervalMs;
+    if (!dueByCount && !dueByTime) return;
+    await this.saveScanCache();
+    this.hashedSinceCheckpoint = 0;
+    this.lastCacheCheckpointAt = now;
+    this.cacheCheckpointIntervalMs = Math.min(
+      this.cacheCheckpointIntervalMs * 2,
+      SCAN_CACHE_CHECKPOINT_MAX_INTERVAL_MS,
+    );
   }
 
   private cachePrune(activePaths: Set<string>): void {
@@ -857,9 +1198,31 @@ export class LocalScanner {
 
   /**
    * Scan all non-excluded files in the vault and return LocalFileEntry snapshots.
+   *
+   * `onProgress` reports files examined out of the vault file list. Include
+   * paths (config-dir subtrees) are not part of that denominator; scans that
+   * rely on them still finish with the same result, just without a total.
+   *
+   * `signal` makes the walk interruptible. A first sync over a large vault
+   * reads every file whole, and on a phone that can outlive the host's
+   * tolerance for a backgrounded WebView — before this the only way out was
+   * killing the app, and the round could not be cancelled at all. An aborted
+   * scan stops at the next file boundary and returns `aborted: true` with the
+   * partial page never published: the hashes already paid for are upserted
+   * (so the next attempt resumes instead of re-reading them), but no
+   * `cachePrune` runs, so nothing here can make a file look deleted.
    */
-  async scanAll(): Promise<LocalScanResult> {
+  async scanAll(
+    onProgress?: (current: number, total?: number) => void,
+    signal?: AbortSignal,
+  ): Promise<LocalScanResult> {
     await this.loadScanCache();
+    this.hashedSinceCheckpoint = 0;
+    this.lastCacheCheckpointAt = Date.now();
+    this.cacheCheckpointIntervalMs = SCAN_CACHE_CHECKPOINT_MIN_INTERVAL_MS;
+    this.scanCacheHits = 0;
+    this.scanReadMs = 0;
+    this.scanHashMs = 0;
     const entries: LocalFileEntry[] = [];
     const skippedLarge: string[] = [];
     const failedPaths: string[] = [];
@@ -883,12 +1246,20 @@ export class LocalScanner {
         skippedCount: 0,
         complete: false,
         recoveryCopies: [],
+        metrics: this.scanMetricsSnapshot(entries),
       };
     }
     let skippedCount = 0;
     const recoveryCopies: string[] = [];
 
     this.collectLoadedFolderPaths(folderPaths, folderScanFailures);
+
+    // IncludePaths add files outside `vault.getFiles()`; when they are
+    // configured, the vault list is not a complete denominator, so report a
+    // count only instead of freezing at total/total before the tail scan.
+    const progressTotal = this.config.includePaths.length === 0
+      ? allFiles.length
+      : undefined;
 
     skippedCount = await this.scanVaultFiles({
       allFiles,
@@ -899,7 +1270,11 @@ export class LocalScanner {
       observedFilePaths,
       recoveryCopies,
       skippedCount,
+      progressTotal,
+      onProgress,
+      signal,
     });
+    if (signal?.aborted) return this.abortedScanResult(entries);
 
     // ── IncludePaths enumeration ──
     this.diag?.log("scan", `includePaths: [${this.config.includePaths.join(', ')}], excludePaths: [${this.config.excludePaths.join(', ')}]`);
@@ -912,7 +1287,9 @@ export class LocalScanner {
       scannedDirs,
       folderPaths,
       recoveryCopies,
+      signal,
     );
+    if (signal?.aborted) return this.abortedScanResult(entries);
     for (const path of observedFilePaths) {
       if (this.shouldSyncPath(path)) addParentFolderPaths(path, folderPaths);
     }
@@ -932,12 +1309,13 @@ export class LocalScanner {
     );
     // ponytail: only log the count — full path listing is verbose and rarely useful
 
-    // An incomplete scan cannot prove a cached path was deleted. Keep the
-    // previous cache intact and publish nothing until a healthy scan succeeds.
-    if (failedPaths.length === 0) {
-      this.cachePrune(scannedPaths);
-      await this.saveScanCache();
-    }
+    // An incomplete scan cannot prove a cached path was deleted, so pruning
+    // waits for a clean walk. The entries it did hash are still content-true
+    // facts and are upserted: one unreadable file no longer discards every
+    // hash the round paid for, and the next scan's mtime+size probe
+    // re-validates them before reuse.
+    if (failedPaths.length === 0) this.cachePrune(scannedPaths);
+    await this.saveScanCache();
 
     return {
       entries,
@@ -949,6 +1327,51 @@ export class LocalScanner {
       skippedCount,
       complete: failedPaths.length === 0,
       recoveryCopies,
+      metrics: this.scanMetricsSnapshot(entries),
+    };
+  }
+
+  /** Cost facts for this walk; diagnostic only, never a cache or decision
+   *  input. */
+  private scanMetricsSnapshot(entries: LocalFileEntry[]): LocalScanMetrics {
+    let bytes = 0;
+    for (const entry of entries) bytes += entry.size;
+    return {
+      files: entries.length,
+      bytes,
+      cacheHits: this.scanCacheHits,
+      readMs: this.scanReadMs,
+      hashMs: this.scanHashMs,
+    };
+  }
+
+  /** Terminal shape for a walk the round's cancel signal interrupted.
+   *
+   *  `complete: false` is deliberate even without a single failed path: a
+   *  partial entry list must never be mistaken for the vault's truth, so every
+   *  existing caller that gates on `complete` stops exactly as it does for a
+   *  incomplete scan — no plan, no mutation. The hashes already paid for are
+   *  persisted (upsert only, never `cachePrune`) so a cancelled first sync
+   *  resumes instead of re-reading every file from scratch. Callers separate
+   *  "cancelled" from "scan failed" by reading `aborted`. */
+  private async abortedScanResult(entries: LocalFileEntry[]): Promise<LocalScanResult> {
+    await this.saveScanCache();
+    this.diag?.log(
+      "scan",
+      `scanAll aborted by the round cancel — ${entries.length} file(s) had been examined; ${this.hashedSinceCheckpoint} hash(es) kept for the next attempt, nothing pruned`,
+    );
+    return {
+      entries,
+      folders: [],
+      folderScanComplete: false,
+      folderScanFailures: [],
+      skippedLarge: [],
+      failedPaths: [],
+      skippedCount: 0,
+      complete: false,
+      aborted: true,
+      recoveryCopies: [],
+      metrics: this.scanMetricsSnapshot(entries),
     };
   }
 
@@ -965,18 +1388,40 @@ export class LocalScanner {
     observedFilePaths: Set<string>;
     recoveryCopies: string[];
     skippedCount: number;
+    progressTotal?: number;
+    onProgress?: (current: number, total?: number) => void;
+    signal?: AbortSignal;
   }): Promise<number> {
-    const { allFiles, entries, skippedLarge, failedPaths, scannedPaths, observedFilePaths, recoveryCopies } = args;
+    const { allFiles, entries, skippedLarge, failedPaths, scannedPaths, observedFilePaths, recoveryCopies, progressTotal, onProgress, signal } = args;
     let { skippedCount } = args;
-    let fileCount = 0;
+    let examinedCount = 0;
     for (const file of allFiles) {
+      // Cancel is checked once per file, before any work: the cache probe and
+      // the content read already yield to the host on their own, so the
+      // cancellation window is bounded by one file's read, not the whole walk.
+      if (signal?.aborted) return skippedCount;
+      examinedCount += 1;
+      // Yield on the examined-file cadence, not only after hashing. A warm
+      // scan is all cache hits, and without this the whole walk ran as one
+      // synchronous block on the host's main thread (74 ms for 317 files,
+      // seconds for a large vault, every scheduled round).
+      if (examinedCount % SCAN_SLEEP_EVERY === 0) await yieldToHost();
+      if (
+        examinedCount % SCAN_PROGRESS_EVERY === 0
+        || examinedCount === allFiles.length
+      ) {
+        onProgress?.(examinedCount, progressTotal);
+      }
       const path = file.path;
       scannedPaths.add(path);
       observedFilePaths.add(path);
 
-      if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+      if (this.isExcludedPath(path)) {
         if (path.endsWith(EASY_SYNC_RECOVERY_SUFFIX)) recoveryCopies.push(path);
-        if (!isPathExcludedByFolders(path, this.config.excludedFolders)) {
+        if (!isPathExcludedByNormalizedFolders(
+          path,
+          this.getExclusionIndex().excludedFoldersLower,
+        )) {
           skippedCount++;
         }
         continue;
@@ -1006,6 +1451,7 @@ export class LocalScanner {
         ? null
         : this.cacheProbe(path, stat.mtime ?? 0, stat.size);
       if (cached) {
+        this.scanCacheHits += 1;
         entries.push({
           path,
           size: stat.size,
@@ -1018,6 +1464,7 @@ export class LocalScanner {
       }
 
       let content: ArrayBuffer;
+      const readStartedAt = Date.now();
       try {
         content = await this.vault.adapter.readBinary(path);
       } catch {
@@ -1025,10 +1472,14 @@ export class LocalScanner {
         // (DeleteRemote, ConfirmLocalDelete) must be blocked this round.
         failedPaths.push(path);
         continue;
+      } finally {
+        this.scanReadMs += Date.now() - readStartedAt;
       }
 
+      const hashStartedAt = Date.now();
       const hash = await sha256Hex(content);
       const quickXorHash = quickXorHashBase64(content);
+      this.scanHashMs += Date.now() - hashStartedAt;
       const size = resolveScannedFileSize(stat.size, content.byteLength);
       if (size > this.config.maxFileSize) {
         skippedLarge.push(path);
@@ -1037,9 +1488,7 @@ export class LocalScanner {
       const binary = size > 0 ? isBinary(content) : false;
       entries.push({ path, size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
       this.cacheSet(path, stat.mtime ?? 0, size, hash, quickXorHash, binary);
-
-      // P1: yield to UI thread every N files (per Obsidian performance docs)
-      if (++fileCount % SCAN_SLEEP_EVERY === 0) await sleep(0);
+      await this.maybeCheckpointScanCache();
     }
     return skippedCount;
   }
@@ -1058,8 +1507,10 @@ export class LocalScanner {
     scannedDirs: Set<string>,
     folderPaths: Set<string>,
     recoveryCopies: string[],
+    signal?: AbortSignal,
   ): Promise<void> {
     for (const prefix of this.config.includePaths) {
+      if (signal?.aborted) return;
       if (prefix.endsWith("/")) {
         await this.scanDir(
           prefix,
@@ -1072,6 +1523,7 @@ export class LocalScanner {
           folderPaths,
           true,
           recoveryCopies,
+          signal,
         );
       } else {
         await this.scanSinglePath(
@@ -1099,7 +1551,7 @@ export class LocalScanner {
     if (scannedPaths.has(filePath)) return;
     scannedPaths.add(filePath);
 
-    if (isExcluded(filePath, this.config, this.configDir, this.pluginId)) return;
+    if (this.isExcludedPath(filePath)) return;
 
     let stat;
     try {
@@ -1136,6 +1588,7 @@ export class LocalScanner {
       ? null
       : this.cacheProbe(filePath, stat.mtime ?? 0, stat.size);
     if (cached) {
+      this.scanCacheHits += 1;
       entries.push({
         path: filePath,
         size: stat.size,
@@ -1148,15 +1601,20 @@ export class LocalScanner {
     }
 
     let content: ArrayBuffer;
+    const readStartedAt = Date.now();
     try {
       content = await this.vault.adapter.readBinary(filePath);
     } catch {
       failedPaths.push(filePath);
       return;
+    } finally {
+      this.scanReadMs += Date.now() - readStartedAt;
     }
 
+    const hashStartedAt = Date.now();
     const hash = await sha256Hex(content);
     const quickXorHash = quickXorHashBase64(content);
+    this.scanHashMs += Date.now() - hashStartedAt;
     const size = resolveScannedFileSize(stat.size, content.byteLength);
     if (size > this.config.maxFileSize) {
       skippedLarge.push(filePath);
@@ -1172,6 +1630,7 @@ export class LocalScanner {
       binary,
     });
     this.cacheSet(filePath, stat.mtime ?? 0, size, hash, quickXorHash, binary);
+    await this.maybeCheckpointScanCache();
   }
 
   /** Recursively list and scan files under `dirPath` via vault.adapter.
@@ -1190,10 +1649,12 @@ export class LocalScanner {
     folderPaths: Set<string>,
     allowMissingRoot = false,
     recoveryCopies?: string[],
+    signal?: AbortSignal,
   ): Promise<void> {
+    if (signal?.aborted) return;
     // Normalize: strip trailing slash(es) so path construction is clean
     const base = dirPath.replace(/\/+$/, "");
-    if (scannedDirs.has(base) || isExcludedDirectory(base, this.config, this.configDir, this.pluginId)) return;
+    if (scannedDirs.has(base) || this.isExcludedDirectoryPath(base)) return;
     scannedDirs.add(base);
 
     // Explicitly included config directories such as themes/ and snippets/
@@ -1234,6 +1695,7 @@ export class LocalScanner {
       scannedPaths,
       observedFilePaths,
       recoveryCopies,
+      signal,
     });
 
     for (const sub of listed.folders) {
@@ -1249,6 +1711,7 @@ export class LocalScanner {
         folderPaths,
         false,
         recoveryCopies,
+        signal,
       );
     }
   }
@@ -1268,15 +1731,17 @@ export class LocalScanner {
     scannedPaths: Set<string>;
     observedFilePaths: Set<string>;
     recoveryCopies: string[] | undefined;
+    signal?: AbortSignal;
   }): Promise<void> {
-    const { base, listed, entries, skippedLarge, failedPaths, scannedPaths, observedFilePaths, recoveryCopies } = args;
+    const { base, listed, entries, skippedLarge, failedPaths, scannedPaths, observedFilePaths, recoveryCopies, signal } = args;
     for (const file of listed.files) {
+      if (signal?.aborted) return;
       const path = normalizeListedPath(base, file);
       if (scannedPaths.has(path)) continue;
       scannedPaths.add(path);
       observedFilePaths.add(path);
 
-      if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+      if (this.isExcludedPath(path)) {
         if (path.endsWith(EASY_SYNC_RECOVERY_SUFFIX)) recoveryCopies?.push(path);
         if (path.endsWith("/data.json")) {
           this.diag?.log("scan", `isExcluded("${path}") → true (/data.json, self-referential protection)`);
@@ -1308,6 +1773,7 @@ export class LocalScanner {
         ? null
         : this.cacheProbe(path, stat.mtime ?? 0, stat.size);
       if (cached) {
+        this.scanCacheHits += 1;
         entries.push({
           path,
           size: stat.size,
@@ -1320,15 +1786,20 @@ export class LocalScanner {
       }
 
       let content: ArrayBuffer;
+      const readStartedAt = Date.now();
       try {
         content = await this.vault.adapter.readBinary(path);
       } catch {
         failedPaths.push(path);
         continue;
+      } finally {
+        this.scanReadMs += Date.now() - readStartedAt;
       }
 
+      const hashStartedAt = Date.now();
       const hash = await sha256Hex(content);
       const quickXorHash = quickXorHashBase64(content);
+      this.scanHashMs += Date.now() - hashStartedAt;
       const size = resolveScannedFileSize(stat.size, content.byteLength);
       if (size > this.config.maxFileSize) {
         skippedLarge.push(path);
@@ -1337,6 +1808,7 @@ export class LocalScanner {
       const binary = size > 0 ? isBinary(content) : false;
       entries.push({ path, size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
       this.cacheSet(path, stat.mtime ?? 0, size, hash, quickXorHash, binary);
+      await this.maybeCheckpointScanCache();
     }
   }
 
@@ -1375,7 +1847,7 @@ export class LocalScanner {
   ): Promise<LocalFileInspection> {
     if (
       !options.allowExcludedForRecovery
-      && isExcluded(path, this.config, this.configDir, this.pluginId)
+      && this.isExcludedPath(path)
     ) {
       return { status: "uncertain", reason: "excluded" };
     }
@@ -1425,7 +1897,7 @@ export class LocalScanner {
    *  SHA-256 guard and one irreversible erase is a single stat, not the whole
    *  wave. It is a supplementary mtime+size gate, not a content proof. */
   async inspectFileStat(path: string): Promise<LocalFileStatInspection> {
-    if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+    if (this.isExcludedPath(path)) {
       return { status: "uncertain", reason: "excluded" };
     }
     let stat;
@@ -1521,4 +1993,25 @@ function normalizeTopologyPath(path: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => compatSetTimeout(() => resolve(), ms));
+}
+
+/** Yield one full macrotask without the browser's nested-timer clamp.
+ *
+ *  `setTimeout(0)` is clamped to ~4 ms once timers are nested a few levels;
+ *  a warm scan yielding every 50 examined files would turn that into seconds
+ *  of wall clock on a 100k-file vault. A MessageChannel task is a normal
+ *  macrotask (the host stays repaintable) without the timer clamp. Hosts
+ *  without MessageChannel fall back to the previous zero-delay timer.
+ */
+function yieldToHost(): Promise<void> {
+  if (typeof MessageChannel === "undefined") return sleep(0);
+  return new Promise<void>((resolve) => {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(null);
+  });
 }

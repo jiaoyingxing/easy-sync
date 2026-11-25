@@ -346,7 +346,11 @@ export function parseSharedSyncProtocolV2(
 /**
  * Canonical byte representation of the immutable public V2 record.
  *
- * Property order is part of the published predecessor digest contract.
+ * Property order is part of the published predecessor digest contract. A
+ * four-field scope serializes byte-identically to every earlier version; the
+ * S0 provider fields are appended only when the caller actually supplied them
+ * (W2b2b2 first-sync full scope), in a fixed order so the V3 predecessor
+ * digest can be rebuilt by the same function.
  */
 export function serializeSharedSyncProtocolV2(
   protocol: SharedSyncProtocolV2,
@@ -359,16 +363,36 @@ export function serializeSharedSyncProtocolV2(
     kind: protocol.kind,
     protocolVersion: protocol.protocolVersion,
     migrationGeneration: protocol.migrationGeneration,
-    scope: {
-      accountId: protocol.scope.accountId,
-      driveId: protocol.scope.driveId,
-      vaultFolderId: protocol.scope.vaultFolderId,
-      filesRootId: protocol.scope.filesRootId,
-    },
+    scope: serializeProtocolScope(protocol.scope),
     confirmedAllDevicesUpdatedAt:
       protocol.confirmedAllDevicesUpdatedAt,
     createdAt: protocol.createdAt,
   });
+}
+
+/** 四元顺序不变；可选 provider 字段只在存在时追加。 */
+function serializeProtocolScope(scope: SyncScope): SyncScope {
+  return {
+    accountId: scope.accountId,
+    driveId: scope.driveId,
+    vaultFolderId: scope.vaultFolderId,
+    filesRootId: scope.filesRootId,
+    ...(scope.providerKind !== undefined
+      ? { providerKind: scope.providerKind }
+      : {}),
+    ...(scope.endpointId !== undefined
+      ? { endpointId: scope.endpointId }
+      : {}),
+    ...(scope.containerId !== undefined
+      ? { containerId: scope.containerId }
+      : {}),
+    ...(scope.rootPath !== undefined
+      ? { rootPath: scope.rootPath }
+      : {}),
+    ...(scope.credentialBindingId !== undefined
+      ? { credentialBindingId: scope.credentialBindingId }
+      : {}),
+  };
 }
 
 export function isSharedSyncProtocolBindingV2(

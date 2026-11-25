@@ -246,6 +246,9 @@ export class RangeStreamAdaptation implements RangeStreamObserver {
   private connectionFailureStreak = 0;
   /** Consecutive throttle events; doubles the base 429 cooldown. */
   private rateLimitStreak = 0;
+  /** A 429/509 arrived this round. A throttled tier is not carried into the
+   *  next round: the service already said it was too high. */
+  private rateLimitedThisRound = false;
   /** Last (tier, target, fundable rung) triple whose size-blocked probe was
    *  logged, so a round of same-sized files explains itself once instead of
    *  once per file. */
@@ -267,10 +270,52 @@ export class RangeStreamAdaptation implements RangeStreamObserver {
     return DOWNLOAD_RANGE_STREAM_LADDER[this.tierIndex];
   }
 
+  /** Whether a 429/509 downgraded this round. The caller clears its warm-start
+   *  memory when this is true: a throttled tier must not be remembered. */
+  get hadRateLimitThisRound(): boolean {
+    return this.rateLimitedThisRound;
+  }
+
+  /** The ladder tier this round settled on — a confirmed knee (two
+   *  below-the-line steps) or a hold band (a step that paid too little to
+   *  justify another move). `null` means the round produced no settled
+   *  evidence (no large file, an early abort, or a throttle); the caller then
+   *  keeps whatever it remembered from an earlier round.
+   *
+   *  The caller starts the next round one rung BELOW this value, so the
+   *  ordinary probe machinery re-proves the step every round: a link that got
+   *  slower between rounds falls back instead of inheriting a stale tier
+   *  forever, and a healthy link is back at the settled tier on its second
+   *  large file. */
+  settledStreamsForNextRound(): number | null {
+    if (this.rateLimitedThisRound) return null;
+    if (this.freeze !== null) {
+      return DOWNLOAD_RANGE_STREAM_LADDER[this.freeze.tierIndex];
+    }
+    if (this.ceilingIndex < DOWNLOAD_RANGE_STREAM_LADDER.length - 1) {
+      return DOWNLOAD_RANGE_STREAM_LADDER[
+        Math.min(this.tierIndex, this.ceilingIndex)
+      ];
+    }
+    return null;
+  }
+
   /** Reset for a new sync round. The instance is reused so callers holding a
-   *  reference (the downloader input) keep seeing the same controller. */
-  reset(): void {
-    this.tierIndex = 0;
+   *  reference (the downloader input) keep seeing the same controller. A
+   *  remembered tier starts ONE rung below itself (see
+   *  `settledStreamsForNextRound`); an unknown value starts at the floor. */
+  reset(options: { settledStreams?: number } = {}): void {
+    const remembered = options.settledStreams;
+    const rememberedIndex = remembered === undefined
+      ? -1
+      : (DOWNLOAD_RANGE_STREAM_LADDER as readonly number[]).indexOf(remembered);
+    this.tierIndex = rememberedIndex > 0 ? rememberedIndex - 1 : 0;
+    if (rememberedIndex > 0) {
+      this.diag?.log(
+        "onedrive",
+        `multi-range adaptation — warm start at ${this.plannedStreams} streams, one rung below the ${remembered} streams the previous round settled on`,
+      );
+    }
     this.samplesByStreams.clear();
     this.lastSample = null;
     this.pendingProbe = null;
@@ -282,6 +327,7 @@ export class RangeStreamAdaptation implements RangeStreamObserver {
     this.cooldownUntilMs = 0;
     this.connectionFailureStreak = 0;
     this.rateLimitStreak = 0;
+    this.rateLimitedThisRound = false;
     this.lastSizeBlockedProbeKey = null;
   }
 
@@ -474,6 +520,7 @@ export class RangeStreamAdaptation implements RangeStreamObserver {
 
   recordRateLimited(observation: RangeStreamRateLimitObservation = {}): void {
     this.connectionFailureStreak = 0;
+    this.rateLimitedThisRound = true;
     this.probePending = false;
     this.probeKind = null;
     this.pendingProbe = null;

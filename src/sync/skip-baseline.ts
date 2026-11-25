@@ -2,6 +2,11 @@
  * Configuration-skip helpers shared by planning, progress counting and the
  * sidebar.
  *
+ * Folder-exclusion history snapshot: each completed round keeps a capped copy
+ * of the configured excluded folder paths so the sidebar can show what the
+ * round's local scan excluded. The fold lists folders only (never files); the
+ * scan filter remains the sole rule owner and this snapshot is display-only.
+ *
  * Size-exclusion baseline: a per-device mirror of the paths that were
  * settled as SkipLargeFile in the most recent completed plan. It exists
  * only so the UI can show skip rows incrementally (2026-09-16 拍板, 方案单
@@ -37,6 +42,56 @@ export function normalizeHistorySkipPaths(value: unknown): string[] {
     if (seen.size >= MAX_HISTORY_SKIP_PATHS) break;
   }
   return [...seen];
+}
+
+/** Per-round cap for the folder paths retained inside one history entry. The
+ *  fold title still reports the true configured total and notes the omitted
+ *  remainder; the settings list itself stays the authoritative copy. */
+export const MAX_HISTORY_EXCLUDED_FOLDERS = 200;
+
+/** Normalize the folder-exclusion snapshot retained by one history entry:
+ *  non-empty strings only, de-duplicated, capped at
+ *  `MAX_HISTORY_EXCLUDED_FOLDERS`. `total` keeps the pre-cap unique count so
+ *  the fold can report truncation honestly. */
+export function normalizeHistoryExcludedFolders(value: unknown): {
+  paths: string[];
+  total: number;
+} {
+  if (!Array.isArray(value)) return { paths: [], total: 0 };
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry === "string" && entry.length > 0) seen.add(entry);
+  }
+  const paths = [...seen];
+  return {
+    paths: paths.slice(0, MAX_HISTORY_EXCLUDED_FOLDERS),
+    total: paths.length,
+  };
+}
+
+/** Collect one history entry's folder-exclusion fold facts. Legacy entries
+ *  without the field degrade to an empty fold. */
+export function collectHistoryExcludedFolders(entry: {
+  excludedFolders?: unknown;
+  excludedFoldersTotal?: unknown;
+}): { paths: string[]; total: number; omitted: number } {
+  const normalized = normalizeHistoryExcludedFolders(entry.excludedFolders);
+  const persistedTotal =
+    typeof entry.excludedFoldersTotal === "number"
+    && Number.isFinite(entry.excludedFoldersTotal)
+    && entry.excludedFoldersTotal > 0
+      ? Math.trunc(entry.excludedFoldersTotal)
+      : 0;
+  const total = Math.max(
+    normalized.total,
+    persistedTotal,
+    normalized.paths.length,
+  );
+  return {
+    paths: normalized.paths,
+    total,
+    omitted: Math.max(0, total - normalized.paths.length),
+  };
 }
 
 /** Normalize a persisted baseline value: only non-empty strings survive,

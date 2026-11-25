@@ -150,13 +150,6 @@ body.is-phone .easy-sync-modal-footer.is-fixed {
   margin: 0 0 2px;
 }
 
-/* 手机软键盘余量：挂到弹框内的滚动容器；--keyboard-height 键盘收起为 0、
-   弹出自动让位，桌面恒为 0。基准内衬按容器覆盖 --easy-sync-tail-*。 */
-.easy-sync-keyboard-tail {
-  padding-bottom: calc(var(--easy-sync-tail-pad, 0px) + var(--keyboard-height, 0px));
-  scroll-padding-bottom: calc(var(--easy-sync-tail-scroll, 0px) + var(--keyboard-height, 0px));
-}
-
 /* 弹框宽度两档：默认档＝宿主不写 width；宽版档＝本条唯一规则。选择器必须带
    .modal 前缀——宿主宽度规则是双类选择器，单类名压不过（Resojot 2026-10-26
    实测 12 条手写宽度静默失效）。除本条与 recovery 侧栏式例外，不再有第三种
@@ -164,6 +157,145 @@ body.is-phone .easy-sync-modal-footer.is-fixed {
 .modal.easy-sync-modal-wide {
   width: min(620px, calc(100vw - 24px));
 }
+
+/* WebDAV 配置弹窗（C2）。
+
+   形状是**一个普通弹窗**：不撑满屏宽、不撑满屏高，正常居中、左右留边。
+   骨架照 Resojot 服务商弹窗：内容区列 flex，表单段自己滚，动作段是它的
+   兄弟、在滚动区外面（不是 sticky——sticky 会让底栏浮在字段上方）。
+
+   2026-11-22 用户第三次纠正后整体重做，前几版的三处错误分别在这里说清：
+   ① 宽度：宿主手机端把 `.modal` 设成 `--dialog-width: 100vw`，所以卡片撑满
+      两边的观感来自宿主，不是我们。这里显式收回成一个卡片宽度。
+   ② 内衬：曾写 `padding-inline: 2px` 覆盖宿主的 `.modal-content`
+      `padding: 16px`，于是内容左右只剩 2px、贴着屏幕边。宿主 16px 内衬
+      留在 `.modal-content`；环宽补到真正裁切的表单滚动段上（见下），
+      两层各管各的。
+   ③ 键盘：不再补「整个键盘高度」。那只在输入框正好贴底时才对，其余情况会
+      留下大片空白（用户截图里的空洞）。改为按**实际被遮挡量**算并自己滚动，
+      见 `bindModalKeyboardInset` 的说明。 */
+.easy-sync-webdav-config-modal {
+  display: flex;
+  flex-direction: column;
+  max-height: var(--easy-sync-modal-max-height);
+  overflow: hidden;
+}
+
+/* 手机端收回卡片宽度：宿主给的是 100vw（通栏）。取一档与 Resojot 服务商
+   弹窗相称的中央卡片，左右留出可点空白。选择器带 `.modal` 前缀——宿主宽度
+   规则是双类选择器，单类名压不过。 */
+body.is-mobile .modal.easy-sync-webdav-config-modal {
+  --dialog-width: min(100vw - var(--size-4-6), 480px);
+  width: min(calc(100vw - var(--size-4-6)), 480px);
+}
+
+.easy-sync-webdav-config-modal .modal-content {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  /* 宿主的 16px 内衬照用。焦点环宽度不在这里补——真裁切发生在表单滚动段
+     （overflow 按 padding box 裁），环宽必须补在那一个元素上，见下。 */
+  padding-inline: var(--size-4-4);
+}
+
+/* 表单段：唯一的滚动面。焦点环内衬落在**这里**：滚动容器按自己的 padding
+   box 裁切，外扩 2px 的聚焦环会不会被切取决于这一层**四边**的内衬——挂在
+   外层 `.modal-content` 上够不到（2026-11-22 真机：环的左右两缘被裁）。
+   上下两缘同理：首行／末行的输入框分别贴着滚动段顶／底边，环的竖向两缘
+   会各被裁掉 2px（2026-11-23 用户截图），所以 `padding-block` 也按环宽留。
+   常量内衬只让卡片多 4px；键盘余量仍只能交给共享类
+   `.easy-sync-keyboard-inset`，不能写成 `padding-bottom`（那会跟着键盘
+   高度参与文档流、把内容驱动高度的卡片顶高）。 */
+.easy-sync-webdav-config-form {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-block: var(--input-border-width-focus, 2px);
+  padding-inline: var(--input-border-width-focus, 2px);
+}
+
+/* 动作段：滚动区之外的兄弟，占自己的高度，永不覆盖字段。
+   按钮排布手机端改两键并排（见下），safe-area 内边距仍归宿主。 */
+body.is-mobile .easy-sync-webdav-config-actions {
+  flex: 0 0 auto;
+  display: flex;
+}
+
+/* 手机端底栏两键并排（2026-11-22 目测拍板，同日早前「按钮按宿主走」被本次
+   推翻：竖排把保存／取消叠成两行，长表单里费高度又看着眼花）。写法照 Resojot
+   服务商壳 2026-11-06 的三件套：容器改回 row（宿主手机端是 column-reverse，
+   改回 row 后取消按 DOM 次序落左边、保存在右）、按钮同行等宽（flex 1 1 0 +
+   width auto，抵掉宿主整宽）、取消的竖排 margin-top 归零。范围钉在本弹窗
+   动作段——其它弹框维持宿主竖排，不随本条变。 */
+body.is-phone .easy-sync-webdav-config-actions .easy-sync-modal-footer,
+body.is-mobile .easy-sync-webdav-config-actions .easy-sync-modal-footer {
+  /* 动作段是 row flex（上方规则），底栏会被收成内容宽（实测 148px／段宽 414px）；
+     补这条让它占满整行，下面的按钮等分才有意义。 */
+  flex: 1 1 auto;
+  flex-direction: row;
+  align-items: center;
+}
+
+body.is-phone .easy-sync-webdav-config-actions .easy-sync-modal-footer button,
+body.is-mobile .easy-sync-webdav-config-actions .easy-sync-modal-footer button {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+}
+
+body.is-phone .easy-sync-webdav-config-actions .easy-sync-modal-footer button.mod-cancel,
+body.is-mobile .easy-sync-webdav-config-actions .easy-sync-modal-footer button.mod-cancel {
+  margin-top: 0;
+}
+
+/* 软键盘余量：`--easy-sync-keyboard-inset` 由 TS 按「聚焦字段实际被盖住多少」
+   逐帧写入，这里把它消费成**滚动锚**。锚必须是 ::after 绝对定位——绝对定位
+   不参与文档流，只扩大「能滚多远」；写 `padding-bottom` 会进入卡片高度计算，
+   内容驱动高度的卡片会被顶高、聚焦时整卡轻微位移（2026-11-22 真机实测）。
+   变量缺省 `0px`：没被盖住、键盘收起、失焦时 TS 写 0，锚高度归零，不留
+   任何空白。 */
+.easy-sync-keyboard-inset {
+  position: relative;
+}
+
+.easy-sync-keyboard-inset::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  height: var(--easy-sync-keyboard-inset, 0px);
+}
+
+/* 软键盘：弹窗位置与尺寸**始终不动**。
+
+   用户明确要求「弹窗无论如何都不动」。所以这里没有任何容器让位、卡片限高
+   或 sticky。避让只发生在表单滚动段内部：由共享类 `.easy-sync-keyboard-inset`
+   的滚动锚补一段可滚空间，被键盘盖住的聚焦输入框由 TS 主动滚到键盘上沿。
+   补多少不在这里写死，由 `bindModalKeyboardInset` 按实际遮挡量逐帧算——
+   没被盖住的框零动作，也不会留下固定空白。 */
+
+/* 2026-11-21 用户目测：输入框聚焦后边框被「挡住」、四周线条不匀。
+ *
+ * 真因：宿主给输入框的聚焦反馈是
+ * `box-shadow: 0 0 0 var(--input-border-width-focus) var(...)`（2px，向外扩），
+ * 不是 outline。外扩的阴影属于 ink overflow，会被祖先滚动容器的 `overflow`
+ * 按 padding box 裁掉。四个字段都贴在本行右端，而行本身没有横向内衬，于是
+ * 输入框右边缘与滚动段的裁切边界重合：右侧那 2px 环全部被切、上／下／左
+ * 三边完整——看起来就是「右边框像被压掉一层」。
+ *
+ * 实测（真宿主注入红环做对照）：内衬 0 时右侧余量 0.00px，环被完整裁掉；
+ * 补回环宽后余量 2.00px，四边完整。
+ *
+ * 取值照 Resojot 服务商录入弹窗同一思路——它的表单区 `padding-right: 2px`
+ * 就是给这圈环留的。关键是不用 `--size-4-2` 那类整档间距：整档会把行文本
+ * 相对标题右移，凭空造一处新的不齐。内衬落在**滚动段** `.easy-sync-webdav-config-form`
+ * 上（见上方骨架条目），因为裁切发生在那一个元素。 */
 
 /* ---- Settings Modals ---- */
 
@@ -841,6 +973,21 @@ body:not(.is-mobile) .easy-sync-view-content {
   overflow-y: auto;
 }
 
+/* Obsidian 移动端抽屉会给 `nav-header` 之后的最后一个 div 加 8px 上内衬
+   （同时给 96px 下内衬让开底部悬浮栏）。速度胶囊只在实际有读数时渲染：
+   没有读数时 `.easy-sync-view-content` 成了那个「最后一个 div」，上内衬
+   就变成状态区与进度面板之间凭空多出的 8px（2026-11-23 安卓真机：同步
+   起跑时出现，首个速度读数出现后收掉）。正文的上边界由上面的状态区提供，
+   不需要这条上内衬；按宿主同一组条件把它归零，宿主的下内衬保留。选择器
+   要压过宿主的 `.nav-header ~ div:last-child`，不依赖胶囊是否挂载。 */
+body.is-mobile.is-floating-nav.is-phone
+  .workspace-drawer
+  .workspace-leaf-content
+  .view-content.easy-sync-view
+  > .easy-sync-view-content {
+  padding-top: 0;
+}
+
 .easy-sync-status-panel {
   display: flex;
   flex-direction: column;
@@ -979,6 +1126,14 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   padding: 8px 0;
   border-top: 1px solid var(--background-modifier-border);
 }
+
+/* 进度面板与其它段落一样保留自己的 `border-top`，不再按空窗期让线。
+   2026-11-21 曾用 `:has(> .easy-sync-progress-bar:only-child):not(:last-child)`
+   让面板在「只有一根条」时退掉这条线，用户 2026-11-23 实测后判为更差：线一
+   消失，面板上方 8px 内衬失去上边界、读成一段凭空多出的顶部空白；首个条目
+   结算、面板长出内容时线又回来，整块跳一次。暂时接受空窗期的「双线夹进度条」
+   ——两条同色线中间夹一根 4px 空轨道。想再收成一条线时，去处见
+   `DECISIONS` 2026-11-23：换宿主无关的判据，不是在 CSS 里继续收窄选择器。 */
 
 .easy-sync-section-title {
   margin: 0;
@@ -1997,7 +2152,7 @@ body.is-phone .easy-sync-settings-tab {
   min-width: 0;
 }
 
-/* 支持页「我的其他插件」两行：保留现有图标＋chevron；整行是外链，交互与根级
+/* 支持页「我的其他插件」插件行：保留现有图标＋chevron；整行是外链，交互与根级
    导航行同型（mod-navigable＋role=link），焦点走宿主 `.setting-item:focus-visible`，
    不自绘悬停／焦点底纹。 */
 .setting-group.mod-list.easy-sync-settings-support-picks {
@@ -2554,4 +2709,43 @@ body.is-mobile
   .easy-sync-recovery-layout:not(.is-detail-open)
   .easy-sync-recovery-detail-pane {
   display: none;
+}
+
+/* Dev-only LAN session modal (S2a/S2b2): temporary; remove with the dev bridge. */
+.easy-sync-lan-session-body {
+  max-height: 70vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.easy-sync-lan-session-role-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.easy-sync-lan-session-status {
+  white-space: pre-wrap;
+  min-height: 2.5em;
+}
+
+.easy-sync-lan-session-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: monospace;
+  font-size: 11px;
+  resize: vertical;
+}
+
+.easy-sync-lan-session-hidden {
+  display: none;
+}
+
+.easy-sync-lan-session-manual {
+  margin-top: 12px;
+}
+
+.easy-sync-lan-session-manual > summary {
+  cursor: pointer;
+  color: var(--text-muted);
 }

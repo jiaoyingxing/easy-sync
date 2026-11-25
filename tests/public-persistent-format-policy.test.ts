@@ -1,7 +1,17 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import packageJson from "../package.json";
 import manifestJson from "../manifest.json";
+import {
+  LAN_PAIRING_PATH,
+  LAN_SIGNAL_ACTIVE_PATH,
+  LAN_SIGNAL_ROOT,
+  LAN_SIGNALING_FORMAT_VERSION,
+} from "../src/sync/lan-signaling";
+import {
+  LAN_PRESENCE_FORMAT_VERSION,
+  LAN_PRESENCE_REQUEST_PATH,
+} from "../src/sync/lan-presence";
 import {
   EASY_SYNC_LEGACY_STORAGE_LAYOUT_VERSION,
   EASY_SYNC_STORAGE_LAYOUT_VERSION,
@@ -50,9 +60,13 @@ interface PolicyFixture {
   };
   families: Array<{
     id: string;
+    class?: string;
     owner: string;
     currentVersion: unknown;
     acceptedOptionalSemantics?: Record<string, string[]>;
+    acceptedNestedVersions?: Record<string, number[]>;
+    members?: string[];
+    compatibility?: string;
   }>;
   profiles: Record<string, FormatProfile>;
   releases: Array<{
@@ -173,6 +187,73 @@ describe("public persistent-format compatibility policy", () => {
     expect(fixture.profiles["v2-with-generation-lineage"]).not.toEqual(
       fixture.profiles["v2-with-local-layout-v2"],
     );
+  });
+
+  // C0 registration: `lan-signaling-v1` is a brand-new family. No public
+  // release ever shipped it, so there is no predecessor format to migrate
+  // from; adding a migration would invent a compatibility promise that never
+  // existed. The gate pins the family to the owning module's own version and
+  // exact paths instead, and requires the no-migration rationale to stay.
+  it("registers the first-version LAN signaling family without inventing a migration", () => {
+    const fixture = readFixture();
+    const family = fixture.families.find(
+      (entry) => entry.id === "lan-signaling-v1",
+    );
+    expect(family).toBeDefined();
+    if (!family) return;
+
+    expect(family).toMatchObject({
+      class: "remote-ephemeral-signaling",
+      owner: "src/sync/lan-signaling.ts",
+      currentVersion: LAN_SIGNALING_FORMAT_VERSION,
+    });
+    expect(existsSync(family.owner)).toBe(true);
+    expect(family.members).toEqual(expect.arrayContaining([
+      LAN_PAIRING_PATH,
+      `${LAN_SIGNAL_ROOT}/`,
+      LAN_SIGNAL_ACTIVE_PATH,
+      `${LAN_SIGNAL_ROOT}/<sessionId>/offer.json`,
+      `${LAN_SIGNAL_ROOT}/<sessionId>/answer.json`,
+      `${LAN_SIGNAL_ROOT}/<sessionId>/host-candidates.json`,
+      `${LAN_SIGNAL_ROOT}/<sessionId>/joiner-candidates.json`,
+      `${LAN_SIGNAL_ROOT}/<sessionId>/closed.json`,
+    ]));
+    expect(family.acceptedNestedVersions).toBeUndefined();
+    expect(family.compatibility).toContain("no migration is warranted");
+    // No frozen public release can prove a family that never shipped.
+    expect(fixture.releases.some(
+      (release) => release.proves.includes("LAN"),
+    )).toBe(false);
+  });
+
+  // C0 registration for the S5a presence request: also a brand-new family with
+  // no shipped predecessor. It must stay separate from `lan-signaling-v1`
+  // (that family's members and version are frozen): a presence request is a
+  // different wire record with its own schema, HMAC domain and single path.
+  it("registers the LAN presence request as its own first-version family", () => {
+    const fixture = readFixture();
+    const family = fixture.families.find(
+      (entry) => entry.id === "lan-presence-v1",
+    );
+    expect(family).toBeDefined();
+    if (!family) return;
+
+    expect(family).toMatchObject({
+      class: "remote-ephemeral-signaling",
+      owner: "src/sync/lan-presence.ts",
+      currentVersion: LAN_PRESENCE_FORMAT_VERSION,
+      members: [LAN_PRESENCE_REQUEST_PATH],
+    });
+    expect(existsSync(family.owner)).toBe(true);
+    expect(family.acceptedNestedVersions).toBeUndefined();
+    expect(family.compatibility).toContain("no migration is warranted");
+    expect(family.compatibility).toContain("exact file");
+
+    const signaling = fixture.families.find(
+      (entry) => entry.id === "lan-signaling-v1",
+    );
+    expect(signaling?.members).not.toContain(LAN_PRESENCE_REQUEST_PATH);
+    expect(signaling?.currentVersion).toBe(LAN_SIGNALING_FORMAT_VERSION);
   });
 
   it("matches the current public release and current runtime version vector", () => {

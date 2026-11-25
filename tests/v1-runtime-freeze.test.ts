@@ -201,6 +201,11 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
     disposition: "public-read-only-import",
     literal: "easy-sync-mutation-ledger",
     expectedFiles: [
+      // F1 云端分账（2026-11-23 准入）：`src/cloud/cloud-book.ts` 是**键名清
+      // 单**——它只声明「哪些 `data.json` 键跟云端走」，不读不写账本内容、
+      // 不新增第二状态源，所以不构成 precommit writer 的扩张。清单与
+      // `state-manager.ts` 常量是否逐字一致由 `tests/cloud-book.test.ts` 兜住。
+      "src/cloud/cloud-book.ts",
       "src/sync/public-1-1-3-cutover.ts",
       "src/sync/state-manager.ts",
     ],
@@ -210,6 +215,7 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
     disposition: "v2-active-recovery",
     literal: "easy-sync-v2-mutation-ledger",
     expectedFiles: [
+      "src/cloud/cloud-book.ts",
       "src/sync/public-1-1-3-cutover.ts",
       "src/sync/state-manager.ts",
     ],

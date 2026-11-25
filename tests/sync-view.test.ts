@@ -27,6 +27,7 @@ import {
   isDecisionRowKey,
   resolveDecisionRowDefaultOpen,
   isPlanReviewRefreshedSinceShown,
+  isToolbarBulkToggleTarget,
   collectHistorySkipRows,
   partitionCompletedProgressRows,
   resolveCompletedActionCount,
@@ -39,7 +40,9 @@ import {
   resolveSyncViewStatusDetailMode,
   resolveSyncViewStatusDetailText,
   shouldExpandAllVisibleDetails,
+  shouldRevealHistoryOnRetry,
   shouldAutoRebuildPlanReview,
+  shouldRunSyncViewLiveTicker,
   sharedFolderIdentityConfirmLines,
   SYNC_PLAN_VIRTUAL_OVERSCAN,
   syncViewProgressPercent,
@@ -49,6 +52,7 @@ import { I18n } from "../src/i18n";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
 import { SyncActionType } from "../src/sync/types";
+import type { SyncProgressState } from "../src/sync/sync-progress";
 import type { SyncPlanItem } from "../src/sync/types";
 import { ConfirmModal } from "../src/ui/confirm-modal";
 import { formatFileSize } from "../src/ui/file-comparison-modal";
@@ -59,6 +63,7 @@ interface FakeHistoryElement {
   className: string;
   text: string;
   open: boolean;
+  dataset: Record<string, string>;
   children: FakeHistoryElement[];
   createDiv(className?: string): FakeHistoryElement;
   createSpan(className?: string): FakeHistoryElement;
@@ -78,6 +83,7 @@ function createFakeHistoryElement(
     className,
     text: "",
     open: false,
+    dataset: {},
     children: [],
     createDiv(childClass = "") {
       const child = createFakeHistoryElement("div", childClass);
@@ -265,6 +271,21 @@ describe("syncViewProgressPercent", () => {
       currentFile: "large.bin",
       currentItemBytes: 50,
       currentItemTotalBytes: 100,
+      currentItemComplete: false,
+      cancelRequested: false,
+      completedFiles: [],
+      completedCount: 0,
+      startedAt: 1,
+    })).toBe(25);
+    // The download lookahead drives the same bar before settlement.
+    expect(syncViewProgressPercent({
+      phase: "executing",
+      current: 0,
+      processedCurrent: 3,
+      total: 12,
+      currentFile: "large.bin",
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
       currentItemComplete: false,
       cancelRequested: false,
       completedFiles: [],
@@ -552,6 +573,104 @@ describe("shared sidebar detail controls", () => {
     expect(shouldExpandAllVisibleDetails([false, false])).toBe(true);
   });
 
+  it("keeps the result skip fold out of the toolbar bulk expand/collapse", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    const detailsEl = (className: string, open: boolean) => {
+      const element = {
+        className,
+        open,
+        dataset: {} as Record<string, string>,
+        classList: {
+          contains: (token: string) => className.split(/\s+/).includes(token),
+        },
+        setAttribute: (_name: string): void => {
+          element.open = true;
+        },
+        removeAttribute: (_name: string): void => {
+          element.open = false;
+        },
+      };
+      return element;
+    };
+    const run = detailsEl("easy-sync-history-run easy-sync-tree-item", false);
+    const decision = detailsEl("easy-sync-tree-item", false);
+    const skip = detailsEl("easy-sync-history-skip-group easy-sync-tree-item", false);
+    Object.assign(view as object, {
+      contentEl: { querySelectorAll: () => [run, decision, skip] },
+      sessionOverride: "expanded",
+      planGroupExpandedState: new Map(),
+      planRowHeights: new Map(),
+      planRowLayoutRevision: 0,
+      renderedBodyMode: "idle",
+      schedulePlanViewportRender: vi.fn(),
+    });
+    const toggleAll = (view as unknown as {
+      toggleAllDetails(): void;
+    }).toggleAllDetails.bind(view);
+    const shouldExpandAll = (view as unknown as {
+      shouldExpandAllDetails(): boolean;
+    }).shouldExpandAllDetails.bind(view);
+
+    // 批量展开：决策面服从会话覆盖，结果折叠组保持自己的开合状态。
+    toggleAll();
+    expect(run.open).toBe(true);
+    expect(decision.open).toBe(true);
+    expect(skip.open).toBe(false);
+    // 按钮判定也忽略该组：决策面已全开，下一步是「全部折叠」。
+    expect(shouldExpandAll()).toBe(false);
+
+    // 批量折叠：用户手动展开过的结果折叠组不被顺手收起。
+    Object.assign(view as object, { sessionOverride: "collapsed" });
+    skip.open = true;
+    toggleAll();
+    expect(run.open).toBe(false);
+    expect(decision.open).toBe(false);
+    expect(skip.open).toBe(true);
+    expect(shouldExpandAll()).toBe(true);
+
+    // 直接判定口径：只有结果折叠组被排除。
+    expect(isToolbarBulkToggleTarget(skip)).toBe(false);
+    expect(isToolbarBulkToggleTarget(decision)).toBe(true);
+    expect(isToolbarBulkToggleTarget({
+      classList: { contains: () => false },
+    })).toBe(true);
+  });
+
+  it("mounts the round's folder exclusions as a user-owned history fold", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const historyBody = functionBody(
+      source,
+      "  private renderHistoryEntryBody(",
+    );
+    // 历史正文从当轮快照取文件夹路径；空快照不建折叠组。
+    expect(historyBody).toContain("collectHistoryExcludedFolders(entry)");
+    expect(historyBody).toContain("this.createFolderExclusionFold(");
+    expect(historyBody).toContain(
+      't("syncView.history.folderExclusionOmitted"',
+    );
+
+    const fold = functionBody(
+      source,
+      "  private createFolderExclusionFold(",
+    );
+    // 与「大型文件排除」共用折叠壳：默认收起、且被工具栏批量手势排除。
+    expect(fold).toContain("easy-sync-history-skip-group");
+    expect(fold).toContain('t("syncView.folderExclusion.title"');
+    expect(fold).toContain(
+      'this.appendFoldPathRow(list, folder, "folder", false)',
+    );
+
+    // 写入侧：正常同步轮保存当轮生效的文件夹排除快照。
+    const main = readSourceFile("src/main.ts");
+    expect(main).toContain("excludedFolders: [...this.excludedFolders]");
+    const state = readSourceFile("src/sync/state-manager.ts");
+    expect(state).toContain("excludedFolders?: string[]");
+    expect(state).toContain("excludedFoldersTotal?: number");
+    expect(state).toContain(
+      "normalizeHistoryExcludedFolders(rawExcludedFolders)",
+    );
+  });
+
   it("uses one human-readable file-size contract across comparison modals", () => {
     expect(formatFileSize(0)).toBe("0 B");
     expect(formatFileSize(1024)).toBe("1.0 KB");
@@ -647,6 +766,9 @@ describe("shared sidebar detail controls", () => {
       // 运行中列表与历史条目共用的「按设置跳过」折叠件（2026-10-25 拍板）：
       // 站点随共享化移到 createSkipFold，类别与默认态不变。
       "createSkipFold|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
+      // 同步历史的「文件夹排除」折叠组（2026-11-17）：与结果折叠组同壳，
+      // 默认收起、只由用户自己开合。
+      "createFolderExclusionFold|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
       // 更新提示行 2026-10-28 起按决策行族默认展开（出口只在折叠里）。
       "renderUpdateAvailableItem|easy-sync-tree-item": "decision",
       "measurePlanDecisionRowHeights|easy-sync-tree-item easy-sync-plan-decision-probe": "probe",
@@ -931,6 +1053,20 @@ describe("sync view status copy and scrolling layout", () => {
       .toBe("Multiple files have the same content. Choose whether to keep the original cloud location.");
   });
 
+  it("keeps the history folder-exclusion copy parallel to the size fold", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("syncView.folderExclusion.title", { count: 2 }))
+      .toBe("文件夹排除 2 个");
+    expect(en.t("syncView.folderExclusion.title", { count: 2 }))
+      .toBe("2 excluded folder(s)");
+    expect(zh.t("syncView.history.folderExclusionOmitted", { count: 3 }))
+      .toBe("另有 3 个排除文件夹未保留路径。");
+    expect(en.t("syncView.history.folderExclusionOmitted", { count: 3 }))
+      .toBe("Paths for 3 additional excluded folder(s) were not retained.");
+  });
+
   it("keeps verification copy and the adjacent item count non-duplicative", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
@@ -1066,6 +1202,99 @@ describe("sync view status copy and scrolling layout", () => {
     expect(styles).toContain(
       "body.is-mobile .easy-sync-transfer-rate.is-mobile-footer.is-hidden {\n  display: none;\n}",
     );
+  });
+
+  it("prefers an active LAN session on the same chip slot", () => {
+    // 局域网会话与云读数共用同一载体：图标位显示会话阶段，字节位复用现役
+    // 速率文案；会话结束即回云读数。不新增文案、不新增显示面。
+    const makeContainer = () => {
+      type Span = {
+        className: string;
+        textContent: string;
+        setText(value: string): Span;
+      };
+      type Child = {
+        className: string;
+        children: Span[];
+        createSpan(spanClass?: string): Span;
+        addClass(cls: string): Child;
+        removeClass(cls: string): Child;
+        setText(value: string): Child;
+      };
+      const children: Child[] = [];
+      const container = {
+        children,
+        createDiv(className = ""): Child {
+          const child: Child = {
+            className,
+            children: [],
+            createSpan(spanClass = ""): Span {
+              const span: Span = {
+                className: spanClass,
+                textContent: "",
+                setText(value: string) {
+                  this.textContent = value;
+                  return this;
+                },
+              };
+              child.children.push(span);
+              return span;
+            },
+            addClass() {
+              return child;
+            },
+            removeClass() {
+              return child;
+            },
+            setText() {
+              return child;
+            },
+          };
+          children.push(child);
+          return child;
+        },
+      };
+      return container;
+    };
+    const render = (
+      lan: { phase: string; kbps: number | null } | null,
+      cloud: { level: string; kbps: number | null } | null,
+    ) => {
+      const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+      Object.assign(view as object, {
+        platformFacts: { isMobile: false },
+        plugin: {
+          i18n: new I18n("zh-cn"),
+          getLanTransferIndicator: () => lan,
+          getTransferRateReading: () => cloud,
+        },
+      });
+      const container = makeContainer();
+      (view as unknown as {
+        renderTransferRateFooter: (target: unknown) => void;
+      }).renderTransferRateFooter(container);
+      return container;
+    };
+    const iconOf = (container: ReturnType<typeof makeContainer>) =>
+      container.children[0].children[0].className;
+
+    // A LAN session without a quotable rate keeps the icon and leaves the value
+    // slot empty — the same "no invented number" rule as the cloud reading.
+    const pairing = render({ phase: "pairing", kbps: null }, null);
+    expect(pairing.children).toHaveLength(1);
+    expect(pairing.children[0].children).toHaveLength(1);
+    const transferring = render({ phase: "transferring", kbps: 512 }, null);
+    expect(transferring.children[0].children).toHaveLength(2);
+    // LAN wins over a simultaneous cloud reading: one chip, not two.
+    const both = render({ phase: "connected", kbps: null }, { level: "medium", kbps: 512 });
+    expect(both.children).toHaveLength(1);
+    // Session gone: the pre-existing cloud behaviour is untouched.
+    const cloudOnly = render(null, { level: "medium", kbps: 512 });
+    expect(cloudOnly.children).toHaveLength(1);
+    expect(render(null, null).children).toHaveLength(0);
+    // Icon ids themselves are pinned by tests/lan-transfer-activity.test.ts;
+    // here only the shared slot is asserted.
+    expect(iconOf(pairing)).toBe("easy-sync-transfer-rate-icon");
   });
 
   it("shows the user-checkable facts before the same-folder question", () => {
@@ -1388,6 +1617,42 @@ describe("buildSyncViewContentKey", () => {
 
     expect(empty).not.toBe(withEntry);
     expect(withEntry).toContain("run-1");
+  });
+
+  it("tracks the round's folder-exclusion snapshot", () => {
+    const entry = {
+      id: "run-folders",
+      mode: "manual" as const,
+      status: "success" as const,
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 0,
+      files: [],
+    };
+    const withoutFolders = buildSyncViewContentKey(true, {
+      ...baseInput,
+      history: [entry],
+    });
+    const withFolders = buildSyncViewContentKey(true, {
+      ...baseInput,
+      history: [{ ...entry, excludedFolders: ["Archive/", "Media"] }],
+    });
+    const addedFolder = buildSyncViewContentKey(true, {
+      ...baseInput,
+      history: [{
+        ...entry,
+        excludedFolders: ["Archive/", "Media", "Scans"],
+      }],
+    });
+
+    expect(withoutFolders).not.toBe(withFolders);
+    expect(withFolders).not.toBe(addedFolder);
+    expect(withFolders).toContain("Archive/|Media");
   });
 
   it("refreshes expanded history when a persisted run message changes", () => {
@@ -2646,6 +2911,455 @@ describe("buildSyncViewContentKey", () => {
     }
   });
 
+  it("shows 0/N and raises it with the download lookahead before settlement", () => {
+    const makeEl = () => {
+      const el = {
+        textContent: "",
+        removed: false,
+        setText(next: string) {
+          this.textContent = next;
+          return this;
+        },
+        setAttribute() {
+          return this;
+        },
+        removeAttribute() {
+          return this;
+        },
+        remove() {
+          this.removed = true;
+          return this;
+        },
+      };
+      return el;
+    };
+    const makeProgress = (
+      current: number,
+      processedCurrent?: number,
+    ): SyncProgressState => ({
+      phase: "executing",
+      current,
+      ...(processedCurrent !== undefined ? { processedCurrent } : {}),
+      total: 5,
+      currentFile: "notes/a.md",
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
+      currentItemComplete: false,
+      cancelRequested: false,
+      completedFiles: [],
+      completedCount: 0,
+      startedAt: 1_000,
+    });
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    const counter = makeEl();
+    Object.assign(view as object, {
+      statusCounterEl: counter,
+      plugin: { i18n: new I18n("zh-cn") },
+    });
+    const updateCounter = (
+      view as unknown as {
+        updateProgressCounter: (input: {
+          isRunning: boolean;
+          progress: Readonly<SyncProgressState>;
+          mutationRecovery: null;
+          now: number;
+        }) => void;
+      }
+    ).updateProgressCounter.bind(view);
+
+    // 0/N is the correct opening reading; it must not be blanked.
+    updateCounter({
+      isRunning: true,
+      progress: makeProgress(0),
+      mutationRecovery: null,
+      now: 1_000,
+    });
+    expect(counter.textContent).toBe("0/5项");
+
+    // The download lookahead raises the same counter before settlement.
+    updateCounter({
+      isRunning: true,
+      progress: makeProgress(0, 2),
+      mutationRecovery: null,
+      now: 1_000,
+    });
+    expect(counter.textContent).toBe("2/5项");
+
+    // Settled items take over when they pass the lookahead; the lookahead
+    // never lowers the number.
+    updateCounter({
+      isRunning: true,
+      progress: makeProgress(3, 2),
+      mutationRecovery: null,
+      now: 1_000,
+    });
+    expect(counter.textContent).toBe("3/5项");
+  });
+
+  it("patches a pre-execution phase count without rebuilding the body", () => {
+    const makeEl = () => {
+      const el = {
+        textContent: "",
+        children: [] as unknown[],
+        removed: false,
+        setText(next: string) {
+          this.textContent = next;
+          return this;
+        },
+        setAttribute() {
+          return this;
+        },
+        removeAttribute() {
+          return this;
+        },
+        addClass() {
+          return this;
+        },
+        removeClass() {
+          return this;
+        },
+        empty() {
+          this.children = [];
+          return this;
+        },
+        createSpan() {
+          const child = makeEl();
+          this.children.push(child);
+          return child;
+        },
+        remove() {
+          this.removed = true;
+          return this;
+        },
+      };
+      return el;
+    };
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+      patchProgressOnly: () => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender")
+      .mockImplementation(() => undefined);
+    const statusText = makeEl();
+    const counter = makeEl();
+    const statusDetail = makeEl();
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      lastContentKey: "progress:key",
+      renderedBodyMode: "progress",
+      progressPanelEl: null,
+      contentEl: { querySelector: () => null } as unknown as HTMLElement,
+      statusLineEl: makeEl(),
+      statusTextEl: statusText,
+      statusCounterEl: counter,
+      statusDetailEl: statusDetail,
+      statusDetailMode: "current-file",
+      currentFileTextEl: makeEl(),
+      progressFillEl: makeEl(),
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        progressStore: {
+          state: {
+            phase: "planningRecords",
+            current: 0,
+            total: 0,
+            currentFile: "",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: [],
+            completedCount: 0,
+            startedAt: Date.now() - 2_000,
+            phaseStartedAt: Date.now() - 2_000,
+            phaseMetric: { current: 3, total: 10, unit: "batches" },
+          },
+        },
+        syncExecutor: {
+          isRunning: true,
+          hasSideActionsInFlight: false,
+        },
+        syncDirection: "two-way",
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+
+    try {
+      (view as unknown as { patchProgressOnly: () => void }).patchProgressOnly();
+
+      expect(doRender).not.toHaveBeenCalled();
+      expect(statusText.textContent).toBe(
+        new I18n("zh-cn").t("progress.preparingRecords").replace("…", ""),
+      );
+      expect(counter.textContent).toBe("3/10批");
+      // 补充事实行不承接阶段计数：本轮路径没有往里写任何内容。
+      expect((statusDetail as unknown as { children: unknown[] }).children)
+        .toHaveLength(0);
+    } finally {
+      doRender.mockRestore();
+    }
+  });
+
+  it("keeps a young silent pre-execution phase on the generic line without a full rebuild", () => {
+    const makeEl = () => {
+      const el = {
+        textContent: "",
+        children: [] as unknown[],
+        removed: false,
+        setText(next: string) {
+          this.textContent = next;
+          return this;
+        },
+        setAttribute() {
+          return this;
+        },
+        removeAttribute() {
+          return this;
+        },
+        addClass() {
+          return this;
+        },
+        removeClass() {
+          return this;
+        },
+        empty() {
+          this.children = [];
+          return this;
+        },
+        createSpan() {
+          const child = makeEl();
+          this.children.push(child);
+          return child;
+        },
+        remove() {
+          this.removed = true;
+          return this;
+        },
+      };
+      return el;
+    };
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+      patchProgressOnly: () => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender")
+      .mockImplementation(() => undefined);
+    const statusText = makeEl("加载云端基线…");
+    const counter = makeEl("3/10批");
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      lastContentKey: "progress:key",
+      renderedBodyMode: "progress",
+      progressPanelEl: null,
+      contentEl: { querySelector: () => null } as unknown as HTMLElement,
+      statusLineEl: makeEl(),
+      statusTextEl: statusText,
+      statusCounterEl: counter,
+      statusDetailEl: makeEl(),
+      statusDetailMode: "current-file",
+      currentFileTextEl: makeEl(),
+      progressFillEl: makeEl(),
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        progressStore: {
+          state: {
+            phase: "baseline",
+            current: 0,
+            total: 0,
+            currentFile: "",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: [],
+            completedCount: 0,
+            startedAt: Date.now(),
+            phaseStartedAt: Date.now(),
+          },
+        },
+        syncExecutor: {
+          isRunning: true,
+          hasSideActionsInFlight: false,
+        },
+        syncDirection: "two-way",
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+
+    try {
+      (view as unknown as { patchProgressOnly: () => void }).patchProgressOnly();
+
+      expect(doRender).not.toHaveBeenCalled();
+      expect(statusText.textContent).toBe(
+        new I18n("zh-cn").t("syncView.progress"),
+      );
+      expect(counter.removed).toBe(true);
+      const timer = (view as unknown as { statusRevealTimer: number | null })
+        .statusRevealTimer;
+      expect(timer).not.toBeNull();
+      if (timer !== null) window.clearTimeout(timer);
+    } finally {
+      doRender.mockRestore();
+    }
+  });
+
+  it("reveals a young stage and its count on the running tick", () => {
+    const makeEl = () => {
+      const el = {
+        textContent: "",
+        children: [] as unknown[],
+        removed: false,
+        setText(next: string) {
+          this.textContent = next;
+          return this;
+        },
+        setAttribute() {
+          return this;
+        },
+        removeAttribute() {
+          return this;
+        },
+        addClass() {
+          return this;
+        },
+        removeClass() {
+          return this;
+        },
+        empty() {
+          this.children = [];
+          return this;
+        },
+        createSpan() {
+          const child = makeEl();
+          this.children.push(child);
+          return child;
+        },
+        remove() {
+          this.removed = true;
+          return this;
+        },
+      };
+      return el;
+    };
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+      refreshRunningPresentation: (now?: number) => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender")
+      .mockImplementation(() => undefined);
+    const statusText = makeEl("同步进行中…");
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      lastContentKey: "progress:key",
+      renderedBodyMode: "progress",
+      progressPanelEl: null,
+      contentEl: { querySelector: () => null } as unknown as HTMLElement,
+      statusLineEl: makeEl(),
+      statusTextEl: statusText,
+      statusCounterEl: null,
+      statusDetailEl: makeEl(),
+      statusDetailMode: "current-file",
+      currentFileTextEl: makeEl(),
+      progressFillEl: makeEl(),
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        progressStore: {
+          state: {
+            phase: "planningRecords",
+            current: 0,
+            total: 0,
+            currentFile: "",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: [],
+            completedCount: 0,
+            startedAt: Date.now() - 400,
+            phaseStartedAt: Date.now() - 400,
+            phaseMetric: { current: 3, total: 10, unit: "batches" },
+          },
+        },
+        syncExecutor: {
+          isRunning: true,
+          hasSideActionsInFlight: false,
+        },
+        syncDirection: "two-way",
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+
+    try {
+      (view as unknown as { refreshRunningPresentation: (now?: number) => void })
+        .refreshRunningPresentation(Date.now());
+
+      expect(doRender).not.toHaveBeenCalled();
+      expect(statusText.textContent).toBe(
+        new I18n("zh-cn").t("progress.preparingRecords").replace("…", ""),
+      );
+      const counter = (view as unknown as {
+        statusCounterEl: { textContent: string } | null;
+      }).statusCounterEl;
+      expect(counter?.textContent).toBe("3/10批");
+    } finally {
+      doRender.mockRestore();
+    }
+  });
+
+  it("keeps the last stable stage label through a short next stage", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      plugin: { i18n: new I18n("zh-cn") },
+    });
+    const now = Date.now();
+    const read = (state: Partial<SyncProgressState>) => (
+      view as unknown as {
+        runningStatusLabel: (progress: SyncProgressState, now?: number) => string;
+      }
+    ).runningStatusLabel(state as SyncProgressState, now);
+    expect(read({
+      phase: "scanning",
+      startedAt: now,
+      phaseStartedAt: now - 400,
+      phaseMetric: { current: 12, total: 40, unit: "items" },
+    })).toBe("扫描本机文件");
+    expect(read({
+      phase: "checking",
+      startedAt: now,
+      phaseStartedAt: now,
+      phaseMetric: { current: 2, unit: "items" },
+    })).toBe("扫描本机文件");
+    expect(read({
+      phase: "checking",
+      startedAt: now,
+      phaseStartedAt: now - 1_100,
+      phaseMetric: { current: 2, unit: "items" },
+    })).toBe("检查云端变更");
+    // The executor may finish while the operation lock still paints a syncing
+    // frame; keep the last stage instead of flashing the generic phrase.
+    expect(read({
+      phase: "done",
+      startedAt: now,
+    })).toBe("检查云端变更");
+  });
+
+  it("keeps the cancelling phrase in the light status patch", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      plugin: { i18n: new I18n("zh-cn") },
+    });
+    const label = (view as unknown as {
+      runningStatusLabel: (progress: SyncProgressState, now?: number) => string;
+    }).runningStatusLabel({
+      phase: "executing",
+      cancelRequested: true,
+    } as unknown as SyncProgressState, 1_000);
+    expect(label).toBe("正在取消…");
+  });
+
   it("falls back to the full render when the round is no longer running", () => {
     const prototype = EasySyncSyncView.prototype as unknown as {
       doRender: () => void;
@@ -2877,7 +3591,11 @@ describe("buildSyncViewContentKey", () => {
       dispatch.indexOf('if (bodyMode === "plan"'),
     );
     expect(dispatch).toContain("easy-sync-progress-bar");
-    expect(dispatch).toContain("remoteScopeRecoveryPercent(progress)");
+    // 裸条与进度面板共用同一个宽度写入（百分比公式只写一份）；云端核验
+    // 读数那条分支在该入口里，所以这里断言入口调用而不是内联公式。
+    expect(dispatch).toContain("this.updateProgressBarWidth(progress)");
+    expect(functionBody(source, "private updateProgressBarWidth("))
+      .toContain("remoteScopeRecoveryPercent(progress)");
     // The progress body keeps painting its own bar; the patch branch keeps
     // updating whichever bar the current body mounted (2026-10-26: the width
     // write is one shared helper so the light progress path and the full patch
@@ -3015,7 +3733,9 @@ describe("buildSyncViewContentKey", () => {
     expect(source).toContain(
       '"easy-sync-file-list easy-sync-path-layout"',
     );
-    expect(source).toContain("configureFilePath(row, pathEl, file.path, true)");
+    // 结果折叠组与文件夹排除组共用路径行：行级自适应入口不变。
+    expect(source).toContain("configureFilePath(row, pathEl, path, true)");
+    expect(source).toContain("this.appendFoldPathRow(");
   });
 
   it("keeps every static sidebar file list on the adaptive gray-directory path", () => {
@@ -3495,6 +4215,8 @@ describe("buildSyncViewContentKey", () => {
       // 懒建正文后的路径摘取在真实视图里读 contentEl；这里只验证调用，
       // 不需要真实 DOM。
       applyAdaptivePathLayout: vi.fn(),
+      historyRevealEntryId: null,
+      historyRevealCollapsedIds: new Set<string>(),
     });
 
     (view as unknown as {
@@ -3572,6 +4294,8 @@ describe("buildSyncViewContentKey", () => {
       addCollapseIcon: vi.fn(),
       renderFileResults: vi.fn(),
       applyAdaptivePathLayout: vi.fn(),
+      historyRevealEntryId: null,
+      historyRevealCollapsedIds: new Set<string>(),
     });
 
     (view as unknown as {
@@ -3600,6 +4324,48 @@ describe("buildSyncViewContentKey", () => {
     for (const handler of legacyDetails.listeners.toggle ?? []) handler();
 
     expect(collectFakeHistoryText(root)).not.toContain("本轮没有文件变更。");
+  });
+
+  it("renders the round timestamp with the Chinese six-period clock", () => {
+    const root = createFakeHistoryElement();
+    const section = createFakeHistoryElement("section");
+    root.children.push(section);
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      plugin: { i18n: new I18n("zh-cn") },
+      createSection: vi.fn(() => section),
+      addCollapseIcon: vi.fn(),
+      renderFileResults: vi.fn(),
+      applyAdaptivePathLayout: vi.fn(),
+      historyRevealEntryId: null,
+      historyRevealCollapsedIds: new Set<string>(),
+    });
+
+    (view as unknown as {
+      renderHistorySection(
+        container: HTMLElement,
+        history: Array<Record<string, unknown>>,
+      ): void;
+    }).renderHistorySection(root as unknown as HTMLElement, [{
+      id: "late-evening",
+      mode: "manual",
+      status: "success",
+      startedAt: new Date(2026, 10, 23, 23, 29).getTime(),
+      endedAt: new Date(2026, 10, 23, 23, 30).getTime(),
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      skipped: 0,
+      errors: 0,
+      message: "同步完成",
+      files: [],
+    }]);
+
+    const text = collectFakeHistoryText(root);
+    expect(text).toContain("11/23 晚上11:30");
+    expect(text.join("\n")).not.toContain("下午11:30");
   });
 
   it("does not report a failed run as omitted successful file details", () => {
@@ -4234,7 +5000,11 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).toContain('"syncView.conflict.keepLocal"');
     expect(modalSource).toContain('"syncView.conflict.keepRemote"');
     expect(modalSource).toContain('"syncView.pluginBundleReview.identityMismatchNotice"');
-    expect(modalSource).toContain('reason === "identity-mismatch"');
+    // Identity drift (2026-11-23) is detected from the two declared manifest
+    // identities, not from a shared "both sides unavailable" reason: both
+    // buttons stay enabled and the notice names which plugin is on each side.
+    expect(modalSource).toContain("localIdentity.id !== remoteIdentity.id");
+    expect(modalSource).toContain('"syncView.pluginBundleReview.identityWithName"');
     expect(viewSource).not.toContain("CommunityPluginBundleReviewModal");
 
     const zh = new I18n("zh-cn");
@@ -4994,6 +5764,183 @@ describe("remote scope recovery failure presentation", () => {
   });
 });
 
+describe("progress bar empty-window seams (2026-11-21 现场：空窗期三条横线)", () => {
+  /** 只提供这条判定真正读到的表面：style.width / parentElement /
+   *  toggleClass（后者用来反向证明 0% 不再给轨道加任何类）。 */
+  interface FakePanel {
+    className: string;
+    children: FakePanel[];
+    parentElement: FakePanel | null;
+    style: { width: string };
+    readonly classList: { contains(name: string): boolean };
+    toggleClass(name: string, on: boolean): FakePanel;
+  }
+
+  const makePanel = (className = ""): FakePanel => {
+    const panel: FakePanel = {
+      className,
+      children: [],
+      parentElement: null,
+      style: { width: "" },
+      get classList() {
+        return {
+          contains: (name: string) =>
+            panel.className.split(/\s+/).filter(Boolean).includes(name),
+        };
+      },
+      toggleClass(name: string, on: boolean) {
+        const tokens = new Set(panel.className.split(/\s+/).filter(Boolean));
+        if (on) tokens.add(name);
+        else tokens.delete(name);
+        panel.className = [...tokens].join(" ");
+        return panel;
+      },
+    };
+    return panel;
+  };
+
+  const append = (parent: FakePanel, child: FakePanel): FakePanel => {
+    child.parentElement = parent;
+    parent.children.push(child);
+    return child;
+  };
+
+  const paintPercent = (
+    bar: FakePanel,
+    percent: number,
+    fill = append(bar, makePanel("easy-sync-progress-fill")),
+  ): FakePanel => {
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, { progressFillEl: fill });
+    (
+      view as unknown as { updateProgressBarWidth(state: unknown): void }
+    ).updateProgressBarWidth({
+      phase: "executing",
+      current: percent,
+      total: 100,
+      currentFile: "",
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
+      currentItemComplete: false,
+      cancelRequested: false,
+      completedFiles: [],
+      completedCount: 0,
+      startedAt: 0,
+    });
+    return fill;
+  };
+
+  it("keeps the track visible at 0% instead of hiding it", () => {
+    // 2026-11-22 用户澄清：这是显隐问题，不是颜色深浅问题。空窗期位置
+    // 占着却没有条，读成「该有东西却没画」。所以 0% 不给轨道加任何类，
+    // 它照旧是一根空心的灰条。
+    const bar = makePanel("easy-sync-progress-bar");
+    paintPercent(bar, 0);
+    expect(bar.className).toBe("easy-sync-progress-bar");
+  });
+
+  it("keeps the track visible at every percentage", () => {
+    const bar = makePanel("easy-sync-progress-bar");
+    paintPercent(bar, 0);
+    expect(bar.className).toBe("easy-sync-progress-bar");
+    paintPercent(bar, 1);
+    expect(bar.className).toBe("easy-sync-progress-bar");
+    paintPercent(bar, 100);
+    expect(bar.className).toBe("easy-sync-progress-bar");
+  });
+
+  it("never dims or hides the track through CSS", () => {
+    // 反向守卫：这条样式一旦回来，空窗期又会变出一段没有条的空白。
+    const styles = readSourceFile("styles.css");
+    expect(styles).not.toMatch(/\.easy-sync-progress-bar\.is-empty/);
+    // 轨道底色保持主题分隔色，不另调深浅。
+    expect(styles).toMatch(
+      /\.easy-sync-progress-bar\s*\{[^}]*background:\s*var\(--background-modifier-border\);/s,
+    );
+  });
+
+  it("still writes the width so 0% is a real 0%, not a missing bar", () => {
+    // 条在、宽度是实打实的 0%：第一个文件一结算就从 0 开始长。
+    const bar = makePanel("easy-sync-progress-bar");
+    const fill = paintPercent(bar, 0);
+    expect(fill.style.width).toBe("0%");
+    expect(bar.children).toHaveLength(1);
+    // 复用同一个 fill：宽度必须能被后续 tick 改写，而不是只写一次。
+    (
+      Object.create(EasySyncSyncView.prototype) as unknown as {
+        updateProgressBarWidth(state: unknown): void;
+      }
+    ).updateProgressBarWidth.call(
+      Object.assign(Object.create(EasySyncSyncView.prototype), {
+        progressFillEl: fill,
+      }),
+      {
+        phase: "executing",
+        current: 25,
+        total: 100,
+        currentFile: "",
+        currentItemBytes: 0,
+        currentItemTotalBytes: 0,
+        currentItemComplete: false,
+        cancelRequested: false,
+        completedFiles: [],
+        completedCount: 0,
+        startedAt: 0,
+      },
+    );
+    expect(fill.style.width).toBe("25%");
+  });
+
+  it("routes every bar mount and tick through the one width writer", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    // 三个写宽度的地方（两个挂载点 + 轻量 tick）共用同一个入口，
+    // 百分比公式只写一份。
+    expect(source.match(/progressFillEl\.style\.width/g)).toHaveLength(1);
+    expect(functionBody(source, "private updateProgressBarWidth("))
+      .toContain("progressFillEl.style.width");
+    const rebuild = functionBody(source, "private renderSyncViewFullRebuild(args: {");
+    expect(rebuild).toContain("this.updateProgressBarWidth(progress)");
+    const panel = functionBody(source, "private renderProgressPanel(");
+    expect(panel).toContain("this.updateProgressBarWidth(state)");
+    // 0% 不再有任何「改轨道形态」的分支（`is-empty` 这个类名仍服务顶部
+    // 状态详情行，与进度条无关，所以要按「进度条上的 is-empty」断言）。
+    expect(source).not.toContain("applyProgressBarPercent");
+    expect(source).not.toMatch(/progressBar\w*\.toggleClass\(\s*"is-empty"/);
+    expect(source).not.toContain("toggleClass(\"is-empty\", value");
+  });
+
+  it("keeps the panel seam instead of hiding it in the empty window", () => {
+    const styles = readSourceFile("styles.css");
+    const source = readSourceFile("src/ui/sync-view.ts");
+    // 2026-11-23 用户实测回退：让线一消失，面板上方 8px 内衬就没有上边界，
+    // 读成一段凭空多出的顶部空白；首个条目结算时线又回来，整块跳一次。
+    // 空窗期的「双线夹进度条」暂时接受，这条让线规则不得回来。
+    expect(styles).not.toMatch(/\.easy-sync-progress-panel:has\(/);
+    expect(styles).not.toMatch(/\.easy-sync-progress-panel\.is-seamless/);
+    // JS 侧同样不保留镜像：这条判定曾经做成方法，随后又删掉，别再回来。
+    expect(source).not.toContain("is-seamless");
+    expect(source).not.toContain("syncProgressPanelSeamClass");
+    // 面板与其它段落共用的那条分隔线不能被顺手改掉：它现在是唯一的边界。
+    expect(styles).toMatch(
+      /\.easy-sync-section,\s*\.easy-sync-progress-panel\s*\{[^}]*border-top:\s*1px solid var\(--background-modifier-border\);/s,
+    );
+  });
+
+  it("keeps the mobile drawer last-child inset off the view content", () => {
+    const styles = readSourceFile("styles.css");
+    // 2026-11-23 安卓真机：Obsidian 移动端抽屉给 `nav-header` 之后最后一个
+    // div 加 8px 上内衬（`.nav-header ~ div:last-child`）。速度胶囊没有读数
+    // 时不渲染，正文成为该 div；不按同一组宿主条件把上内衬归零，状态区与
+    // 进度面板之间就会出现 8px 空白。选择器必须压过宿主那条规则。
+    const start = styles.indexOf("body.is-mobile.is-floating-nav.is-phone");
+    expect(start).toBeGreaterThan(-1);
+    const drawerRule = styles.slice(start, start + 600);
+    expect(drawerRule).toMatch(
+      /\.view-content\.easy-sync-view[\s\S]*?\.easy-sync-view-content\s*\{[^}]*padding-top:\s*0;/,
+    );
+  });
+});
+
 describe("sync view attention presentation", () => {
   it("keeps pending sign-in and recovery checking concise in the fixed top status", () => {
     const view = Object.create(EasySyncSyncView.prototype) as {
@@ -5313,6 +6260,7 @@ describe("resolveSyncViewPrimaryAction (finding ⑧, C9 P1)", () => {
     isLoggedIn: true,
     isRunning: false,
     canCancel: false,
+    cancelling: false,
     planReviewActive: false,
     planReviewDetailsState: "ready" as const,
     reviewKind: null,
@@ -5355,6 +6303,29 @@ describe("resolveSyncViewPrimaryAction (finding ⑧, C9 P1)", () => {
     });
   });
 
+  it("keeps the recovery review reachable while a plan review is active", () => {
+    // A blocked recovery record is the reason the reviewed plan cannot
+    // execute; its existing manual-review entry must stay reachable instead
+    // of being hidden behind the plan confirm button.
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      planReviewActive: true,
+      recoveryActionKey: "syncView.recovery.reviewDetails",
+    })).toEqual({
+      kind: "recovery",
+      actionKey: "syncView.recovery.reviewDetails",
+    });
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      planReviewActive: true,
+      planReviewDetailsState: "retry",
+      recoveryActionKey: "syncView.recovery.reviewDetails",
+    })).toEqual({
+      kind: "recovery",
+      actionKey: "syncView.recovery.reviewDetails",
+    });
+  });
+
   it("shows the plan-review confirm button while a reviewed plan is ready", () => {
     expect(resolveSyncViewPrimaryAction({
       ...baseInput,
@@ -5379,6 +6350,15 @@ describe("resolveSyncViewPrimaryAction (finding ⑧, C9 P1)", () => {
       isRunning: true,
       canCancel: true,
     })).toEqual({ kind: "cancel" });
+  });
+
+  it("disables the primary action while a cancellation is draining", () => {
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      isRunning: true,
+      canCancel: true,
+      cancelling: true,
+    })).toEqual({ kind: "processing" });
   });
 
   it("shows the pending browser-confirm action for a logged-out pending login", () => {
@@ -5613,8 +6593,12 @@ describe("history section lazy entry bodies", () => {
     expect(source).toContain("renderHistoryEntryBody(body, entry)");
     expect(source).toContain('addEventListener("toggle"');
     expect(source).toContain("firstElementChild === null");
-    expect(source).toMatch(/const initiallyOpen = index === 0 && entry\.status !== "success";/);
+    expect(source).toContain(
+      "const initiallyOpen = !this.historyRevealCollapsedIds.has(entry.id)",
+    );
+    expect(source).toContain("(revealed || (index === 0 && entry.status !== \"success\"))");
     expect(source).toMatch(/details\.open = initiallyOpen;/);
+    expect(source).toContain("details.dataset.easySyncHistoryId = entry.id;");
   });
 
   it("keeps the entry body content contract in the lazy builder", () => {
@@ -5637,6 +6621,275 @@ describe("history section lazy entry bodies", () => {
     expect(body).toContain("syncView.history.skipOmitted");
     expect(body).toContain("syncView.history.noFileChanges");
     expect(body).toContain("formatSyncHistoryCounts");
+  });
+});
+
+describe("history reveal on failed retry (2026-11-19)", () => {
+  type RevealViewState = {
+    historyRevealEntryId: string | null;
+    historyRevealCollapsedIds: Set<string>;
+    historyExpanded: boolean;
+    renderedBodyMode: string;
+  };
+
+  const baseTrigger = {
+    historyExpanded: false,
+    bodyMode: "idle" as const,
+    autoSyncPaused: true,
+    latestHistoryStatus: "failed" as const,
+  };
+
+  const historyEntry = (
+    id: string,
+    status: "failed" | "partial" | "success",
+  ) => ({
+    id,
+    mode: "manual" as const,
+    status,
+    startedAt: 1,
+    endedAt: 2,
+    uploaded: 0,
+    downloaded: 0,
+    deleted: 0,
+    conflicts: 0,
+    deferred: 0,
+    skipped: 0,
+    errors: status === "failed" ? 1 : 0,
+    message: status === "failed" ? "同步失败" : "同步部分完成",
+    files: [],
+  });
+
+  const renderHistory = (
+    view: EasySyncSyncView,
+    history: ReturnType<typeof historyEntry>[],
+  ) => {
+    const root = createFakeHistoryElement();
+    const section = createFakeHistoryElement("section");
+    root.children.push(section);
+    Object.assign(view as object, {
+      plugin: { i18n: new I18n("zh-cn") },
+      createSection: vi.fn(() => section),
+      addCollapseIcon: vi.fn(),
+      renderFileResults: vi.fn(),
+      applyAdaptivePathLayout: vi.fn(),
+    });
+    (view as unknown as {
+      renderHistorySection(
+        container: HTMLElement,
+        entries: ReturnType<typeof historyEntry>[],
+      ): void;
+    }).renderHistorySection(root as unknown as HTMLElement, history);
+    return section.children[0];
+  };
+
+  const revealView = (
+    overrides: Partial<RevealViewState> = {},
+  ): EasySyncSyncView => {
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      historyRevealEntryId: null,
+      historyRevealCollapsedIds: new Set<string>(),
+      historyExpanded: false,
+      renderedBodyMode: "idle",
+      ...overrides,
+    });
+    return view;
+  };
+
+  const revealState = (view: EasySyncSyncView): RevealViewState =>
+    view as unknown as RevealViewState;
+
+  it("only triggers from a blank failed/partial state that still hides history", () => {
+    expect(shouldRevealHistoryOnRetry(baseTrigger)).toBe(true);
+    expect(shouldRevealHistoryOnRetry({
+      ...baseTrigger,
+      latestHistoryStatus: "partial",
+    })).toBe(true);
+    expect(shouldRevealHistoryOnRetry({
+      ...baseTrigger,
+      historyExpanded: true,
+    })).toBe(false);
+    expect(shouldRevealHistoryOnRetry({
+      ...baseTrigger,
+      bodyMode: "pending",
+    })).toBe(false);
+    expect(shouldRevealHistoryOnRetry({
+      ...baseTrigger,
+      autoSyncPaused: false,
+    })).toBe(false);
+    for (const status of [
+      "success",
+      "cancelled",
+      "authExpired",
+      "retry-pending",
+      undefined,
+    ] as const) {
+      expect(shouldRevealHistoryOnRetry({
+        ...baseTrigger,
+        latestHistoryStatus: status,
+      })).toBe(false);
+    }
+  });
+
+  it("opens history and pins the latest failed round on retry", () => {
+    const view = revealView({
+      historyRevealCollapsedIds: new Set(["run-failed"]),
+    });
+    const render = vi.fn();
+    Object.assign(view as object, {
+      plugin: {
+        state: { syncHistory: [historyEntry("run-failed", "failed")] },
+        autoSyncPaused: true,
+      },
+      render,
+    });
+
+    (view as unknown as { revealHistoryForRetry(): void }).revealHistoryForRetry();
+
+    expect(revealState(view).historyExpanded).toBe(true);
+    expect(revealState(view).historyRevealEntryId).toBe("run-failed");
+    expect(revealState(view).historyRevealCollapsedIds.has("run-failed"))
+      .toBe(false);
+    expect(render).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not intervene when history is already open or the body has content", () => {
+    const openView = revealView({ historyExpanded: true });
+    const pendingView = revealView({ renderedBodyMode: "pending" });
+    for (const view of [openView, pendingView]) {
+      const render = vi.fn();
+      Object.assign(view as object, {
+        plugin: {
+          state: { syncHistory: [historyEntry("run-failed", "failed")] },
+          autoSyncPaused: true,
+        },
+        render,
+      });
+      (view as unknown as { revealHistoryForRetry(): void })
+        .revealHistoryForRetry();
+      expect(render).not.toHaveBeenCalled();
+      expect(revealState(view).historyRevealEntryId).toBeNull();
+    }
+  });
+
+  it("keeps the existing default open for the latest non-success round", () => {
+    const view = revealView();
+    const list = renderHistory(view, [
+      historyEntry("run-failed", "failed"),
+      historyEntry("run-success", "success"),
+    ]);
+
+    expect(list.children[0].open).toBe(true);
+    expect(list.children[1].open).toBe(false);
+  });
+
+  it("expands the pinned round and keeps a user-collapsed round closed", () => {
+    const view = revealView({ historyRevealEntryId: "run-failed" });
+    const list = renderHistory(view, [
+      historyEntry("run-failed", "failed"),
+      historyEntry("run-success", "success"),
+    ]);
+    const failed = list.children[0];
+    const summary = failed.children[0];
+
+    expect(failed.open).toBe(true);
+    expect(failed.dataset.easySyncHistoryId).toBe("run-failed");
+
+    // 用户亲手收起：撤销强撑，并记住本次会话内不再弹开。
+    summary.listeners.click[0]();
+    failed.open = false;
+    expect(revealState(view).historyRevealEntryId).toBeNull();
+    expect(revealState(view).historyRevealCollapsedIds.has("run-failed"))
+      .toBe(true);
+
+    const rerendered = renderHistory(view, [
+      historyEntry("run-failed", "failed"),
+      historyEntry("run-success", "success"),
+    ]);
+    expect(rerendered.children[0].open).toBe(false);
+  });
+
+  it("retargets the pin to a newer failed/partial round", () => {
+    const view = revealView({ historyRevealEntryId: "old-failed" });
+    const list = renderHistory(view, [
+      historyEntry("new-partial", "partial"),
+      historyEntry("old-failed", "failed"),
+    ]);
+
+    expect(revealState(view).historyRevealEntryId).toBe("new-partial");
+    expect(list.children[0].open).toBe(true);
+    expect(list.children[0].dataset.easySyncHistoryId).toBe("new-partial");
+    expect(list.children[1].open).toBe(false);
+  });
+
+  it("keeps the old failure open when the retry succeeds", () => {
+    const view = revealView({ historyRevealEntryId: "old-failed" });
+    const list = renderHistory(view, [
+      historyEntry("new-success", "success"),
+      historyEntry("old-failed", "failed"),
+    ]);
+
+    expect(revealState(view).historyRevealEntryId).toBe("old-failed");
+    expect(list.children[0].open).toBe(false);
+    expect(list.children[1].open).toBe(true);
+  });
+
+  it("forces the pinned round open after a programmatic bulk collapse", () => {
+    const details = {
+      open: false,
+      dataset: { easySyncHistoryId: "run-failed" },
+    };
+    const view = revealView({
+      historyRevealEntryId: "run-failed",
+    });
+    Object.assign(view as object, {
+      contentEl: {
+        querySelectorAll: () => [details],
+      },
+    });
+
+    (view as unknown as {
+      applyHistoryRevealOpenState(): void;
+    }).applyHistoryRevealOpenState();
+
+    expect(details.open).toBe(true);
+  });
+
+  it("drops the pin when the retained round is already gone", () => {
+    const view = revealView({ historyRevealEntryId: "retired" });
+    Object.assign(view as object, {
+      contentEl: { querySelectorAll: () => [] },
+    });
+
+    (view as unknown as {
+      applyHistoryRevealOpenState(): void;
+    }).applyHistoryRevealOpenState();
+
+    expect(revealState(view).historyRevealEntryId).toBeNull();
+  });
+
+  it("wires the reveal into the sync-now click and keeps the rebuild order", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    expect(source).toMatch(
+      /this\.revealHistoryForRetry\(\);\s*void this\.plugin\.startManualSync\(\);/,
+    );
+    const rebuild = functionBody(
+      source,
+      "private renderSyncViewFullRebuild(",
+    );
+    const toggleIndex = rebuild.indexOf("this.toggleAllDetails();");
+    const revealIndex = rebuild.indexOf("this.applyHistoryRevealOpenState();");
+    const presentationIndex = rebuild.indexOf(
+      "this.updateCollapseTogglePresentation();",
+    );
+    expect(toggleIndex).toBeGreaterThanOrEqual(0);
+    expect(revealIndex).toBeGreaterThan(toggleIndex);
+    expect(presentationIndex).toBeGreaterThan(revealIndex);
+
+    const toolbar = functionBody(source, "private renderToolbar(");
+    expect(toolbar).toContain("this.historyRevealEntryId = null;");
+    const bulk = functionBody(source, "private renderCollapseToggle(");
+    expect(bulk).toContain("this.historyRevealEntryId = null;");
   });
 });
 
@@ -5738,6 +6991,7 @@ describe("sync entry window presentation (2026-10-10 拍板)", () => {
       isLoggedIn: true,
       isRunning: true,
       canCancel: false,
+      cancelling: false,
       planReviewActive: false,
       planReviewDetailsState: "ready",
       reviewKind: null,
@@ -5752,6 +7006,7 @@ describe("sync entry window presentation (2026-10-10 拍板)", () => {
     // 源码守卫（按钮渲染是 DOM 重路径，正向行为由三载体一致性门覆盖）。
     expect(viewSource).toContain("syncing: state.isRunning || state.syncEntryInProgress,");
     expect(viewSource).toContain("isRunning: state.isRunning || state.syncEntryInProgress,");
+    expect(viewSource).toContain("cancelling: state.progress.cancelRequested,");
     // 入口只读准备期 armed 时主动作必须变可取消（R1）——落点在 canCancel 组合。
     expect(viewSource).toContain(
       "const canCancel = fullSyncRunning || this.plugin.isSyncEntryCancellable;",
@@ -6345,5 +7600,93 @@ describe("conflict batch row (2026-10-23)", () => {
       expect(readSourceFile(file)).toContain("easy-sync-prompt-modal");
     }
     expect(styles).toContain("font-size: var(--font-ui-medium)");
+  });
+});
+
+describe("sync view live ticker", () => {
+  const IDLE_PROGRESS: SyncProgressState = {
+    phase: "idle",
+    current: 0,
+    total: 0,
+    currentFile: "",
+    currentItemBytes: 0,
+    currentItemTotalBytes: 0,
+    currentItemComplete: false,
+    cancelRequested: false,
+    completedFiles: [],
+    completedCount: 0,
+    startedAt: 0,
+  };
+
+  it("arms the sampler only for running work or a live transfer chip", () => {
+    expect(
+      shouldRunSyncViewLiveTicker(IDLE_PROGRESS, false, false, false),
+    ).toBe(false);
+    expect(
+      shouldRunSyncViewLiveTicker(IDLE_PROGRESS, true, false, false),
+    ).toBe(true);
+    expect(
+      shouldRunSyncViewLiveTicker(IDLE_PROGRESS, false, true, false),
+    ).toBe(true);
+    expect(
+      shouldRunSyncViewLiveTicker(
+        { ...IDLE_PROGRESS, phase: "downloading", startedAt: 1 },
+        false,
+        false,
+        false,
+      ),
+    ).toBe(true);
+    expect(
+      shouldRunSyncViewLiveTicker(IDLE_PROGRESS, false, false, true),
+    ).toBe(true);
+  });
+
+  it("keeps the open-but-idle sidebar free of a recurring host timer", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const onOpen = functionBody(source, "async onOpen(");
+    // The old shape armed one interval for the whole view lifetime; the
+    // demand-driven ticker starts from render/phase paths instead.
+    expect(onOpen).not.toContain("registerInterval(");
+    expect(onOpen).toContain("this.syncLiveTicker();");
+    expect(onOpen).toContain("this.register(() => this.stopLiveTicker());");
+
+    const sync = functionBody(source, "private syncLiveTicker(");
+    expect(sync).toContain("if (this.closed)");
+    expect(sync).toContain("if (this.liveTicker !== null) return;");
+    expect(sync).toContain("if (!this.shouldRunLiveTicker()) return;");
+
+    const tick = functionBody(source, "private runLiveTick(");
+    expect(tick).toContain(
+      "if (!this.shouldRunLiveTicker()) this.stopLiveTicker();",
+    );
+  });
+});
+
+describe("sync view live transfer signal", () => {
+  it("samples only a LAN transfer in flight or a fresh cloud reading", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: {
+        getLanTransferIndicator?: () => { phase: string; kbps: number | null } | null;
+        getTransferRateReading: () => unknown;
+      };
+      hasLiveTransferSignal: () => boolean;
+    };
+    view.plugin = {
+      getLanTransferIndicator: () => ({ phase: "connected", kbps: null }),
+      getTransferRateReading: () => null,
+    };
+    // A connected session with no bytes moving is refreshed by phase changes,
+    // not by a 1 Hz timer.
+    expect(view.hasLiveTransferSignal()).toBe(false);
+
+    view.plugin.getLanTransferIndicator = () => ({
+      phase: "transferring",
+      kbps: null,
+    });
+    expect(view.hasLiveTransferSignal()).toBe(true);
+
+    view.plugin.getLanTransferIndicator = () => null;
+    view.plugin.getTransferRateReading = () => ({ kbps: 1, level: "high" });
+    expect(view.hasLiveTransferSignal()).toBe(true);
   });
 });

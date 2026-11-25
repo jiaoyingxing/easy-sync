@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
 import { compareV1WithV2Shadow } from "./helpers/read-only-shadow-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import { buildPublic113AnchoredFilePlan } from "./helpers/public-1-1-3-reentry-fixture";
 import { SyncActionType } from "../src/sync/types";
 import type { LocalFileEntry, RemoteFileEntry, SyncPlan, SyncScope } from "../src/sync/types";
@@ -262,7 +263,7 @@ describe("V2 read-only shadow", () => {
       },
       scope,
       remoteIndex: buildRemoteIndexV2(
-        movedRemoteItems,
+        toRemoteScanFactsV1(movedRemoteItems),
         scope.filesRootId,
         null,
         2,

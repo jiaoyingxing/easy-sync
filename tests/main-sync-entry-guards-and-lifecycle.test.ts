@@ -431,6 +431,72 @@ describe("main sync entry guards", () => {
     });
   });
 
+  it("does not keep a deterministic desktop-only join in the automatic pending set", async () => {
+    const requested = reduceDeviceCommunityPluginParticipation(
+      createEmptyDeviceCommunityPluginParticipation(true),
+      {
+        type: "request-join",
+        pluginId: "calendar",
+        operationId: "join-calendar-1",
+        targetCatalogRevision: 7,
+        targetBundleDigest: "a".repeat(64),
+      },
+    );
+    const desktopOnlyBlocked = reduceDeviceCommunityPluginParticipation(
+      requested,
+      {
+        type: "block",
+        pluginId: "calendar",
+        reason: "manifest-incompatible",
+      },
+    );
+    const plugin = makePlugin();
+    const attached = attachParticipationState(plugin, desktopOnlyBlocked);
+    Object.assign(attached.state, {
+      remoteScope: COMMUNITY_PLUGIN_SCOPE,
+      getRemoteCommunityPluginCatalog: vi.fn(() =>
+        remoteCalendarCatalog(7, "a".repeat(64))
+      ),
+    });
+
+    // The row stays blocked and visible, but another automatic round cannot
+    // change a deterministic platform verdict; only an ordinary/manual round
+    // rechecks it through prepareCommunityPluginJoinsForSync().
+    expect((plugin as never as {
+      hasPendingCommunityPluginJoin(): boolean;
+    }).hasPendingCommunityPluginJoin()).toBe(false);
+    await expect((plugin as never as {
+      prepareCommunityPluginJoinsForSync(): Promise<{
+        authorizations: Array<Record<string, unknown>>;
+      }>;
+    }).prepareCommunityPluginJoinsForSync()).resolves.toMatchObject({
+      authorizations: [{
+        pluginId: "calendar",
+        operationId: "join-calendar-1",
+        targetCatalogRevision: 7,
+        targetBundleDigest: "a".repeat(64),
+      }],
+    });
+    expect(attached.current().pluginsById.calendar).toMatchObject({
+      phase: "restoring",
+      operationId: "join-calendar-1",
+    });
+
+    const retryableBlocked = reduceDeviceCommunityPluginParticipation(
+      requested,
+      {
+        type: "block",
+        pluginId: "calendar",
+        reason: "remote-bundle-missing",
+      },
+    );
+    const retryablePlugin = makePlugin();
+    attachParticipationState(retryablePlugin, retryableBlocked);
+    expect((retryablePlugin as never as {
+      hasPendingCommunityPluginJoin(): boolean;
+    }).hasPendingCommunityPluginJoin()).toBe(true);
+  });
+
   it("returns a selected local plugin with a stale target to ordinary planning", async () => {
     const plugin = makePlugin();
     const attached = attachParticipationState(plugin, changedRemotePluginJoin());
@@ -913,7 +979,10 @@ describe("main sync entry guards", () => {
   it("wires commands, the sync view, lifecycle listeners and layout-ready work from onload", async () => {
     vi.useFakeTimers();
     const plugin = makePlugin();
-    const commands: Array<{ id?: string }> = [];
+    const commands: Array<{
+      id?: string;
+      checkCallback?: (checking: boolean) => boolean;
+    }> = [];
     const views: Array<{ type: string; creator: unknown }> = [];
     const layoutReadyCallbacks: Array<() => void> = [];
     const workspaceOn = vi.fn((event: string) => ({ event }));
@@ -990,8 +1059,18 @@ describe("main sync entry guards", () => {
     expect(commands.map((command) => command.id)).toEqual([
       "start-sync",
       "show-detail",
+      "lan-connect",
       "open-recovery",
     ]);
+    // S4: the experimental entry is unavailable while the switch is off.
+    const lanCommand = commands.find((command) => command.id === "lan-connect");
+    expect(lanCommand?.checkCallback).toBeTypeOf("function");
+    (plugin as unknown as { lanAccelerationEnabled: boolean })
+      .lanAccelerationEnabled = false;
+    expect(lanCommand!.checkCallback!(true)).toBe(false);
+    (plugin as unknown as { lanAccelerationEnabled: boolean })
+      .lanAccelerationEnabled = true;
+    expect(lanCommand!.checkCallback!(true)).toBe(true);
     expect(views).toHaveLength(1);
     expect(views[0]?.type).toBe(SYNC_VIEW_TYPE);
     expect(views[0]?.creator).toBeTypeOf("function");

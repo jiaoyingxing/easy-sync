@@ -457,6 +457,9 @@ function convergentExecutor(
           eTag: liveETag,
           cTag: "ctag",
           size: fileSize,
+          // Match the committed entry's mtime so a projection-identical
+          // assertion in the preserve test is not defeated by metadata.
+          lastModifiedDateTime: new Date(5).toISOString(),
           parentReference: { id: folderId },
         }),
       ],
@@ -609,6 +612,7 @@ describe("receipted mutation spelling convergence", () => {
         operationIds: readonly string[];
         operationEpoch: number | undefined;
         result: SyncResult | undefined;
+        preserveReviewedSourceCommitSeq?: number;
       }): Promise<unknown>;
     }).commitRecoveryCheckpointsWithRepair({
       operationIds: [operationId],
@@ -620,6 +624,38 @@ describe("receipted mutation spelling convergence", () => {
     expect(state.mutationLedger).toEqual([]);
     expect(liveLocalName()).toBe(indexPath);
     expect(vault.rename).toHaveBeenCalledTimes(1);
+    // Without a sealed review the fact-identical rebuild still publishes its
+    // rotated cursor; the preserve lane below is what suppresses this write.
+    expect(state.setRemoteState).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers a projection-identical recovery rebuild while a reviewed plan is sealed", async () => {
+    // Graph rotates the deltaLink on every read. The recovery repair itself
+    // must not turn that cursor-only rotation into a new commitSeq, or the
+    // plan the user just confirmed is invalidated and the round re-pauses
+    // forever (same loop the 2026-09-13 recovery-observation fix closed).
+    const state = spellingState();
+    const { executor } = convergentExecutor(state, { local: null });
+    const before = state.getCommittedV2Envelope()!;
+
+    await expect((executor as unknown as {
+      commitRecoveryCheckpointsWithRepair(args: {
+        operationIds: readonly string[];
+        operationEpoch: number | undefined;
+        result: SyncResult | undefined;
+        preserveReviewedSourceCommitSeq?: number;
+      }): Promise<unknown>;
+    }).commitRecoveryCheckpointsWithRepair({
+      operationIds: [operationId],
+      operationEpoch: 0,
+      result: {} as SyncResult,
+      preserveReviewedSourceCommitSeq: before.meta.commitSeq,
+    })).rejects.toThrow(/V2 base upsert has no remote file identity/);
+
+    expect(state.setRemoteState).not.toHaveBeenCalled();
+    const after = state.getCommittedV2Envelope()!;
+    expect(after.meta.commitSeq).toBe(before.meta.commitSeq);
+    expect(after.remoteIndex.deltaLink).toBe(before.remoteIndex.deltaLink);
   });
 
   it("keeps the record blocked when the live version moved past the receipt", async () => {

@@ -36,6 +36,19 @@ export interface LocaleStrings {
   "ribbon.success": string;
   "ribbon.ready": string;
 
+  // ---- Cloud choice (first entry from the sidebar) ----
+  "cloudChoice.title": string;
+  "cloudChoice.onedrive.name": string;
+  "cloudChoice.onedrive.desc": string;
+  "cloudChoice.webdav.name": string;
+  "cloudChoice.webdav.desc": string;
+
+  // ---- Cloud switch confirmation (typed gate) ----
+  "cloudSwitch.gate.title": string;
+  "cloudSwitch.gate.message": string;
+  "cloudSwitch.gate.inputLabel": string;
+  "cloudSwitch.gate.confirm": string;
+
   // ---- Settings Groups ----
   "settings.rules.name": string;
   "settings.rules.acknowledge": string;
@@ -96,11 +109,45 @@ export interface LocaleStrings {
   "settings.account.device.cancel": string;
   "settings.account.device.busy": string;
   "settings.syncPanel.openRow": string;
+  "settings.webdav.connection.name": string;
+  "settings.webdav.connection.desc.unconfigured": string;
+  "settings.webdav.connection.desc.connected": string;
+  "notice.webdav.needsConfirmation": string;
+  "settings.webdav.connection.desc.failed": string;
+  "settings.webdav.connection.button.login": string;
+  "settings.webdav.connection.button.disable": string;
+  "settings.webdav.config.title": string;
+  "settings.webdav.url.name": string;
+  "settings.webdav.username.name": string;
+  "settings.webdav.password.name": string;
+  "settings.webdav.password.keep": string;
+  "settings.webdav.rootPrefix.name": string;
+  "settings.webdav.rootPrefix.existingContent": string;
+  "settings.webdav.rootPrefix.otherVault": string;
+  "settings.cloudConfig.save": string;
+  "settings.cloudConfig.cancel": string;
+  "settings.cloudConfig.saved": string;
+  "settings.cloudConfig.saveFailed": string;
+  "settings.cloudConfig.secretUnavailable": string;
+  "settings.cloudConfig.urlInvalid": string;
+  "settings.cloudConfig.usernameInvalid": string;
+  "settings.cloudConfig.rootPrefixInvalid": string;
+  "settings.cloudConfig.passwordRequired": string;
+  "settings.cloudTest.failed.authRejected": string;
+  "settings.cloudTest.failed.forbidden": string;
+  "settings.cloudTest.failed.notFound": string;
+  "settings.cloudTest.failed.network": string;
+  "settings.cloudTest.failed.tls": string;
+  "settings.cloudTest.failed.rateLimited": string;
+  "settings.cloudTest.failed.service": string;
+  "settings.cloudTest.failed.config": string;
+  "settings.cloudTest.failed.unknown": string;
   "settings.syncMode.name": string;
   "settings.syncMode.option.twoway": string;
   "settings.syncMode.option.oneway": string;
   "settings.syncMode.hint.twoway": string;
   "settings.syncMode.hint.oneway": string;
+  "settings.syncMode.hint.onewayUnavailable": string;
   "settings.syncMode.gate.title": string;
   "settings.syncMode.gate.message": string;
   "settings.syncMode.gate.point1": string;
@@ -251,8 +298,18 @@ export interface LocaleStrings {
   "settings.reset.leftoverDirectoryOne": string;
   "settings.reset.leftoverDirectoryMany": string;
   "settings.reset.failed": string;
+  // ---- S4 LAN acceleration (experimental) ----
+  "settings.experimental.heading": string;
+  "settings.lanAcceleration.name": string;
+  "settings.lanAcceleration.desc": string;
+  "settings.lanAccelerationThreshold.name": string;
+  "settings.lanAccelerationThreshold.desc": string;
+  "settings.lanAccelerationThreshold.optionAll": string;
+  "settings.lanAccelerationThreshold.optionMb": string;
   "notice.vaultCloudClient.onedrive": string;
   "notice.vaultCloudClient.icloud": string;
+  "vaultCloudClientWarning.title": string;
+  "vaultCloudClientWarning.snoozeToday": string;
   "settings.about.product.name": string;
   "settings.about.product.desc": string;
   "settings.about.updateNow": string;
@@ -282,6 +339,10 @@ export interface LocaleStrings {
   "settings.supportPage.resojot.desc": string;
   "settings.supportPage.openplug.name": string;
   "settings.supportPage.openplug.desc": string;
+  "settings.supportPage.storageCleanup.name": string;
+  "settings.supportPage.storageCleanup.desc": string;
+  "settings.supportPage.aiCodingPlanCheck.name": string;
+  "settings.supportPage.aiCodingPlanCheck.desc": string;
 
   // ---- 旧宿主升级指引（<1.13 手动强装） ----
   "settings.hostRequirement.title": string;
@@ -451,6 +512,7 @@ export interface LocaleStrings {
   "syncView.pluginBundleReview.diffTitle": string;
   "syncView.pluginBundleReview.readOnly": string;
   "syncView.pluginBundleReview.identityMismatchNotice": string;
+  "syncView.pluginBundleReview.identityWithName": string;
   "syncView.pluginBundleReview.directionUnavailable": string;
   "syncView.pluginBundleReview.reason.bundle-incomplete": string;
   "syncView.pluginBundleReview.reason.facts-unavailable": string;
@@ -462,16 +524,123 @@ export interface LocaleStrings {
   // ---- Commands ----
   "command.syncNow": string;
   "command.showDetail": string;
+  "command.lanConnect": string;
+
+  // ---- LAN session (experimental) ----
+  "lanSession.loadFailed": string;
+  "lanSession.title": string;
+  "lanSession.intro": string;
+  "lanSession.role.sender": string;
+  "lanSession.role.receiver": string;
+  "lanSession.mode.cloud": string;
+  "lanSession.mode.manual": string;
+  "lanSession.manual.summary": string;
+  "lanSession.close": string;
+  "lanSession.cloud.sender.heading": string;
+  "lanSession.cloud.sender.desc": string;
+  "lanSession.cloud.sender.publish": string;
+  "lanSession.cloud.sender.cancel": string;
+  "lanSession.cloud.receiver.heading": string;
+  "lanSession.cloud.receiver.desc": string;
+  "lanSession.cloud.receiver.join": string;
+  "lanSession.cloud.receiver.cancel": string;
+  "lanSession.cloud.receiver.start": string;
+  "lanSession.manual.sender.desc": string;
+  "lanSession.manual.sender.generateOffer": string;
+  "lanSession.manual.sender.offerLabel": string;
+  "lanSession.manual.sender.copyOffer": string;
+  "lanSession.manual.sender.answerLabel": string;
+  "lanSession.manual.sender.connect": string;
+  "lanSession.manual.receiver.desc": string;
+  "lanSession.manual.receiver.generateAnswer": string;
+  "lanSession.manual.receiver.answerLabel": string;
+  "lanSession.manual.receiver.copyAnswer": string;
+  "lanSession.manual.receiver.inject": string;
+  "lanSession.copyLabel.offer": string;
+  "lanSession.copyLabel.answer": string;
+  "lanSession.status.syncStarted": string;
+  "lanSession.status.senderHint": string;
+  "lanSession.status.receiverHint": string;
+  "lanSession.status.modeCloud": string;
+  "lanSession.status.modeManual": string;
+  "lanSession.status.pairingReady": string;
+  "lanSession.status.offerPublished": string;
+  "lanSession.status.waitAnswerTimeout": string;
+  "lanSession.status.findingOffer": string;
+  "lanSession.status.offerFound": string;
+  "lanSession.status.answerPublished": string;
+  "lanSession.status.receiving": string;
+  "lanSession.status.receiverReady": string;
+  "lanSession.status.answerReceived": string;
+  "lanSession.status.refusedPath": string;
+  "lanSession.status.servingPath": string;
+  "lanSession.status.sending": string;
+  "lanSession.status.servedPath": string;
+  "lanSession.status.connected": string;
+  "lanSession.status.candidatesPublished": string;
+  "lanSession.status.waitingPairing": string;
+  "lanSession.status.cancelled": string;
+  "lanSession.status.failed": string;
+  "lanSession.status.iceGathering": string;
+  "lanSession.status.offerGenerated": string;
+  "lanSession.status.answerGenerated": string;
+  "lanSession.status.dcWaiting": string;
+  "lanSession.status.sourceInjected": string;
+  "lanSession.status.copyEmpty": string;
+  "lanSession.status.copied": string;
+  "lanSession.status.copyFailed": string;
+  "lanSession.status.generateOfferFailed": string;
+  "lanSession.status.connectFailed": string;
+  "lanSession.status.generateAnswerFailed": string;
+  "lanSession.status.injectFailed": string;
+  "lanSession.ice.complete": string;
+  "lanSession.ice.short": string;
+  "lanSession.ice.timeout": string;
+  "lanSession.label.host": string;
+  "lanSession.label.joiner": string;
+  "lanSession.stats": string;
+  "lanSession.error.clientNotReady": string;
+  "lanSession.error.activeSession": string;
+  "lanSession.error.publishConflict": string;
+  "lanSession.error.publishRejected": string;
+  "lanSession.error.activeInvalid": string;
+  "lanSession.error.waitOfferTimeout": string;
+  "lanSession.error.offerClosed": string;
+  "lanSession.error.offerValidation": string;
+  "lanSession.error.offerWriteTimeout": string;
+  "lanSession.error.offerType": string;
+  "lanSession.error.offerSdpEmpty": string;
+  "lanSession.error.answerRejected": string;
+  "lanSession.error.alreadyAnswered": string;
+  "lanSession.error.answerClosed": string;
+  "lanSession.error.answerValidation": string;
+  "lanSession.error.answerSdpEmpty": string;
+  "lanSession.error.dcNotInitialized": string;
+  "lanSession.error.dcTimeout": string;
+  "lanSession.error.pairingCorrupt": string;
+  "lanSession.error.cancelled": string;
+  "lanSession.error.noPairing": string;
+  "lanSession.error.pairingCreate": string;
+  "lanSession.error.manualNeedOffer": string;
+  "lanSession.error.manualNeedAnswer": string;
+  "lanSession.error.manualOfferInput": string;
+  "lanSession.error.manualAnswerInput": string;
+  "lanSession.error.dcNotEstablished": string;
 
   // ---- Sync Progress ----
   "progress.scanningLocal": string;
+  "progress.recoveringOperations": string;
+  "progress.preparingAction": string;
   "progress.preparingRemote": string;
   "progress.checkingRemote": string;
   "progress.loadingBaseline": string;
+  "progress.preparingRecords": string;
   "progress.generatingPlan": string;
+  "progress.savingPlan": string;
+  "progress.establishingSync": string;
+  "progress.savingSyncResult": string;
   "progress.verifyingFiles": string;
   "progress.remoteScopeRecovery": string;
-  "progress.recoveringMutation": string;
 
   // ---- Sync Results ----
   "result.synced": string;
@@ -562,6 +731,7 @@ export interface LocaleStrings {
   // ---- Sync Lifecycle Notices ----
   "notice.sync.start": string;
   "notice.sync.stage": string;
+  "notice.sync.stageMetric": string;
   "notice.sync.progress": string;
   "notice.sync.remoteScopeRecovery": string;
   "notice.sync.verifyProgress": string;
@@ -618,6 +788,7 @@ export interface LocaleStrings {
   "reason.folder.local-source-changed": string;
   "reason.folder.parent-version-changed": string;
   "reason.folder.remote-version-changed": string;
+  "reason.folder.path-identity-move-deferred": string;
   "reason.folder.local-create-unconfirmed": string;
   "reason.folder.local-inspection-failed": string;
   "reason.folder.delete-wait-remote": string;
@@ -794,9 +965,19 @@ export interface LocaleStrings {
   "syncAction.summary.skipped": string;
   "syncAction.summary.errors": string;
   "syncView.progress.items": string;
+  "syncView.progress.batches": string;
+  "syncView.progress.countItems": string;
+  "syncView.progress.countBatches": string;
+  "syncView.progress.elapsed": string;
+  "syncView.progress.elapsedAria": string;
+  "syncView.progress.itemsAria": string;
+  "syncView.progress.countItemsAria": string;
+  "syncView.progress.batchesAria": string;
+  "syncView.progress.countBatchesAria": string;
   "syncView.progress.completed": string;
   "syncView.progress.omitted": string;
   "syncView.skipGroup.title": string;
+  "syncView.folderExclusion.title": string;
   "syncView.progress.remoteScopeRecoveryFailureTitle": string;
   "syncView.progress.remoteScopeRecoveryFailureSummary": string;
   "syncView.cancelSync": string;
@@ -921,6 +1102,7 @@ export interface LocaleStrings {
   "syncView.recovery.retry": string;
   "syncView.recovery.openAccountSettings": string;
   "syncView.recovery.remainingAria": string;
+  "syncView.recovery.progressAria": string;
   "syncView.recovery.retryScopeRecovery": string;
   "syncView.recovery.reviewDetails": string;
   "mutationRecovery.reason.factsChanged": string;
@@ -936,6 +1118,8 @@ export interface LocaleStrings {
    *  当前版本也没有安全处置方式时的一句终局说明；同一事实一个 key，
    *  待处理行与核对区共用。 */
   "syncView.itemTermination.nonRetryable": string;
+  "syncView.identityBlock.guidance.manifest-invalid": string;
+  "syncView.identityBlock.guidance.identity-collision": string;
   "syncView.collapseAll": string;
   "syncView.expandAll": string;
   "syncView.history.title": string;
@@ -946,6 +1130,7 @@ export interface LocaleStrings {
   "syncView.history.noFileChanges": string;
   "syncView.history.omitted": string;
   "syncView.history.skipOmitted": string;
+  "syncView.history.folderExclusionOmitted": string;
   "syncView.history.status.success": string;
   "syncView.history.status.partial": string;
   "syncView.history.status.cancelled": string;
@@ -982,6 +1167,8 @@ export interface LocaleStrings {
   "rsMigration.noOneDriveNotice": string;
   "rsMigration.completedNotice": string;
   "rsMigration.failureTitle": string;
+  /** 目标目录已有内容：持久状态，标题不带「暂时」，且不提供重试。 */
+  "rsMigration.unavailableTitle": string;
   "rsMigration.failureBody": string;
   "rsMigration.failureBodyDestination": string;
   "rsMigration.failureRetry": string;
@@ -989,6 +1176,8 @@ export interface LocaleStrings {
   "rsMigration.failureGuide": string;
   "rsMigration.guideTitle": string;
   "rsMigration.guideBody": string;
+  /** 目标非空时的手动指引：正文前加同名文件核对提醒。 */
+  "rsMigration.guideBodyDestination": string;
   "rsMigration.guideOk": string;
   "vaultJoin.offerTitle": string;
   "vaultJoin.offerBody": string;
@@ -1015,6 +1204,7 @@ export interface LocaleStrings {
   "confirm.pluginUpgradeTitle": string;
   "confirm.pluginUpgradeMessage": string;
   "reason.pluginDowngradeRemote": string;
+  "reason.pluginIdentityDrift": string;
 
   // ---- Sync Plan Alert & Review ----
   "syncPlan.readyTitle": string;

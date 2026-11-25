@@ -982,3 +982,82 @@ describe("StateManager V2 production controller", () => {
     expect(harness.plugin.updatePluginData).not.toHaveBeenCalled();
   });
 });
+
+describe("S0 plan-review scope provider fields", () => {
+  it("discards a persisted plan-review scope with an invalid providerKind", async () => {
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-plan-review-scope": {
+          ...scope,
+          providerKind: "dropbox",
+        },
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      expect(state.planReviewScope).toBeNull();
+    } finally {
+      await state.close();
+    }
+  });
+
+  it("discards a persisted plan-review scope with a non-string provider field", async () => {
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-plan-review-scope": {
+          ...scope,
+          providerKind: "s3",
+          endpointId: 42,
+        },
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      expect(state.planReviewScope).toBeNull();
+    } finally {
+      await state.close();
+    }
+  });
+
+  it("keeps a valid plan-review scope carrying S0 provider fields", async () => {
+    const persisted = {
+      ...scope,
+      providerKind: "webdav",
+      endpointId: "https://dav.example.com",
+      containerId: "",
+      rootPath: "/notes",
+      credentialBindingId: "a".repeat(32),
+    };
+    const harness = makeHarness({
+      pluginData: { "easy-sync-plan-review-scope": persisted },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      expect(state.planReviewScope).toEqual(persisted);
+    } finally {
+      await state.close();
+    }
+  });
+});
+
+describe("S0 cached-scope compatibility", () => {
+  it("keeps a historical cached scope with an empty accountId", async () => {
+    const persisted = {
+      ...scope,
+      accountId: "",
+    };
+    const harness = makeHarness({
+      pluginData: { "easy-sync-plan-review-scope": persisted },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      expect(state.planReviewScope).toEqual(persisted);
+    } finally {
+      await state.close();
+    }
+  });
+});

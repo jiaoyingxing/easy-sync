@@ -110,6 +110,14 @@ function makeView(input: {
     isSyncEntryInProgress: false,
     autoSyncPaused: false,
     auth: undefined,
+    // F5：面板的就绪事实只从这一个入口读；本夹具是「未登录的 OneDrive」。
+    activeCloudReadiness: () => ({
+      provider: "onedrive",
+      initializing: false,
+      loggedIn: false,
+      loginPending: false,
+      sessionPending: false,
+    }),
     state: syncState,
     i18n: new I18n("zh-cn"),
     getCommunityPluginAdoptionRows: () => [],

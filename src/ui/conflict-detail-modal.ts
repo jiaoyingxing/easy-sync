@@ -54,6 +54,7 @@ export class ConflictDetailModal extends FileComparisonModal {
   constructor(
     private readonly plugin: EasySyncPlugin,
     private readonly item: SyncPlanItem,
+    private readonly formatTimestamp: (timestamp: number) => string,
   ) {
     super(plugin.app);
   }
@@ -540,11 +541,11 @@ export class ConflictDetailModal extends FileComparisonModal {
         {
           label: t("conflictDetail.modifiedTime"),
           local: localTime
-            ? localTime.toLocaleString()
+            ? this.formatTimestamp(localTime.getTime())
               + (localIsNewer ? ` ${t("conflictDetail.newer")}` : "")
             : "—",
           remote: remoteTime
-            ? remoteTime.toLocaleString()
+            ? this.formatTimestamp(remoteTime.getTime())
               + (remoteIsNewer ? ` ${t("conflictDetail.newer")}` : "")
             : "—",
           localHighlighted: Boolean(localIsNewer),

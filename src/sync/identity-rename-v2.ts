@@ -78,12 +78,33 @@ interface IdentityRenamePlanOptionsV2 {
     remoteId: string;
   }[];
   /**
+   * Folder paths this same plan creates before any file move. They carry no
+   * committed node yet, so `projectedFolderIdentities` cannot express them
+   * (it only accepts a remote node that already exists). A path-identity
+   * provider is the only caller: the created collection's id is its path, and
+   * the folder create commits before every rename in the same round.
+   */
+  plannedFolderCreates?: readonly {
+    path: string;
+    remoteId: string;
+  }[];
+  /**
    * Device-local host-rename evidence (`fromPath -> toPath`) bound to one
    * committed file identity. It may prove a relocation even when the local
    * content changed; it is single-device evidence and never replaces the
    * remote version, destination and CAS gates below.
    */
   localFileMoveHints?: readonly LocalFolderMoveHintV1[];
+  /**
+   * Ledger-proven remote identity relocations for this round: old anchor remote
+   * id (path-identity provider) -> new remote id/path. Produced only from a
+   * verified sidecar ledger plus current local/remote observations; this is a
+   * cross-device identity proof, not a local rename hint.
+   */
+  remoteIdentityMoves?: ReadonlyMap<string, {
+    remoteId: string;
+    path: string;
+  }>;
 }
 
 /** Plan only identity-proven moves. Execution still requires local/remote CAS. */
@@ -140,6 +161,16 @@ export function planIdentityRenamesFromStateV2(
       pathByFolderId.set(projected.remoteId, projected.path);
     }
   }
+  // A create this same plan emits before any file move. A committed identity
+  // at that path always wins (the create would be withheld as occupied); an
+  // occupied identity from another id keeps the move fail-closed, exactly as
+  // for a committed folder.
+  for (const planned of options.plannedFolderCreates ?? []) {
+    const key = normalizeIdentityPath(planned.path);
+    if (folderIdByPath.has(key)) continue;
+    folderIdByPath.set(key, planned.remoteId);
+    pathByFolderId.set(planned.remoteId, planned.path);
+  }
 
   // Host-rename evidence is accepted only while it is still bound to the
   // committed anchor at its source path; a hint that survived a committed
@@ -172,6 +203,9 @@ export function planIdentityRenamesFromStateV2(
   for (const anchor of state.fileAnchors) {
     planIdentityRenameForAnchorV2({
       anchor,
+      remoteIdentityMove: anchor.remoteId
+        ? options.remoteIdentityMoves?.get(anchor.remoteId)
+        : undefined,
       state,
       pathByRemoteId,
       remoteIdByPath,
@@ -200,6 +234,7 @@ export function planIdentityRenamesFromStateV2(
  */
 function planIdentityRenameForAnchorV2(args: {
   anchor: SyncAnchorV2;
+  remoteIdentityMove?: { remoteId: string; path: string };
   state: CanonicalPlannerStateV2;
   pathByRemoteId: CanonicalPlannerStateV2["remotePathById"];
   remoteIdByPath: Map<string, string>;
@@ -216,6 +251,7 @@ function planIdentityRenameForAnchorV2(args: {
 }): void {
   const {
     anchor,
+    remoteIdentityMove,
     state,
     pathByRemoteId,
     remoteIdByPath,
@@ -231,8 +267,9 @@ function planIdentityRenameForAnchorV2(args: {
     actions,
   } = args;
     if (!anchor.remoteId) return;
-    const remote = state.remoteNodeById.get(anchor.remoteId);
-    const remotePath = pathByRemoteId.get(anchor.remoteId);
+    const effectiveRemoteId = remoteIdentityMove?.remoteId ?? anchor.remoteId;
+    const remote = state.remoteNodeById.get(effectiveRemoteId);
+    const remotePath = pathByRemoteId.get(effectiveRemoteId);
     const anchorPathKey = normalizeIdentityPath(anchor.lastPath);
     const occupantId = remoteIdByPath.get(anchorPathKey);
     const occupant = occupantId
@@ -316,6 +353,24 @@ function planIdentityRenameForAnchorV2(args: {
 
     // Remote identity moved while local stayed at the anchored path.
     if (remotePath !== anchor.lastPath && oldLocal) {
+      // The folded local index can resolve the anchored key to an entry that
+      // already carries the remote spelling (a case-only folder rename moved
+      // both sides). Nothing is left to move; minting a self move here would
+      // record the local parent spelling in an intent the reducer can never
+      // receipt (2026-11-25 field report: case-only folder rename on a
+      // case-sensitive host left an intent-only moveLocal that blocked the
+      // whole device as evidence-corrupt).
+      if (nfcPath(oldLocal.path) === nfcPath(remotePath)) return;
+      // A file-level move may only carry a FILE-NAME spelling change inside
+      // the same byte-identical parent. When the parent itself is a spelling
+      // alias, the folder layer owns the divergence (its remote-side twin is
+      // `destination-parent-spelling-diverged`); a moveLocal recorded under
+      // the local parent spelling can never commit.
+      if (
+        nfcPath(parentOf(oldLocal.path)) !== nfcPath(parentOf(remotePath))
+        && normalizeIdentityPath(parentOf(oldLocal.path))
+          === normalizeIdentityPath(parentOf(remotePath))
+      ) return;
       const remoteHashKnown = remote.contentHash !== undefined;
       const contentTagComparable =
         !remoteHashKnown
@@ -353,7 +408,8 @@ function planIdentityRenameForAnchorV2(args: {
           anchor.lastPath,
         ));
       } else if (
-        remoteHashKnown
+        remoteIdentityMove
+        || remoteHashKnown
         || contentTagComparable
       ) {
         actions.push({
@@ -664,6 +720,15 @@ function conflict(
  *  normalization). Semantically equivalent to the shared `identityPath`. */
 function normalizeIdentityPath(path: string): string {
   return path.normalize("NFC").toLocaleLowerCase("en-US");
+}
+
+function nfcPath(path: string): string {
+  return path.normalize("NFC");
+}
+
+function parentOf(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash === -1 ? "" : path.slice(0, slash);
 }
 
 function localContentKey(hash: string, size: number): string {

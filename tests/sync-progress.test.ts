@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   isAnySyncActivityRunning,
+  resolveRoundProgressCurrent,
   syncProgressPercent,
   SyncProgressStore,
 } from "../src/sync/sync-progress";
@@ -112,6 +113,90 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.currentItemTotalBytes).toBe(0);
   });
 
+  it("keeps phase metrics separate from round counts and resets them per phase", () => {
+    const progress = new SyncProgressStore();
+    progress.markStarted();
+
+    progress.setPhase("planningRecords");
+    progress.setPhaseMetric({ current: 3, total: 10, unit: "batches" });
+    expect(progress.state.phaseStartedAt).toBeGreaterThan(0);
+    expect(progress.state.phaseMetric).toEqual({
+      current: 3,
+      total: 10,
+      unit: "batches",
+    });
+    // The round's own counter stays untouched; the body bar cannot mount.
+    expect(progress.state.current).toBe(0);
+    expect(progress.state.total).toBe(0);
+
+    progress.setPhase("planning");
+    expect(progress.state.phaseMetric).toBeUndefined();
+
+    progress.setPhase("executing");
+    progress.setProgress(3, 10, "note.md", SyncActionType.Upload);
+    progress.setPhase("committing", { keepCounts: true });
+    expect(progress.state.current).toBe(3);
+    expect(progress.state.total).toBe(10);
+    expect(progress.state.currentFile).toBe("");
+    expect(progress.state.phaseMetric).toBeUndefined();
+  });
+
+  it("keeps already settled rows when a side-action batch moves from preparation to execution", () => {
+    const progress = new SyncProgressStore();
+    progress.markStarted("sideAction");
+    progress.setPhase("preparingAction");
+    progress.addCompletedFile({ path: "first.md", status: "delete" });
+
+    progress.setPhase("executing", { keepCompleted: true });
+    expect(progress.state.completedFiles.map((file) => file.path))
+      .toEqual(["first.md"]);
+    expect(progress.state.completedCount).toBe(1);
+
+    progress.setPhase("executing");
+    expect(progress.state.completedFiles).toEqual([]);
+    expect(progress.state.completedCount).toBe(0);
+  });
+
+  it("keeps one phase start for a repeated same-phase switch and restarts on a new phase or round", () => {
+    const progress = new SyncProgressStore();
+    const now = vi.spyOn(Date, "now");
+
+    try {
+      now.mockReturnValue(1_000);
+      progress.markStarted();
+      progress.setPhase("planning");
+      expect(progress.state.phaseStartedAt).toBe(1_000);
+
+      now.mockReturnValue(2_000);
+      progress.setPhase("planning");
+      expect(progress.state.phaseStartedAt).toBe(1_000);
+
+      progress.setPhase("savingPlan");
+      expect(progress.state.phaseStartedAt).toBe(2_000);
+
+      // `markStarted` clears the timestamp; the next round's first phase must
+      // start a fresh window even when its name repeats the previous one.
+      progress.setPhase("planning");
+      progress.markStarted();
+      now.mockReturnValue(3_000);
+      progress.setPhase("planning");
+      expect(progress.state.phaseStartedAt).toBe(3_000);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("clamps a phase metric's total to its current count", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("scanning");
+    progress.setPhaseMetric({ current: 12, total: 5, unit: "items" });
+    expect(progress.state.phaseMetric).toEqual({
+      current: 12,
+      total: 12,
+      unit: "items",
+    });
+  });
+
   it("shows the known item size from the first visible moment", () => {
     const progress = new SyncProgressStore();
 
@@ -184,6 +269,33 @@ describe("SyncProgressStore retention", () => {
 
     progress.setProgress(4, 4, "last.md", SyncActionType.Upload);
     expect(syncProgressPercent(progress.state)).toBe(100);
+  });
+
+  it("raises the visible round position with the download lookahead", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("executing");
+    progress.setProgress(0, 4, "a.md", SyncActionType.Download);
+
+    // The lookahead moves the visible counter/bar while `current` stays the
+    // durable settled count.
+    progress.setProcessedCurrent(3);
+    expect(progress.state.current).toBe(0);
+    expect(resolveRoundProgressCurrent(progress.state)).toBe(3);
+    expect(syncProgressPercent(progress.state)).toBe(75);
+
+    // It never decreases, and it cannot pass the round total.
+    progress.setProcessedCurrent(2);
+    expect(resolveRoundProgressCurrent(progress.state)).toBe(3);
+    progress.setProcessedCurrent(9);
+    expect(resolveRoundProgressCurrent(progress.state)).toBe(4);
+
+    // A later settled count below the lookahead does not pull the display
+    // back; finish clears the lookahead so the result uses settled items.
+    progress.setProgress(1, 4, "b.md", SyncActionType.Download);
+    expect(resolveRoundProgressCurrent(progress.state)).toBe(4);
+    progress.finish();
+    expect(progress.state.processedCurrent).toBeUndefined();
+    expect(resolveRoundProgressCurrent(progress.state)).toBe(1);
   });
 
   it("treats executor and progress store as one running signal", () => {

@@ -298,3 +298,57 @@ describe("DownloadConcurrencyPolicy — 降级后爬回 (2026-10-27)", () => {
     expect(policy.isLockedSerial).toBe(true);
   });
 });
+
+describe("DownloadConcurrencyPolicy warm start", () => {
+  it("starts at the remembered depth and two healthy batches never lower it", () => {
+    const policy = new DownloadConcurrencyPolicy(
+      ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
+      { initialConcurrency: ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY },
+    );
+
+    expect(policy.limit).toBe(ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY);
+    // The cold-start ladder's second rung used to write two unconditionally;
+    // from a warm four that would be a downgrade with no evidence behind it.
+    policy.observeBatch(healthyBatch(2));
+    expect(policy.limit).toBe(ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY);
+    policy.observeBatch(healthyBatch(2));
+    expect(policy.limit).toBe(ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY);
+  });
+
+  it("clamps a remembered depth into the platform range", () => {
+    expect(new DownloadConcurrencyPolicy(
+      MOBILE_DOWNLOAD_MAX_CONCURRENCY,
+      { initialConcurrency: 4 },
+    ).limit).toBe(MOBILE_DOWNLOAD_MAX_CONCURRENCY);
+    expect(new DownloadConcurrencyPolicy(4, { initialConcurrency: 0 }).limit)
+      .toBe(1);
+    expect(new DownloadConcurrencyPolicy(4, { initialConcurrency: Number.NaN }).limit)
+      .toBe(1);
+  });
+
+  it("still locks to serial from a warm start on an unhealthy signal", () => {
+    const policy = new DownloadConcurrencyPolicy(4, { initialConcurrency: 4 });
+
+    policy.observeBatch({ ...healthyBatch(2), failed: true });
+
+    expect(policy.limit).toBe(1);
+    expect(policy.isLockedSerial).toBe(true);
+  });
+
+  it("keeps a warm start when a batch moved no bytes (zero-byte notes)", () => {
+    const policy = new DownloadConcurrencyPolicy(4, { initialConcurrency: 4 });
+
+    // A completed batch of empty files says nothing about the link; it must not
+    // be read as a stall and pull the next round back to serial.
+    policy.observeBatch({
+      files: 2,
+      bytes: 0,
+      elapsedMs: 100,
+      transferMs: 100,
+      failed: false,
+      degradedPath: false,
+    });
+
+    expect(policy.limit).toBe(4);
+  });
+});

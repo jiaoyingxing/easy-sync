@@ -34,6 +34,7 @@ import {
   type DeletionLedgerEntryV1,
 } from "../../src/sync/deletion-ledger";
 import { OneDriveClient, ResponseByteBudgetError } from "../../src/onedrive/client";
+import { ONEDRIVE_CAPABILITIES } from "../../src/onedrive/capabilities";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../../src/onedrive/types";
 import { V2StateRefusalError } from "../../src/sync/v2-state-refusal";
 import type { LocalScanner } from "../../src/sync/local-scanner";
@@ -143,6 +144,7 @@ export function makeDownloadLocalStore(onWrite?: () => Promise<void>) {
 
 export function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
   return {
+    capabilities: ONEDRIVE_CAPABILITIES,
     downloadBaseline: vi.fn().mockResolvedValue(null),
     downloadFile: vi.fn().mockImplementation(
       (_v: string, _p: string, _u?: string, _d?: string, s = 0, onProgress?: (d: number, t: number) => void) => {
@@ -231,11 +233,16 @@ export function makeActiveV2State(
   remoteEntries: RemoteFileEntry[],
   baseEntries: BaseFileEntry[],
   overrides: Record<string, unknown> = {},
+  /** Optional full scope (S0 provider fields included). Omitted keeps the
+   *  legacy OneDrive four-field fixture byte-for-byte. */
+  scopeOverride?: SyncScope,
 ): StateManager {
-  const scope: SyncScope = {
-    ...TEST_SYNC_SCOPE,
-    accountId: "account-id",
-  };
+  const scope: SyncScope = scopeOverride
+    ? { ...scopeOverride }
+    : {
+        ...TEST_SYNC_SCOPE,
+        accountId: "account-id",
+      };
   let remoteFolders = (
     Array.isArray(overrides.remoteFolders)
       ? overrides.remoteFolders as RemoteFolderEntry[]
@@ -386,7 +393,20 @@ export function makeActiveV2State(
     recordCloudDeletion: vi.fn(async (entry: DeletionLedgerEntryV1) => {
       deletionLedger = upsertDeletionLedgerEntryV1(deletionLedger, entry);
     }),
-    upsertPendingConflicts: vi.fn().mockResolvedValue(undefined),
+    // 真实现，与生产 `upsertPlanItems` 同语义（按 path 覆盖）：冲突行的写入
+    // 会被结算自证读取，no-op 桩会让「行事实过期」这类缺陷在测试里隐形。
+    upsertPendingConflicts: vi.fn(async (items: SyncPlanItem[]) => {
+      for (const item of items) {
+        const index = state.pendingConflicts.findIndex(
+          (existing) => existing.path === item.path,
+        );
+        if (index < 0) state.pendingConflicts.push(item);
+        else state.pendingConflicts[index] = item;
+      }
+    }),
+    addPendingConflict: vi.fn(async (item: SyncPlanItem) => {
+      await state.upsertPendingConflicts([item]);
+    }),
     prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
     upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
     prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
@@ -929,6 +949,30 @@ export function makeActiveV2State(
     const expectedIds = new Set(
       expectedRecords.map((record) => record.intent.operationId),
     );
+    // 生产端在写盘前还会把每条冲突行的 decisionToken 与同路径结算成员的
+    // 期望事实逐字节互证；桩必须同样拒绝，否则「行事实落后于本次核对」这类
+    // 真实缺陷在测试里会被写成成功。
+    const settlement = entry.manualResolution;
+    const members = settlement?.version === 2 ? settlement.members : [];
+    const tokenAgreesWithMember = (conflict: SyncPlanItem): boolean => {
+      const token = conflict.decisionToken;
+      const member = members.find((candidate) =>
+        candidate.intent.path === conflict.path);
+      if (!token || !member) return false;
+      const expectedLocal = member.intent.expectedLocal;
+      const expectedRemote = member.intent.expectedRemote;
+      const localMatches = expectedLocal.exists
+        ? token.local.exists === true
+          && token.local.hash === expectedLocal.hash
+          && token.local.size === expectedLocal.size
+        : token.local.exists === false;
+      const remoteMatches = expectedRemote.exists
+        ? token.remote.exists === true
+          && token.remote.driveId === expectedRemote.driveId
+          && token.remote.eTag === expectedRemote.eTag
+        : token.remote.exists === false;
+      return localMatches && remoteMatches;
+    };
     if (expectedRecords.some((expected) => {
       const active = state.mutationLedger.find(
         (candidate) => candidate.intent.operationId === expected.intent.operationId,
@@ -939,7 +983,9 @@ export function makeActiveV2State(
         (candidate) => candidate.path === expected.path,
       );
       return !active || JSON.stringify(active) !== JSON.stringify(expected);
-    }) || state.mutationLedger.some((candidate) =>
+    }) || expectedConflicts.some((conflict) =>
+      !tokenAgreesWithMember(conflict))
+    || state.mutationLedger.some((candidate) =>
       candidate.intent.operationId === entry.intent.operationId
       && !expectedIds.has(candidate.intent.operationId))) return false;
     state.mutationLedger.push(structuredClone(entry));
@@ -1111,6 +1157,14 @@ export async function makeManualResolutionHarness(input: {
   configDir?: string;
   receiptedRenameAnchorCollision?: boolean;
   pendingConflictPaths?: string[];
+  /** 让某条待处理冲突行带着「更早时刻」的事实（真实现场：插件在本机更新后，
+   *  降级守卫仍保留旧行不重写）。值为该路径的本机旧内容；云端旧事实用
+   *  `staleConflictRemote` 指定。用于复现结算自证失败的形态。 */
+  staleConflictLocal?: Record<string, string>;
+  staleConflictRemote?: Record<string, string>;
+  /** 远端文件存在但正文读不全（声明长度与实际返回不符）：P1 superseded 判定
+   *  必须失败关闭，记录保持未裁决。用于隔离用例。 */
+  remoteUnreadable?: boolean;
   /** 只有云端一侧的冲突行（本机已删、云端改过）：本机删除出口带着合法
    *  decisionToken，可直接驱动「保留本机＝删掉云端那份多余副本」分支。 */
   remoteOnlyConflictPaths?: string[];
@@ -1166,7 +1220,7 @@ export async function makeManualResolutionHarness(input: {
         mtime: 1,
         eTag: `etag-${version++}`,
         cTag: `ctag-${version}`,
-        sha256Hash: await sha256Hex(bytes),
+        ...(input.remoteUnreadable ? {} : { sha256Hash: await sha256Hex(bytes) }),
       },
       bytes,
     });
@@ -1439,17 +1493,30 @@ export async function makeManualResolutionHarness(input: {
     if (!local || !remote) {
       throw new Error(`pending conflict harness requires both sides: ${path}`);
     }
+    // 现场形态：行里记的是挂起那一刻的事实，磁盘与云端此后已变。
+    const staleLocalText = input.staleConflictLocal?.[path];
+    const rowLocal = staleLocalText !== undefined
+      ? new TextEncoder().encode(staleLocalText).buffer
+      : local;
+    const staleRemoteText = input.staleConflictRemote?.[path];
+    const rowRemote = staleRemoteText !== undefined
+      ? {
+          ...remote,
+          eTag: `etag-stale-${path}`,
+          size: new TextEncoder().encode(staleRemoteText).byteLength,
+        }
+      : remote;
     pendingConflicts.push({
       type: SyncActionType.Conflict,
       path,
       local: {
         path,
-        hash: await sha256Hex(local),
-        size: local.byteLength,
+        hash: await sha256Hex(rowLocal),
+        size: rowLocal.byteLength,
         mtime: 1,
         binary: false,
       },
-      remote,
+      remote: rowRemote,
       decisionToken: {
         version: 1,
         vaultName: "testVault",
@@ -1457,13 +1524,13 @@ export async function makeManualResolutionHarness(input: {
         scope,
         local: {
           exists: true,
-          hash: await sha256Hex(local),
-          size: local.byteLength,
+          hash: await sha256Hex(rowLocal),
+          size: rowLocal.byteLength,
         },
         remote: {
           exists: true,
-          driveId: remote.driveId,
-          eTag: remote.eTag,
+          driveId: rowRemote.driveId,
+          eTag: rowRemote.eTag,
         },
         ancestorHash: null,
       },
@@ -1508,6 +1575,7 @@ export async function makeManualResolutionHarness(input: {
   const downloadFile = vi.fn(async (_vault: string, path: string) => {
     const current = remoteFiles.get(path);
     if (!current) throw new Error(`missing remote: ${path}`);
+    if (input.remoteUnreadable) return new ArrayBuffer(0);
     return current.bytes.slice(0);
   });
   const onedrive = makeMockOneDrive({

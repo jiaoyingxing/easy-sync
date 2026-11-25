@@ -78,6 +78,7 @@ import {
   type RemoteNodeV2,
 } from "./remote-index-v2";
 import {
+  normalizeHistoryExcludedFolders,
   normalizeHistorySkipPaths,
   normalizeSizeExclusionBaseline,
 } from "./skip-baseline";
@@ -95,6 +96,17 @@ import {
   reduceFolderStateEnvelopeV2,
   type ConfirmedDescendantFolderRejectionReasonV2,
 } from "./folder-state-reducer-v2";
+import { rebindPathIdentityFolderAnchorsV2 } from "./folder-anchor-rebind-v2";
+import {
+  applyConvergedFolderAnchorSpellingV2,
+  deriveConvergedFolderAnchorSpellingsV2,
+  type ConvergedFolderAnchorSpellingV2,
+} from "./folder-anchor-spelling-convergence";
+import {
+  applyPathIdentityFolderSpellingConvergenceV2,
+  derivePathIdentityFolderSpellingConvergencesV2,
+  type PathIdentityFolderSpellingConvergenceV2,
+} from "./path-identity-folder-spelling-convergence";
 import type {
   SharedFolderIdentityResolutionSnapshotV1,
 } from "./shared-folder-identity-resolution";
@@ -146,6 +158,30 @@ import {
   sameLocalOnlyIgnoreMemory,
   type LocalOnlyIgnoreMemoryV1,
 } from "./local-only-ignore-memory";
+import {
+  createEmptyRetainedEmptyCollections,
+  normalizeRetainedEmptyCollections,
+  readRetainedEmptyCollections,
+  type RetainedEmptyCollectionV1,
+  type RetainedEmptyCollectionsV1,
+} from "./retained-empty-collections";
+import {
+  createEmptyPendingPathIdentityFolderMoves,
+  normalizePendingPathIdentityFolderMoves,
+  pendingPathIdentityFolderMoveKey,
+  readPendingPathIdentityFolderMoves,
+  type PendingPathIdentityFolderMoveV1,
+  type PendingPathIdentityFolderMovesV1,
+} from "./pending-path-identity-folder-moves";
+import {
+  createIdentityLedgerSnapshot,
+  readIdentityLedgerSnapshot,
+  type IdentityLedgerSnapshotV1,
+} from "./identity-ledger-snapshot";
+import {
+  readWebDavLedgerRebuildMarker,
+  type WebDavLedgerRebuildMarkerV1,
+} from "../cloud/webdav-ledger-trust";
 import {
   emptyLocalOnlyCopiesV1,
   readLocalOnlyCopiesV1,
@@ -290,6 +326,9 @@ export interface PluginDataStore {
   ) => StateV2IndexedDbActiveStore;
   createRemoteScopeRecoveryEvidenceStore?:
     RemoteScopeRecoveryEvidenceStoreFactory;
+  // F1 云端分账：当前账本的 sidecar 子目录（相对插件目录）。null／缺省＝
+  // 原地存放（OneDrive 与所有既有调用点）。
+  readonly activeCloudBookDirectory?: string | null;
 }
 
 /**
@@ -731,6 +770,12 @@ const DELETION_LEDGER_COMPACT_EXPIRED_THRESHOLD = 1_000;
 const DELETION_LEDGER_COMPACT_DEAD_LINES_THRESHOLD = 200;
 /** 片⑤ 忽略记忆：「留在本机，不再提醒」的本机清单（只影响提醒）。 */
 const KEY_LOCAL_ONLY_IGNORE_MEMORY = "easy-sync-local-only-ignore-memory";
+const KEY_RETAINED_EMPTY_COLLECTIONS = "easy-sync-retained-empty-collections";
+const KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES =
+  "easy-sync-pending-path-identity-folder-moves";
+const KEY_IDENTITY_LEDGER_SNAPSHOT = "easy-sync-identity-ledger-snapshot";
+/** W2b-2: set while a rebuilt WebDAV identity ledger still awaits one successful round. */
+const KEY_WEBDAV_LEDGER_REBUILD = "easy-sync-webdav-ledger-rebuild";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
 const KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS =
   "community-plugin-manifest-observations";
@@ -799,6 +844,13 @@ export interface SyncHistoryEntry {
    *  sidebar no longer re-emits stable skips (2026-10-25 拍板). Absent on
    *  entries written before this field and on rounds with nothing skipped. */
   skipPaths?: string[];
+  /** Folder exclusions applied to the round's local scan, capped and
+   *  de-duplicated. Display-only snapshot for the history fold; absent on
+   *  older entries and on rounds without folder exclusions. */
+  excludedFolders?: string[];
+  /** True unique folder count before the retention cap; present only when
+   *  the retained path list was truncated. */
+  excludedFoldersTotal?: number;
   errors: number;
   message: string;
   files: FileProgress[];
@@ -840,7 +892,18 @@ export interface PendingIssue {
     | "scope-crossing"
     | "transfer-network"
     | "transfer-remote-moving"
-    | "one-way-folder-retained";
+    | "one-way-folder-retained"
+      /** Community-plugin identity blocks that no code path can auto-resolve.
+       *  They are deterministic (nothing was written; only a fact change — a
+       *  repaired manifest, a renamed/removed directory, one side re-installed
+       *  as the same plugin — can clear them), so they are filed as
+       *  external-dependency rows instead of "this build cannot finish it"
+       *  diagnoses. The drift shape normally becomes a whole-bundle review row
+       *  before execution; the code here only covers the execution-time
+       *  backstop (the review guard could not read the cloud manifest). */
+    | "plugin-manifest-invalid"
+    | "plugin-identity-collision"
+    | "plugin-identity-drift";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -888,6 +951,10 @@ interface PluginData {
   [KEY_LOCAL_ONLY_COPIES]: LocalOnlyCopiesV1;
   [KEY_DELETION_LEDGER]: DeletionLedgerV1;
   [KEY_LOCAL_ONLY_IGNORE_MEMORY]: LocalOnlyIgnoreMemoryV1;
+  [KEY_RETAINED_EMPTY_COLLECTIONS]: RetainedEmptyCollectionsV1;
+  [KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]: PendingPathIdentityFolderMovesV1;
+  [KEY_IDENTITY_LEDGER_SNAPSHOT]: IdentityLedgerSnapshotV1 | null;
+  [KEY_WEBDAV_LEDGER_REBUILD]: WebDavLedgerRebuildMarkerV1 | null;
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
     CommunityPluginManifestObservationV1[];
   [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
@@ -932,6 +999,11 @@ const DEFAULT_DATA: PluginData = {
     [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
     [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1(),
     [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
+    [KEY_RETAINED_EMPTY_COLLECTIONS]: createEmptyRetainedEmptyCollections(),
+    [KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]:
+      createEmptyPendingPathIdentityFolderMoves(),
+    [KEY_IDENTITY_LEDGER_SNAPSHOT]: null,
+    [KEY_WEBDAV_LEDGER_REBUILD]: null,
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
     [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
@@ -969,6 +1041,11 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
     [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1(),
     [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
+    [KEY_RETAINED_EMPTY_COLLECTIONS]: createEmptyRetainedEmptyCollections(),
+    [KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]:
+      createEmptyPendingPathIdentityFolderMoves(),
+    [KEY_IDENTITY_LEDGER_SNAPSHOT]: null,
+    [KEY_WEBDAV_LEDGER_REBUILD]: null,
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
     [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
@@ -1126,7 +1203,23 @@ export class StateManager {
   private deletionLedgerNeedsNewline = false;
   private remoteState: RemoteSyncState | null = null;
   private v2Envelope: SyncStateEnvelopeV2 | null = null;
+  /** Lazily built `NFC(lastPath) -> first committed anchor` lookup for the
+   *  current envelope. The four read-only path-fact accessors below used to
+   *  scan and NFC-normalize every anchor per call; a reviewed delete wave calls
+   *  them once per file, which made a large wave O(files × anchors). The
+   *  envelope is replaced as a whole, so identity is the generation marker. */
+  private anchorPathLookup: {
+    envelope: SyncStateEnvelopeV2;
+    byPath: Map<string, SyncAnchorV2>;
+  } | null = null;
   private v2PathView: StatePathViewV2 | null = null;
+  /** Exact-path lookup for the cached path view's base entries. `getBaseEntry`
+   *  is called per decision/evidence row and per changed base entry; scanning
+   *  the sorted base array each time was O(rows × anchors). */
+  private baseEntryLookup: {
+    view: StatePathViewV2;
+    byPath: Map<string, BaseFileEntry>;
+  } | null = null;
   private lastContentFactCommitSeq: number | null = null;
   private v2Store: StateEnvelopeV2Store | null = null;
   private v2IndexedDbStore: StateV2IndexedDbActiveStore | null = null;
@@ -1162,6 +1255,21 @@ export class StateManager {
 
   constructor(private plugin: PluginDataStore) {
     this.data = createDefaultData();
+  }
+
+  /**
+   * 当前账本的 sidecar 路径集（F1 云端分账）。
+   *
+   * **唯一取得点**：`getEasySyncPaths` 的所有调用都走这里，账本目录由插件
+   * 按活动云端给出。插件没实现这个 seam（测试替身、窄适配器）时退回原地
+   * 路径——与改造前逐字一致，缺省行为零变化。
+   */
+  private bookPaths(): ReturnType<typeof getEasySyncPaths> {
+    return getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+      this.plugin.activeCloudBookDirectory ?? null,
+    );
   }
 
   /** Monotonically increasing counter — detects mid-sync resets or concurrent runs */
@@ -1208,7 +1316,9 @@ export class StateManager {
     await this.v2IndexedDbStore?.close();
     await this.remoteScopeRecoveryEvidenceStore?.close();
     this.v2Envelope = null;
+    this.anchorPathLookup = null;
     this.v2PathView = null;
+    this.baseEntryLookup = null;
     this.v2Store = null;
     this.v2IndexedDbStore = null;
     this.remoteScopeRecoveryEvidenceStore = null;
@@ -1235,10 +1345,7 @@ export class StateManager {
     this.deletionLedgerAppendFallbackWarned = false;
     this.deletionLedgerNeedsNewline = false;
     this.deletionLedgerEpoch += 1;
-    const layoutPaths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const layoutPaths = this.bookPaths();
     const legacyLayoutPaths = getEasySyncLegacyPaths(
       this.plugin.app.vault,
       this.plugin.manifest.id,
@@ -1277,7 +1384,7 @@ export class StateManager {
     // into the in-memory view. The next load retries the file write.
     this.mergeLegacyDeletionLedgerIntoMemory();
     await this.retireCommunityPluginEnablementPluginData(saved ?? {});
-    const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
+    const paths = this.bookPaths();
     const adapter = this.plugin.app.vault.adapter;
     // Real Obsidian adapters expose exists(). Narrow compatibility/test
     // adapters that do not cannot reliably distinguish this new optional file
@@ -1965,7 +2072,7 @@ export class StateManager {
         : savedPlanReviewRevision,
       [KEY_PLAN_REVIEW_SCOPE]: legacyPlanReview
         ? null
-        : isSyncScope(saved[KEY_PLAN_REVIEW_SCOPE])
+        : isCachedSyncScope(saved[KEY_PLAN_REVIEW_SCOPE])
           ? saved[KEY_PLAN_REVIEW_SCOPE]
           : null,
       [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: legacyPlanReview
@@ -2009,6 +2116,17 @@ export class StateManager {
       [KEY_LOCAL_ONLY_IGNORE_MEMORY]:
         readLocalOnlyIgnoreMemory(saved[KEY_LOCAL_ONLY_IGNORE_MEMORY])
         ?? createEmptyLocalOnlyIgnoreMemory(),
+      [KEY_RETAINED_EMPTY_COLLECTIONS]:
+        readRetainedEmptyCollections(saved[KEY_RETAINED_EMPTY_COLLECTIONS])
+        ?? createEmptyRetainedEmptyCollections(),
+      [KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]:
+        readPendingPathIdentityFolderMoves(
+          saved[KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES],
+        ) ?? createEmptyPendingPathIdentityFolderMoves(),
+      [KEY_IDENTITY_LEDGER_SNAPSHOT]:
+        readIdentityLedgerSnapshot(saved[KEY_IDENTITY_LEDGER_SNAPSHOT]),
+      [KEY_WEBDAV_LEDGER_REBUILD]:
+        readWebDavLedgerRebuildMarker(saved[KEY_WEBDAV_LEDGER_REBUILD]),
       [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
         communityPluginManifestObservations,
       [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
@@ -2098,10 +2216,7 @@ export class StateManager {
       );
     }
     try {
-      const paths = getEasySyncPaths(
-        this.plugin.app.vault,
-        this.plugin.manifest.id,
-      );
+      const paths = this.bookPaths();
       const outcome = await pruneExpiredLocalArchiveDirectoriesV1({
         adapter: this.plugin.app.vault.adapter,
         pluginDir: paths.pluginDir,
@@ -2249,10 +2364,7 @@ export class StateManager {
   }
 
   private deletionLedgerPath(): string {
-    return getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    ).deletionLedgerFile;
+    return this.bookPaths().deletionLedgerFile;
   }
 
   /** Serialize every ledger write. `then(task, task)` keeps the chain alive
@@ -2659,10 +2771,7 @@ export class StateManager {
   }
 
   private mutationLedgerBackupPath(): string {
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     return `${paths.stateV2File}.ledger-backup`;
   }
 
@@ -2827,10 +2936,7 @@ export class StateManager {
   }
 
   private get remoteStatePath(): string {
-    return getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    ).remoteStateFile;
+    return this.bookPaths().remoteStateFile;
   }
 
   private activateV2Envelope(
@@ -2838,7 +2944,9 @@ export class StateManager {
     contentFactChanged = true,
   ): void {
     this.v2Envelope = envelope;
+    this.anchorPathLookup = null;
     this.v2PathView = null;
+    this.baseEntryLookup = null;
     if (contentFactChanged || this.lastContentFactCommitSeq === null) {
       this.lastContentFactCommitSeq = envelope.meta.commitSeq;
     }
@@ -3217,7 +3325,9 @@ export class StateManager {
       } else {
         await active.close().catch(() => undefined);
         this.v2Envelope = null;
+        this.anchorPathLookup = null;
         this.v2PathView = null;
+        this.baseEntryLookup = null;
         throw error;
       }
     }
@@ -3229,7 +3339,9 @@ export class StateManager {
     ) {
       await active.close();
       this.v2Envelope = null;
+      this.anchorPathLookup = null;
       this.v2PathView = null;
+      this.baseEntryLookup = null;
       throw new Error(
         "V2 IndexedDB Vault identity changed during authority selection",
       );
@@ -3258,7 +3370,9 @@ export class StateManager {
       return reread;
     }
     this.v2Envelope = null;
+    this.anchorPathLookup = null;
     this.v2PathView = null;
+    this.baseEntryLookup = null;
     throw new Error(changedMessage);
   }
 
@@ -3345,10 +3459,7 @@ export class StateManager {
   }
 
   private createAncestorStoreV2(
-    paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    ),
+    paths = this.bookPaths(),
   ): AncestorStoreV2 {
     return new AncestorStoreV2(
       this.plugin.app.vault.adapter,
@@ -3937,10 +4048,7 @@ export class StateManager {
           "V2 scope recovery cannot commit while mutation or state recovery is unresolved",
         );
       }
-      const paths = getEasySyncPaths(
-        this.plugin.app.vault,
-        this.plugin.manifest.id,
-      );
+      const paths = this.bookPaths();
       const sourceManifest = await readStateV2Manifest(
         this.plugin.app.vault.adapter,
         paths.stateV2ManifestFile,
@@ -4043,10 +4151,7 @@ export class StateManager {
       "missing";
     let baseContentRaw: string | null = null;
     let baseContentEntries: Record<string, string> = {};
-    const baseContentPath = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    ).baseContentFile;
+    const baseContentPath = this.bookPaths().baseContentFile;
     const legacyBaseContentPath = getEasySyncLegacyPaths(
       this.plugin.app.vault,
       this.plugin.manifest.id,
@@ -4115,6 +4220,7 @@ export class StateManager {
     candidate: SyncStateEnvelopeV2,
     source: Public113MigrationInput,
     now = Date.now(),
+    onProgress?: (current: number, total: number) => void,
   ): Promise<CanonicalPlannerStateV2 | null> {
     const factory = this.plugin.createPublic113IndexedDbCandidateStore;
     if (!factory) return null;
@@ -4137,6 +4243,7 @@ export class StateManager {
       await store.stageCandidate(candidate, {
         sourceStateDigest: requestedSourceDigest,
         now,
+        onProgress,
       });
       const view = await store.loadPreparedPlannerView(
         requestedSourceDigest,
@@ -4240,10 +4347,7 @@ export class StateManager {
       throw new Error("Public 1.1.3 migration input changed before review");
     }
 
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const adapter = this.plugin.app.vault.adapter;
     let manifestPresent: boolean;
     let witnessPresent: boolean;
@@ -4414,7 +4518,7 @@ export class StateManager {
       throw new Error("Public 1.1.3 migration input changed before V2 activation");
     }
 
-    const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
+    const paths = this.bookPaths();
     const sourceStateDigest =
       await this.reconcilePreManifestMigrationArtifacts({
       candidate: input.candidate,
@@ -4639,6 +4743,179 @@ export class StateManager {
       });
       if (sameLocalOnlyIgnoreMemory(next, family)) return current;
       return { ...current, [KEY_LOCAL_ONLY_IGNORE_MEMORY]: next };
+    });
+  }
+
+  /**
+   * 保留空集合记忆：本机删文件夹后，服务器因没有条件集合删除而留下的空壳。
+   * 只用于扫描抑制与删除结算，不参与身份、内容或同步方向判断。
+   */
+  get retainedEmptyCollections(): readonly RetainedEmptyCollectionV1[] {
+    return this.data[KEY_RETAINED_EMPTY_COLLECTIONS].entries;
+  }
+
+  /** 记住一个刚结算的保留空壳（同一路径覆盖旧记录）。 */
+  async recordRetainedEmptyCollection(
+    path: string,
+    eTag: string | null,
+  ): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_RETAINED_EMPTY_COLLECTIONS]
+        ?? createEmptyRetainedEmptyCollections();
+      const next = normalizeRetainedEmptyCollections([
+        ...family.entries.filter((entry) => entry.path !== path),
+        { path, eTag, recordedAt: Date.now() },
+      ]);
+      return { ...current, [KEY_RETAINED_EMPTY_COLLECTIONS]: next };
+    });
+  }
+
+  /** 本地重建/远端变化后清除一个保留空壳；不存在时零写入。 */
+  async clearRetainedEmptyCollection(path: string): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_RETAINED_EMPTY_COLLECTIONS]
+        ?? createEmptyRetainedEmptyCollections();
+      if (!family.entries.some((entry) => entry.path === path)) return current;
+      return {
+        ...current,
+        [KEY_RETAINED_EMPTY_COLLECTIONS]: normalizeRetainedEmptyCollections(
+          family.entries.filter((entry) => entry.path !== path),
+        ),
+      };
+    });
+  }
+
+  /** 扫描期批量失效（远端空壳消失、出现子项或版本变化）时一次写回。 */
+  async replaceRetainedEmptyCollections(
+    entries: readonly RetainedEmptyCollectionV1[],
+  ): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_RETAINED_EMPTY_COLLECTIONS]
+        ?? createEmptyRetainedEmptyCollections();
+      const next = normalizeRetainedEmptyCollections(entries);
+      if (JSON.stringify(next) === JSON.stringify(family)) return current;
+      return { ...current, [KEY_RETAINED_EMPTY_COLLECTIONS]: next };
+    });
+  }
+
+  /**
+   * 路径身份文件夹改名拆解的跨轮续做记录。只在本机插件数据里，绑定当前同步
+   * 作用域；读取方必须再用已提交 envelope 复核源锚点、目标集合与剩余文件。
+   */
+  get pendingPathIdentityFolderMoves(): readonly PendingPathIdentityFolderMoveV1[] {
+    const entries = this.data[KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES].entries;
+    const scope = this.v2Envelope?.scope;
+    return scope
+      ? entries.filter((entry) => sameSyncScope(entry.scope, scope))
+      : [];
+  }
+
+  /** 记下一个已开始执行拆解的文件夹改名；源路径不存在锚点时零写入。 */
+  async recordPendingPathIdentityFolderMove(input: {
+    sourcePath: string;
+    targetPath: string;
+    observedAt?: number;
+  }): Promise<boolean> {
+    if (
+      this.v2StateLoadBlock
+      || !this.v2Envelope?.folderAnchors
+      || !input.sourcePath
+      || !input.targetPath
+      || input.sourcePath === input.targetPath
+    ) return false;
+    const sourceKey = input.sourcePath.normalize("NFC");
+    const anchored = Object.values(
+      this.v2Envelope.folderAnchors.byAnchorId,
+    ).some((anchor) => anchor.lastPath.normalize("NFC") === sourceKey);
+    if (!anchored) return false;
+    const scope = { ...this.v2Envelope.scope };
+    const entry: PendingPathIdentityFolderMoveV1 = {
+      version: 1,
+      scope,
+      sourcePath: input.sourcePath,
+      targetPath: input.targetPath,
+      observedAt: input.observedAt ?? Date.now(),
+    };
+    const key = pendingPathIdentityFolderMoveKey(scope, entry.sourcePath);
+    await this.commitPluginData((current) => {
+      const family = current[KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]
+        ?? createEmptyPendingPathIdentityFolderMoves();
+      const next = normalizePendingPathIdentityFolderMoves([
+        ...family.entries.filter((candidate) =>
+          pendingPathIdentityFolderMoveKey(candidate.scope, candidate.sourcePath)
+            !== key),
+        entry,
+      ]);
+      if (JSON.stringify(next) === JSON.stringify(family)) return current;
+      return { ...current, [KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]: next };
+    });
+    // The source anchor existed before the write (checked above); an unchanged
+    // record is a re-observation of a continuation, not a failure.
+    return true;
+  }
+
+  /** 拆解收口（或放弃）后清除一个续做记录；不存在时零写入。 */
+  async clearPendingPathIdentityFolderMove(sourcePath: string): Promise<void> {
+    const scope = this.v2Envelope?.scope;
+    if (!scope) return;
+    const key = pendingPathIdentityFolderMoveKey(scope, sourcePath);
+    await this.commitPluginData((current) => {
+      const family = current[KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]
+        ?? createEmptyPendingPathIdentityFolderMoves();
+      const kept = family.entries.filter((entry) =>
+        pendingPathIdentityFolderMoveKey(entry.scope, entry.sourcePath) !== key);
+      if (kept.length === family.entries.length) return current;
+      return {
+        ...current,
+        [KEY_PENDING_PATH_IDENTITY_FOLDER_MOVES]:
+          normalizePendingPathIdentityFolderMoves(kept),
+      };
+    });
+  }
+
+  /**
+   * 只保存最近一次 verified 身份账本的 path 投影，用于跨设备移动识别。
+   * 不参与授权；执行器必须先用本地/远端观察复核才会转成 planner relocation。
+   */
+  get identityLedgerSnapshot(): IdentityLedgerSnapshotV1 | null {
+    return this.data[KEY_IDENTITY_LEDGER_SNAPSHOT];
+  }
+
+  async replaceIdentityLedgerSnapshot(
+    scope: SyncScope,
+    entries: Record<string, string>,
+  ): Promise<void> {
+    await this.commitPluginData((current) => {
+      const existing = current[KEY_IDENTITY_LEDGER_SNAPSHOT];
+      const next = createIdentityLedgerSnapshot(scope, entries);
+      if (
+        existing
+        && sameSyncScope(existing.scope, next.scope)
+        && JSON.stringify(existing.entries) === JSON.stringify(next.entries)
+      ) return current;
+      return { ...current, [KEY_IDENTITY_LEDGER_SNAPSHOT]: next };
+    });
+  }
+
+  /**
+   * 「WebDAV 身份账本重建未确认」标记（W2b-2）。
+   *
+   * 只在启动引导真的重建了账本（远端缺失／损坏，uuid 全部换新）时写入；
+   * 有一轮真的成功同步后清除。存在期间该 scope 的跨设备身份推断与自动删除
+   * 保持关闭，也不需要任何新界面。
+   */
+  get webDavLedgerRebuildMarker(): WebDavLedgerRebuildMarkerV1 | null {
+    return this.data[KEY_WEBDAV_LEDGER_REBUILD];
+  }
+
+  /** 写入（或清除）该标记；内容不变时零写入。 */
+  async replaceWebDavLedgerRebuildMarker(
+    marker: WebDavLedgerRebuildMarkerV1 | null,
+  ): Promise<void> {
+    await this.commitPluginData((current) => {
+      const existing = current[KEY_WEBDAV_LEDGER_REBUILD];
+      if (JSON.stringify(existing) === JSON.stringify(marker)) return current;
+      return { ...current, [KEY_WEBDAV_LEDGER_REBUILD]: marker };
     });
   }
 
@@ -5164,10 +5441,7 @@ export class StateManager {
     kind: "upsert" | "delete";
     node: RemoteNodeV2 | null;
   }>> {
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const store = this.createV2IndexedDbRecoveryStore(paths);
     return store.remoteNodeHistory(driveId, limit ?? 64);
   }
@@ -6016,6 +6290,32 @@ export class StateManager {
   }
 
   /**
+   * B3a：路径身份小文件夹改名拆解后的状态收口。逐文件移动已经完成、目标
+   * 文件夹已创建/观察，但 folder anchor 仍指向旧路径；把源子树 folder
+   * anchor 翻译到目标路径并把 `remoteId` 改成目标路径。只写状态，不产生
+   * 任何 provider mutation；源文件锚点未清、目标 folder 缺失等前置不成立
+   * 时由纯函数抛错，整次提交失败关闭。
+   */
+  async rebindPathIdentityFolderAnchorsAfterMove(input: {
+    sourcePath: string;
+    targetPath: string;
+    completedAt?: number;
+  }): Promise<boolean> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Folder anchor rebind requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) {
+      throw new Error("Mutation recovery ledger is corrupt");
+    }
+    return await this.commitV2State((current) =>
+      rebindPathIdentityFolderAnchorsV2(current, {
+        sourcePath: input.sourcePath,
+        targetPath: input.targetPath,
+        completedAt: input.completedAt ?? Date.now(),
+      }));
+  }
+
+  /**
    * Settle one stuck upload whose remote object was replaced by an identical
    * object under a new Graph identity. State-only: the envelope anchor is
    * rebound through the equal-read controller (identity lineage advance,
@@ -6479,10 +6779,7 @@ export class StateManager {
       || isFolderMutationIntent(expected.intent)
       || expected.manualResolution !== undefined
     ) return false;
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const sourceAuthority = await this.assertConservativeResetAuthority(
       paths,
       this.v2Envelope,
@@ -6899,10 +7196,16 @@ export class StateManager {
 
   getBaseEntry(path: string): BaseFileEntry | undefined {
     const pathView = this.getV2PathView();
-    if (pathView) {
-      return pathView.baseEntries.find((entry) => entry.path === path);
+    if (!pathView) return this.data[KEY_BASE_SNAPSHOT][path];
+    if (this.baseEntryLookup?.view !== pathView) {
+      const byPath = new Map<string, BaseFileEntry>();
+      for (const entry of pathView.baseEntries) {
+        // First match wins, exactly like `baseEntries.find(...)`.
+        if (!byPath.has(entry.path)) byPath.set(entry.path, entry);
+      }
+      this.baseEntryLookup = { view: pathView, byPath };
     }
-    return this.data[KEY_BASE_SNAPSHOT][path];
+    return this.baseEntryLookup.byPath.get(path);
   }
 
   /** Update a single file's base entry immediately (per-file persistence) */
@@ -7353,10 +7656,7 @@ export class StateManager {
   async getRemoteEnumCheckpoint(): Promise<RemoteEnumCheckpoint | null> {
     try {
       const adapter = this.plugin.app.vault.adapter;
-      const path = getEasySyncPaths(
-        this.plugin.app.vault,
-        this.plugin.manifest.id,
-      ).remoteEnumCheckpointFile;
+      const path = this.bookPaths().remoteEnumCheckpointFile;
       if (!await adapter.exists(path)) return null;
       const parsed = JSON.parse(await adapter.read(path)) as RemoteEnumCheckpoint;
       if (
@@ -7378,7 +7678,7 @@ export class StateManager {
 
   async saveRemoteEnumCheckpoint(checkpoint: RemoteEnumCheckpoint): Promise<void> {
     const adapter = this.plugin.app.vault.adapter;
-    const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
+    const paths = this.bookPaths();
     try {
       await adapter.mkdir(paths.tmpDir).catch(() => {});
       await adapter.mkdir(`${paths.tmpDir}/cache`).catch(() => {});
@@ -7391,10 +7691,7 @@ export class StateManager {
   async clearRemoteEnumCheckpoint(): Promise<void> {
     try {
       const adapter = this.plugin.app.vault.adapter;
-      const path = getEasySyncPaths(
-        this.plugin.app.vault,
-        this.plugin.manifest.id,
-      ).remoteEnumCheckpointFile;
+      const path = this.bookPaths().remoteEnumCheckpointFile;
       if (await adapter.exists(path)) await adapter.remove(path);
     } catch {
       // A leftover checkpoint is harmless (fail-open cache); removal is
@@ -7907,6 +8204,247 @@ export class StateManager {
       throw error;
     }
     return { status: "accepted", accepted: reduced.accepted };
+  }
+
+  /**
+   * Move stale folder anchors to the spelling both sides already use. This is
+   * the state-only convergence for the case-only folder rename: local and
+   * remote agree on one spelling, but the committed anchor keeps the old one
+   * and every round re-emits the same conflict.
+   *
+   * The candidate slice is derived from current facts outside the commit and
+   * every subtree anchor is re-projected against the committed remote index
+   * inside the CAS callback, so a changed envelope rejects instead of
+   * half-rebinding. No Vault or Graph write happens on any path.
+   */
+  async convergeFolderAnchorSpellings(input: {
+    scope: Readonly<SyncScope>;
+    localFiles: readonly LocalFileEntry[];
+    localFolders: readonly LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    includeFolderPath?: (path: string) => boolean;
+    preserveFolderPath?: (path: string) => boolean;
+    now?: number;
+  }): Promise<{
+    status: "accepted" | "none" | "blocked";
+    converged: number;
+    folderAnchors: number;
+    fileAnchors: number;
+    reason?: string;
+  }> {
+    const envelope = this.v2Envelope;
+    if (!envelope || !sameSyncScope(envelope.scope, input.scope)) {
+      return {
+        status: "blocked",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+        reason: "scope-changed",
+      };
+    }
+    const reviews = deriveConvergedFolderAnchorSpellingsV2({
+      envelope,
+      localFiles: input.localFiles,
+      localFolders: input.localFolders,
+      localFolderScanComplete: input.localFolderScanComplete,
+      ...(input.includeFolderPath
+        ? { includeFolderPath: input.includeFolderPath }
+        : {}),
+      ...(input.preserveFolderPath
+        ? { preserveFolderPath: input.preserveFolderPath }
+        : {}),
+    });
+    if (reviews.length === 0) {
+      return {
+        status: "none",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+      };
+    }
+    if (await this.confirmedDescendantEvidenceBlocked(input.scope)) {
+      return {
+        status: "blocked",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+        reason: "state-not-clean",
+      };
+    }
+    const confirmedAt = input.now ?? Date.now();
+    const preview = applyConvergedFolderSpellingReviewsV2(
+      envelope,
+      reviews,
+      confirmedAt,
+    );
+    if (!preview) {
+      return {
+        status: "blocked",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+        reason: "facts-changed",
+      };
+    }
+    const expectedCommitSeq = envelope.meta.commitSeq;
+    const staleCommit = new Error(
+      "Folder anchor spelling convergence changed before state commit",
+    );
+    try {
+      await this.commitV2State((current) => {
+        if (
+          current.meta.commitSeq !== expectedCommitSeq
+          || current.meta.lifecycleEpoch !== envelope.meta.lifecycleEpoch
+          || !sameSyncScope(current.scope, input.scope)
+        ) throw staleCommit;
+        const applied = applyConvergedFolderSpellingReviewsV2(
+          current,
+          reviews,
+          confirmedAt,
+        );
+        if (
+          !applied
+          || applied.envelope.meta.commitSeq !== preview.envelope.meta.commitSeq
+        ) throw staleCommit;
+        return applied.envelope;
+      });
+    } catch (error) {
+      if (error === staleCommit) {
+        return {
+          status: "blocked",
+          converged: 0,
+          folderAnchors: 0,
+          fileAnchors: 0,
+          reason: "facts-changed",
+        };
+      }
+      throw error;
+    }
+    return {
+      status: "accepted",
+      converged: reviews.length,
+      folderAnchors: preview.folderAnchors,
+      fileAnchors: preview.fileAnchors,
+    };
+  }
+
+  /**
+   * Re-claim path-identity folder anchors after both sides already use the
+   * same new spelling. WebDAV/S3 change the item id with the path, so the old
+   * anchor id is gone and the ordinary active-forget button can never rebuild
+   * its snapshot. This is the state-only continuation: every anchored
+   * descendant must exist on both sides under the translated path; no Vault or
+   * remote write happens, and the ordinary plan reconciles content afterwards.
+   */
+  async convergePathIdentityFolderSpellings(input: {
+    scope: Readonly<SyncScope>;
+    localFiles: readonly LocalFileEntry[];
+    localFolders: readonly LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    includeFolderPath?: (path: string) => boolean;
+    preserveFolderPath?: (path: string) => boolean;
+    now?: number;
+  }): Promise<{
+    status: "accepted" | "none" | "blocked";
+    converged: number;
+    folderAnchors: number;
+    fileAnchors: number;
+    reason?: string;
+  }> {
+    const envelope = this.v2Envelope;
+    if (!envelope || !sameSyncScope(envelope.scope, input.scope)) {
+      return {
+        status: "blocked",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+        reason: "scope-changed",
+      };
+    }
+    const reviews = derivePathIdentityFolderSpellingConvergencesV2({
+      envelope,
+      localFiles: input.localFiles,
+      localFolders: input.localFolders,
+      localFolderScanComplete: input.localFolderScanComplete,
+      ...(input.includeFolderPath
+        ? { includeFolderPath: input.includeFolderPath }
+        : {}),
+      ...(input.preserveFolderPath
+        ? { preserveFolderPath: input.preserveFolderPath }
+        : {}),
+    });
+    if (reviews.length === 0) {
+      return {
+        status: "none",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+      };
+    }
+    if (await this.confirmedDescendantEvidenceBlocked(input.scope)) {
+      return {
+        status: "blocked",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+        reason: "state-not-clean",
+      };
+    }
+    const confirmedAt = input.now ?? Date.now();
+    const preview = applyPathIdentityFolderSpellingReviewsV2(
+      envelope,
+      reviews,
+      confirmedAt,
+    );
+    if (!preview) {
+      return {
+        status: "blocked",
+        converged: 0,
+        folderAnchors: 0,
+        fileAnchors: 0,
+        reason: "facts-changed",
+      };
+    }
+    const expectedCommitSeq = envelope.meta.commitSeq;
+    const staleCommit = new Error(
+      "Path-identity folder spelling convergence changed before state commit",
+    );
+    try {
+      await this.commitV2State((current) => {
+        if (
+          current.meta.commitSeq !== expectedCommitSeq
+          || current.meta.lifecycleEpoch !== envelope.meta.lifecycleEpoch
+          || !sameSyncScope(current.scope, input.scope)
+        ) throw staleCommit;
+        const applied = applyPathIdentityFolderSpellingReviewsV2(
+          current,
+          reviews,
+          confirmedAt,
+        );
+        if (
+          !applied
+          || applied.envelope.meta.commitSeq !== preview.envelope.meta.commitSeq
+        ) throw staleCommit;
+        return applied.envelope;
+      });
+    } catch (error) {
+      if (error === staleCommit) {
+        return {
+          status: "blocked",
+          converged: 0,
+          folderAnchors: 0,
+          fileAnchors: 0,
+          reason: "facts-changed",
+        };
+      }
+      throw error;
+    }
+    return {
+      status: "accepted",
+      converged: reviews.length,
+      folderAnchors: preview.folderAnchors,
+      fileAnchors: preview.fileAnchors,
+    };
   }
 
   /**
@@ -9504,10 +10042,7 @@ export class StateManager {
         "V2 migration hold cannot commit after the public 1.1.3 input changed",
       );
     }
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     await this.reconcilePreManifestMigrationArtifacts({
       candidate: hold.candidate,
       source,
@@ -9975,10 +10510,7 @@ export class StateManager {
     await this.assertV2CorruptStateRecoverySourceCurrent(
       source.sourceDigest,
     );
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const adapter = this.plugin.app.vault.adapter;
     const committed =
       `${paths.stateV2CorruptSourcePrefix}${source.sourceDigest}.json`;
@@ -10060,10 +10592,7 @@ export class StateManager {
     if (!source || source.sourceDigest !== sourceDigest) {
       throw new Error("V2 corrupt-state recovery source changed");
     }
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const raw = await this.plugin.app.vault.adapter.read(paths.stateV2File);
     if (
       raw !== source.rawEnvelope
@@ -10217,10 +10746,7 @@ export class StateManager {
       await this.assertV2CorruptStateRecoverySourceCurrent(
         hold.sourceDigest,
       );
-      const paths = getEasySyncPaths(
-        this.plugin.app.vault,
-        this.plugin.manifest.id,
-      );
+      const paths = this.bookPaths();
       const manifest = await readStateV2Manifest(
         this.plugin.app.vault.adapter,
         paths.stateV2ManifestFile,
@@ -10357,10 +10883,7 @@ export class StateManager {
    * 找回来。没有信封、没有绑定、或绑定没有 id 时返回 undefined。
    */
   remoteIdForPath(path: string): string | undefined {
-    const normalized = path.normalize("NFC");
-    return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
-      (anchor) => anchor.lastPath.normalize("NFC") === normalized,
-    )?.remoteId;
+    return this.committedAnchorAtPath(path)?.remoteId;
   }
 
   /**
@@ -10371,10 +10894,7 @@ export class StateManager {
   baselineFactsForPath(
     path: string,
   ): { hash: string; size: number; at: number } | undefined {
-    const normalized = path.normalize("NFC");
-    const anchor = Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
-      (entry) => entry.lastPath.normalize("NFC") === normalized,
-    );
+    const anchor = this.committedAnchorAtPath(path);
     if (!anchor) return undefined;
     return {
       hash: anchor.contentHash,
@@ -10390,10 +10910,7 @@ export class StateManager {
    * 就是库里当前那份。无信封、无该路径锚点、或锚点没有 eTag 时 undefined。
    */
   remoteETagForPath(path: string): string | undefined {
-    const normalized = path.normalize("NFC");
-    return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
-      (anchor) => anchor.lastPath.normalize("NFC") === normalized,
-    )?.remoteETag;
+    return this.committedAnchorAtPath(path)?.remoteETag;
   }
 
   /**
@@ -10403,10 +10920,27 @@ export class StateManager {
    * 无信封、无该路径锚点、或锚点没有 cTag 时 undefined。
    */
   remoteCTagForPath(path: string): string | undefined {
-    const normalized = path.normalize("NFC");
-    return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
-      (anchor) => anchor.lastPath.normalize("NFC") === normalized,
-    )?.remoteCTag;
+    return this.committedAnchorAtPath(path)?.remoteCTag;
+  }
+
+  /** First committed anchor whose NFC path equals the requested path, with
+   *  the same first-match semantics as the old per-call `Object.values(...)
+   *  .find(...)`. The lookup is built once per envelope generation: a
+   *  reviewed delete wave asks per file, and rescanning every anchor each time
+   *  made a large wave O(files × anchors) host CPU. */
+  private committedAnchorAtPath(path: string): SyncAnchorV2 | undefined {
+    const envelope = this.v2Envelope;
+    if (!envelope) return undefined;
+    if (this.anchorPathLookup?.envelope !== envelope) {
+      const byPath = new Map<string, SyncAnchorV2>();
+      for (const anchor of Object.values(envelope.anchors.byAnchorId)) {
+        const key = anchor.lastPath.normalize("NFC");
+        // First match wins, exactly like `Object.values(...).find(...)`.
+        if (!byPath.has(key)) byPath.set(key, anchor);
+      }
+      this.anchorPathLookup = { envelope, byPath };
+    }
+    return this.anchorPathLookup.byPath.get(path.normalize("NFC"));
   }
 
   /**
@@ -10548,7 +11082,7 @@ export class StateManager {
       ) {
         throw new Error("V2 protocol binding upgrade has durable mutation recovery");
       }
-      const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
+      const paths = this.bookPaths();
       const manifest = await readStateV2Manifest(
         this.plugin.app.vault.adapter,
         paths.stateV2ManifestFile,
@@ -10760,12 +11294,34 @@ export class StateManager {
   }
 
   async addSyncHistory(entry: SyncHistoryEntry): Promise<void> {
-    const { skipPaths: rawSkipPaths, ...rest } = entry;
+    const {
+      skipPaths: rawSkipPaths,
+      excludedFolders: rawExcludedFolders,
+      excludedFoldersTotal: rawExcludedFoldersTotal,
+      ...rest
+    } = entry;
     const skipPaths = normalizeHistorySkipPaths(rawSkipPaths);
+    const excludedFolders = normalizeHistoryExcludedFolders(rawExcludedFolders);
+    const excludedFoldersTotal = Math.max(
+      excludedFolders.total,
+      typeof rawExcludedFoldersTotal === "number"
+        && Number.isFinite(rawExcludedFoldersTotal)
+        && rawExcludedFoldersTotal > 0
+        ? Math.trunc(rawExcludedFoldersTotal)
+        : 0,
+    );
     const normalized = {
       ...rest,
       files: retainFileProgress(entry.files),
       ...(skipPaths.length > 0 ? { skipPaths } : {}),
+      ...(excludedFolders.paths.length > 0
+        ? {
+            excludedFolders: excludedFolders.paths,
+            ...(excludedFoldersTotal > excludedFolders.paths.length
+              ? { excludedFoldersTotal }
+              : {}),
+          }
+        : {}),
     };
     await this.save((current) => ({
       ...current,
@@ -10804,10 +11360,7 @@ export class StateManager {
     // An in-flight deletion-ledger append must not recreate the sidecar after
     // the artifact cleanup below deletes it.
     await this.deletionLedgerWriteQueue.catch(() => undefined);
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const adapter = this.plugin.app.vault.adapter;
     if (await new LocalRecoveryJournal(adapter, paths.tmpDir).hasPendingRecovery()) {
       throw new ConservativeResetBlockedError(
@@ -10952,10 +11505,7 @@ export class StateManager {
         "Cannot conservatively reset without mutation recovery evidence",
       );
     }
-    const paths = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
+    const paths = this.bookPaths();
     const adapter = this.plugin.app.vault.adapter;
     if (await new LocalRecoveryJournal(
       adapter,
@@ -11939,7 +12489,7 @@ function parseLocalFolderMoveHints(value: unknown): LocalFolderMoveHintV1[] {
     const hint = raw as Partial<LocalFolderMoveHintV1>;
     if (
       hint.version !== 1
-      || !isSyncScope(hint.scope)
+      || !isCachedSyncScope(hint.scope)
       || typeof hint.remoteId !== "string"
       || hint.remoteId.length === 0
       || !isVaultRelativeMutationPath(hint.fromPath)
@@ -11977,7 +12527,7 @@ function parseLocalFolderDeleteHints(value: unknown): LocalFolderDeleteHintV1[] 
     const hint = raw as Partial<LocalFolderDeleteHintV1>;
     if (
       hint.version !== 1
-      || !isSyncScope(hint.scope)
+      || !isCachedSyncScope(hint.scope)
       || typeof hint.remoteId !== "string"
       || hint.remoteId.length === 0
       || !isVaultRelativeMutationPath(hint.path)
@@ -12048,7 +12598,7 @@ function readConfirmedDescendantFileReconstructionCheckpointV1(
   if (
     candidate.version !== 1
     || candidate.kind !== "confirmed-descendant-file-reconstruction"
-    || !isSyncScope(candidate.scope)
+    || !isCachedSyncScope(candidate.scope)
     || !Number.isSafeInteger(candidate.lifecycleEpoch)
     || Number(candidate.lifecycleEpoch) < 1
     || !Number.isSafeInteger(candidate.sourceCommitSeq)
@@ -12100,7 +12650,7 @@ function parseRemoteState(value: unknown): RemoteSyncState | null {
   if (state.version !== 1) return null;
   if (typeof state.generation !== "number") (state as Record<string, unknown>).generation = 0;
   const rawScope = (state).scope;
-  if (rawScope !== undefined && rawScope !== null && !isSyncScope(rawScope)) return null;
+  if (rawScope !== undefined && rawScope !== null && !isCachedSyncScope(rawScope)) return null;
   if (state.deltaLink !== null && typeof state.deltaLink !== "string") return null;
   if (!state.entries || typeof state.entries !== "object" || Array.isArray(state.entries)) {
     return null;
@@ -12152,7 +12702,7 @@ function parseCanonicalPlanIdentityV2(
     || Number(value.sourceCommitSeq) < 0
     || typeof value.digest !== "string"
     || value.digest.length === 0
-    || !isSyncScope(value.scope)
+    || !isCachedSyncScope(value.scope)
   ) return null;
   return {
     version: 3,
@@ -12162,13 +12712,34 @@ function parseCanonicalPlanIdentityV2(
   };
 }
 
-function isSyncScope(value: unknown): value is SyncScope {
+/**
+ * 设备缓存／恢复账本里的历史 scope 判据。
+ *
+ * public 1.1.3 升级、mutation ledger 与 bootstrap fallback 路径会保留
+ * `accountId` 为空串的历史 scope；它们不是 envelope/authority 身份，不能用
+ * 中央严格 `isSyncScope`（要求四元非空）判 corrupt。这里刻意保留原宽松
+ * 语义（四元只要求 string，允许空串），同时补 S0 新字段校验：新字段若存在
+ * 仍必须是合法值，非法 providerKind／非 string 字段继续被拒绝。
+ */
+function isCachedSyncScope(value: unknown): value is SyncScope {
   if (!value || typeof value !== "object") return false;
   const scope = value as Partial<SyncScope>;
   return typeof scope.accountId === "string"
     && typeof scope.driveId === "string"
     && typeof scope.vaultFolderId === "string"
-    && typeof scope.filesRootId === "string";
+    && typeof scope.filesRootId === "string"
+    && (scope.providerKind === undefined
+      || scope.providerKind === "onedrive"
+      || scope.providerKind === "s3"
+      || scope.providerKind === "webdav")
+    && optionalCachedScopeString(scope.endpointId)
+    && optionalCachedScopeString(scope.containerId)
+    && optionalCachedScopeString(scope.rootPath)
+    && optionalCachedScopeString(scope.credentialBindingId);
+}
+
+function optionalCachedScopeString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
 }
 
 function parseMutationLedger(value: unknown): MutationLedgerEntryV1[] {
@@ -12277,7 +12848,7 @@ function isMutationRecoveryQuarantineEntryV2(
     && value.reason === "receipted-upload-version-unreachable"
     && typeof value.quarantinedAt === "number"
     && Number.isFinite(value.quarantinedAt)
-    && isSyncScope(value.scope)
+    && isCachedSyncScope(value.scope)
     && Number.isSafeInteger(value.sourceCommitSeq)
     && Number(value.sourceCommitSeq) >= 1
     && typeof value.remoteId === "string"
@@ -12555,7 +13126,7 @@ function isSyncDecisionToken(value: unknown): value is SyncDecisionToken {
   return value.version === 1
     && typeof value.vaultName === "string"
     && typeof value.accountId === "string"
-    && isSyncScope(value.scope)
+    && isCachedSyncScope(value.scope)
     && (value.ancestorHash === null || typeof value.ancestorHash === "string")
     && (local.exists === false || (
       local.exists === true
@@ -12786,7 +13357,7 @@ function isMutationIntent(
     const needsIdentity = folderIntent.action !== "createRemoteFolder";
     return typeof folderIntent.operationId === "string"
       && Number.isSafeInteger(folderIntent.planRevision)
-      && isSyncScope(folderIntent.scope)
+      && isCachedSyncScope(folderIntent.scope)
       && isVaultRelativeMutationPath(folderIntent.path)
       && (!isMove || isVaultRelativeMutationPath(folderIntent.sourcePath))
       && (!needsIdentity || typeof folderIntent.folderId === "string")
@@ -12816,7 +13387,7 @@ function isMutationIntent(
   return fileIntent.version === 1
     && typeof fileIntent.operationId === "string"
     && Number.isSafeInteger(fileIntent.planRevision)
-    && isSyncScope(fileIntent.scope)
+    && isCachedSyncScope(fileIntent.scope)
     && (fileIntent.action === "upload"
       || fileIntent.action === "download"
       || fileIntent.action === "deleteRemote"
@@ -13094,7 +13665,7 @@ function readSyncScopeExpansionMarkerV1(
     || typeof value.targetSettingsFingerprint !== "string"
     || value.targetSettingsFingerprint.length === 0
     || !isRecord(value.source)
-    || !isSyncScope(value.source.scope)
+    || !isCachedSyncScope(value.source.scope)
     || !Number.isSafeInteger(value.source.commitSeq)
     || Number(value.source.commitSeq) < 1
     || !Number.isSafeInteger(value.source.lifecycleEpoch)
@@ -13417,6 +13988,62 @@ function clearPlanReviewData(current: PluginData): PluginData {
     [KEY_PLAN_REVIEW_SCOPE]: null,
     [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: null,
   };
+}
+
+/** Apply every reviewed path-identity re-claim in order; any rejection voids
+ *  the whole batch so a later root never commits alone. */
+function applyPathIdentityFolderSpellingReviewsV2(
+  envelope: SyncStateEnvelopeV2,
+  reviews: readonly PathIdentityFolderSpellingConvergenceV2[],
+  confirmedAt: number,
+): {
+  envelope: SyncStateEnvelopeV2;
+  folderAnchors: number;
+  fileAnchors: number;
+} | null {
+  let current = envelope;
+  let folderAnchors = 0;
+  let fileAnchors = 0;
+  for (const review of reviews) {
+    const applied = applyPathIdentityFolderSpellingConvergenceV2(
+      current,
+      review,
+      confirmedAt,
+    );
+    if (applied.status !== "accepted") return null;
+    current = applied.envelope;
+    folderAnchors += applied.convergedFolderAnchors;
+    fileAnchors += applied.convergedFileAnchors;
+  }
+  return { envelope: current, folderAnchors, fileAnchors };
+}
+
+/** Apply every reviewed spelling convergence in order; any rejection voids
+ *  the whole batch so a later root never commits alone. */
+function applyConvergedFolderSpellingReviewsV2(
+  envelope: SyncStateEnvelopeV2,
+  reviews: readonly ConvergedFolderAnchorSpellingV2[],
+  confirmedAt: number,
+): {
+  envelope: SyncStateEnvelopeV2;
+  folderAnchors: number;
+  fileAnchors: number;
+} | null {
+  let current = envelope;
+  let folderAnchors = 0;
+  let fileAnchors = 0;
+  for (const review of reviews) {
+    const applied = applyConvergedFolderAnchorSpellingV2(
+      current,
+      review,
+      confirmedAt,
+    );
+    if (applied.status !== "accepted") return null;
+    current = applied.envelope;
+    folderAnchors += applied.convergedFolderAnchors;
+    fileAnchors += applied.convergedFileAnchors;
+  }
+  return { envelope: current, folderAnchors, fileAnchors };
 }
 
 function samePendingIssues(left: PendingIssue[], right: PendingIssue[]): boolean {

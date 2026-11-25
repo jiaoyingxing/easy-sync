@@ -658,6 +658,61 @@ describe("community plugin inventory", () => {
     });
   });
 
+  it("marks only a local bundle with both manifest and main.js complete", async () => {
+    const files = new Map<string, string>([
+      [".obsidian/plugins/complete/manifest.json", JSON.stringify({
+        id: "complete",
+        name: "Complete",
+        version: "2.0.0",
+        isDesktopOnly: true,
+      })],
+      [".obsidian/plugins/partial/manifest.json", JSON.stringify({
+        id: "partial",
+        name: "Partial",
+        version: "2.0.0",
+        isDesktopOnly: true,
+      })],
+    ]);
+    const adapter = {
+      exists: vi.fn(async (path: string) =>
+        path === ".obsidian/plugins"
+        || files.has(path)
+        || path === ".obsidian/plugins/complete/main.js"
+      ),
+      list: vi.fn(async () => ({
+        files: [],
+        folders: [
+          ".obsidian/plugins/complete",
+          ".obsidian/plugins/partial",
+        ],
+      })),
+      read: vi.fn(async (path: string) => {
+        const value = files.get(path);
+        if (value === undefined) throw new Error("missing");
+        return value;
+      }),
+    } as unknown as DataAdapter;
+
+    const result = await buildCommunityPluginInventory(
+      adapter,
+      ".obsidian",
+      "easy-sync",
+    );
+    const complete = result.find((item) => item.id === "complete");
+    const partial = result.find((item) => item.id === "partial");
+
+    expect(complete).toMatchObject({
+      local: true,
+      desktopOnly: true,
+      localBundleComplete: true,
+    });
+    expect(partial).toMatchObject({
+      local: true,
+      desktopOnly: true,
+    });
+    expect(partial).not.toHaveProperty("localBundleComplete");
+  });
+
   it("fails closed when the local plugin folder cannot be listed", async () => {
     const adapter = {
       exists: vi.fn(async () => true),

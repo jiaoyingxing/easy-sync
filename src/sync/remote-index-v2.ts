@@ -1,4 +1,4 @@
-import type { DriveItem } from "../onedrive/types";
+import type { RemoteScanFactV1 } from "./remote-facts-adapter";
 import type {
   ContentVersionToken,
   ExternalItemId,
@@ -144,30 +144,30 @@ export function isAnchoredDescendantV2(path: string, root: string): boolean {
 
 /** Build and validate a staging identity index. No state is published here. */
 export function buildRemoteIndexV2(
-  items: DriveItem[],
+  items: readonly RemoteScanFactV1[],
   filesRootId: string,
   deltaLink: string | null,
   cursorRevision = 0,
 ): RemoteIndexProjectionV2 {
-  const latest = new Map<string, DriveItem>();
+  const latest = new Map<string, RemoteScanFactV1>();
   for (const item of items) latest.set(item.id, item);
   const nodes = new Map<string, RemoteNodeV2>();
   for (const item of latest.values()) {
     if (item.deleted) continue;
-    if (!item.id || !item.name || !item.parentReference?.id || (!item.file && !item.folder)) {
+    if (!item.id || !item.name || !item.parentId || !item.kind) {
       throw new Error(`Remote identity incomplete: ${item.id}`);
     }
     nodes.set(item.id, {
       id: item.id,
-      parentId: item.parentReference.id,
+      parentId: item.parentId,
       name: item.name,
-      kind: item.folder ? "folder" : "file",
+      kind: item.kind,
       eTag: item.eTag,
       cTag: item.cTag,
       size: item.size,
-      mtime: item.lastModifiedDateTime ? new Date(item.lastModifiedDateTime).getTime() : undefined,
-      contentHash: item.file?.hashes?.sha256Hash?.toLowerCase(),
-      quickXorHash: item.file?.hashes?.quickXorHash,
+      mtime: item.mtime,
+      contentHash: item.contentHash,
+      quickXorHash: item.quickXorHash,
     });
   }
 

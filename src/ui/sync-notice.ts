@@ -5,6 +5,7 @@ import {
   resolveSyncPendingAttentionCounts,
 } from "./sync-result-presentation";
 import {
+  resolveRoundProgressCurrent,
   syncProgressPercent,
   type FileProgress,
   type RemoteScopeRecoveryVerificationProgress,
@@ -12,9 +13,12 @@ import {
 } from "../sync/sync-progress";
 import type { EasySyncNoticeMessage } from "./notice-center";
 import {
-  resolveSyncActivityPresentation,
-  trimSyncActivityLabel,
+  resolveSyncActivityMetric,
+  resolveVisibleSyncActivityPresentation,
   translateSyncActivity,
+  translateSyncActivityMetric,
+  trimSyncActivityLabel,
+  type SyncActivityMetric,
   type SyncActivityPresentation,
   type SyncStatusTranslator,
 } from "./sync-status-presentation";
@@ -55,6 +59,8 @@ type SyncProgressNoticeKind =
 interface SyncProgressNoticePresentation {
   kind: SyncProgressNoticeKind;
   activity: SyncActivityPresentation;
+  /** Stage-count reading for the same single text slot; never sets a bar. */
+  metric?: SyncActivityMetric;
   showProgressBar: boolean;
   determinate: boolean;
   percent: number;
@@ -65,8 +71,15 @@ interface SyncProgressNoticePresentation {
 
 export function resolveSyncProgressNoticePresentation(
   progress: Readonly<SyncProgressState>,
+  now = Date.now(),
+  activityOverride?: SyncActivityPresentation,
 ): SyncProgressNoticePresentation {
-  const activity = resolveSyncActivityPresentation(progress);
+  const activity = activityOverride
+    ?? resolveVisibleSyncActivityPresentation(progress, now);
+  const activityMetric = resolveSyncActivityMetric(progress, now);
+  // The notice has one text slot. Only a real stage count joins the stage
+  // phrase; elapsed time stays in the sidebar counter (no extra 1s tick).
+  const metric = activityMetric?.kind === "count" ? activityMetric : undefined;
   const recoveryVerification = progress.recoveryVerification;
   const recoveryCurrent = recoveryVerification
     ? recoveryVerification.reused + recoveryVerification.verifiedThisRun
@@ -74,7 +87,9 @@ export function resolveSyncProgressNoticePresentation(
   const recoveryDeterminate = Boolean(
     recoveryVerification && recoveryVerification.total > 0,
   );
-  const current = recoveryDeterminate ? recoveryCurrent : progress.current;
+  const current = recoveryDeterminate
+    ? recoveryCurrent
+    : resolveRoundProgressCurrent(progress);
   const total = recoveryDeterminate
     ? recoveryVerification!.total
     : progress.total;
@@ -103,6 +118,7 @@ export function resolveSyncProgressNoticePresentation(
   return {
     kind,
     activity,
+    ...(metric ? { metric } : {}),
     // Pre-execution stages currently expose status only. Show the bar only
     // after verification or file execution provides a concrete item total.
     showProgressBar: determinate
@@ -150,10 +166,18 @@ export function formatSyncProgressNoticeLabel(
         current: presentation.current,
         total: presentation.total,
       });
-    case "stage":
+    case "stage": {
+      const stage = translateSyncActivity(presentation.activity, t);
+      if (presentation.metric) {
+        return t("notice.sync.stageMetric", {
+          stage: trimSyncActivityLabel(stage),
+          metric: translateSyncActivityMetric(presentation.metric, t),
+        });
+      }
       return t("notice.sync.stage", {
-        stage: translateSyncActivity(presentation.activity, t),
+        stage,
       });
+    }
     case "starting":
     default:
       return t("notice.sync.start");

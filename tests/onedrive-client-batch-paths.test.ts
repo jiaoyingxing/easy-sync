@@ -118,3 +118,90 @@ describe("OneDriveClient.getFileMetadataByPaths", () => {
     expect(requestSpy).toHaveBeenCalledTimes(batchPosts);
   });
 });
+
+describe("OneDriveClient.delete-wave absence proof chunk lanes (2026-11-19)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reads four 20-path chunks beside each other when the caller asks for lanes", async () => {
+    const paths = Array.from({ length: 64 }, (_unused, index) => `wave-${index}.md`);
+    let active = 0;
+    let peak = 0;
+    let posts = 0;
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(
+      async (request) => {
+        const body = JSON.parse(request.body as string) as {
+          requests: Array<{ id: string; url: string }>;
+        };
+        posts++;
+        active++;
+        peak = Math.max(peak, active);
+        // Hold the POST long enough for a second lane to overlap it.
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        active--;
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            responses: body.requests.map((entry) => ({
+              id: entry.id,
+              status: 200,
+              headers: {},
+              body: { id: entry.url, name: entry.url, file: {} },
+            })),
+          },
+        };
+      },
+    );
+    const client = new OneDriveClient(async () => "token");
+
+    const result = await client.getFileMetadataByPaths(
+      "testVault",
+      paths,
+      "other",
+      { chunkConcurrency: 2 },
+    );
+
+    expect(posts).toBe(4);
+    expect(peak).toBe(2);
+    expect(result.size).toBe(paths.length);
+    for (const path of paths) {
+      expect(result.get(path)).toMatchObject({ name: expect.any(String) });
+    }
+    expect(requestSpy).toHaveBeenCalledTimes(posts);
+  });
+
+  it("keeps the default serial chunk order when no lanes are requested", async () => {
+    const paths = Array.from({ length: 45 }, (_unused, index) => `serial-${index}.md`);
+    let active = 0;
+    let peak = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (request) => {
+      const body = JSON.parse(request.body as string) as {
+        requests: Array<{ id: string; url: string }>;
+      };
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active--;
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          responses: body.requests.map((entry) => ({
+            id: entry.id,
+            status: 200,
+            headers: {},
+            body: { id: entry.url, name: entry.url, file: {} },
+          })),
+        },
+      };
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    const result = await client.getFileMetadataByPaths("testVault", paths);
+
+    expect(peak).toBe(1);
+    expect(result.size).toBe(paths.length);
+  });
+});

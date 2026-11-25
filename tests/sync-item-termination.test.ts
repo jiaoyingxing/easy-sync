@@ -184,6 +184,33 @@ describe("S4 blocked-item disposition resolution", () => {
     })).toBe("retryable-external");
   });
 
+  it("treats exit-less community-plugin identity blocks as external waits", () => {
+    // 2026-11-23: these rows wait on a fact the user owns outside EasySync
+    // (repair the manifest / remove one duplicate directory / make one side
+    // the same plugin). Nothing about this build is missing, so they must
+    // never become the "report it to the author" diagnosis.
+    for (const issueCode of [
+      "plugin-manifest-invalid",
+      "plugin-identity-collision",
+      "plugin-identity-drift",
+    ] as const) {
+      expect(resolvePendingIssueDisposition({
+        issueCode,
+        actionType: SyncActionType.Upload,
+        reason: "插件本机与云端的身份不一致：calendar",
+        hasRenderableExit: false,
+      })).toBe("retryable-external");
+    }
+    // Reverse control: an ordinary exit-less content failure keeps its
+    // non-retryable diagnosis.
+    expect(resolvePendingIssueDisposition({
+      issueCode: undefined,
+      actionType: SyncActionType.Upload,
+      reason: "ordinary failure",
+      hasRenderableExit: false,
+    })).toBe("non-retryable");
+  });
+
   it("treats by-design skip rows and exit-bearing rows as non-judged endings", () => {
     for (const actionType of [
       SyncActionType.SkipLargeFile,

@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import type { DataAdapter } from "obsidian";
 import {
   StateEnvelopeV2Store,
+  stateV2EnvelopeHeader,
   type StateEnvelopeV2Paths,
   type SyncStateEnvelopeV2,
 } from "../src/sync/state-envelope-v2";
+import { stateV2IndexedDbRecoveryEnvelopeDigest } from "../src/sync/state-v2-indexeddb-recovery";
 
 const paths: StateEnvelopeV2Paths = {
   committed: "plugin/state-v2.json",
@@ -1273,5 +1275,72 @@ describe("StateEnvelopeV2Store", () => {
     const candidate = envelope();
     candidate.remoteIndex.filesRootId = candidate.scope.vaultFolderId;
     await expect(store.publish(candidate)).rejects.toThrow("remote index");
+  });
+});
+
+describe("S0 legacy envelope byte stability", () => {
+  it("loads a legacy four-field envelope and re-serializes it byte-for-byte", async () => {
+    const { adapter, files } = makeAdapter();
+    const candidate = envelope(7);
+    const raw = JSON.stringify(candidate);
+    files.set(paths.committed, raw);
+    const store = new StateEnvelopeV2Store(adapter, paths);
+
+    const loaded = await store.load(candidate.scope);
+
+    expect(loaded).not.toBeNull();
+    expect(JSON.stringify(loaded)).toBe(raw);
+    expect(Object.keys(loaded!.scope)).toEqual([
+      "accountId",
+      "driveId",
+      "vaultFolderId",
+      "filesRootId",
+    ]);
+    expect("providerKind" in loaded!.scope).toBe(false);
+    expect("endpointId" in loaded!.scope).toBe(false);
+    expect("containerId" in loaded!.scope).toBe(false);
+    expect("rootPath" in loaded!.scope).toBe(false);
+    expect("credentialBindingId" in loaded!.scope).toBe(false);
+  });
+
+  it("keeps the IndexedDB authoritative digest for a legacy envelope", async () => {
+    // Golden value recorded from the pre-change HEAD implementation; it must
+    // not be regenerated from the changed code.
+    const value = envelope(7);
+    expect(await stateV2IndexedDbRecoveryEnvelopeDigest(value))
+      .toBe("185ae25be391fc5df48a5f250267d52603c8983226e1733fcb66de6d2464083c");
+    expect(stateV2EnvelopeHeader(value).scope).toEqual({
+      accountId: "account",
+      driveId: "drive",
+      vaultFolderId: "vault",
+      filesRootId: "root",
+    });
+    expect(Object.keys(stateV2EnvelopeHeader(value).scope)).toEqual([
+      "accountId",
+      "driveId",
+      "vaultFolderId",
+      "filesRootId",
+    ]);
+  });
+
+  it("round-trips an envelope with explicit provider fields without touching legacy fields", async () => {
+    const { adapter, files } = makeAdapter();
+    const store = new StateEnvelopeV2Store(adapter, paths);
+    const candidate = envelope();
+    candidate.scope = {
+      ...candidate.scope,
+      providerKind: "s3",
+      endpointId: "https://s3.example.com|us-east-1",
+      containerId: "drive",
+      rootPath: "root",
+      credentialBindingId: "account",
+    };
+
+    await store.publish(candidate);
+
+    expect(files.get(paths.committed)).toBe(JSON.stringify(candidate));
+    const loaded = await store.load(candidate.scope);
+    expect(loaded!.scope).toEqual(candidate.scope);
+    expect(JSON.stringify(loaded)).toBe(JSON.stringify(candidate));
   });
 });

@@ -36,12 +36,19 @@ import {
 import {
   type FileProgress,
   isAnySyncActivityRunning,
+  isPreExecutionSyncPhase,
   isSuccessfulFileProgress,
+  resolveRoundProgressCurrent,
   type RemoteScopeRecoveryVerificationProgress,
   type SyncProgressState,
 } from "../sync/sync-progress";
-import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
+import type {
+  PendingIssue,
+  SyncHistoryEntry,
+  SyncHistoryStatus,
+} from "../sync/state-manager";
 import {
+  collectHistoryExcludedFolders,
   isConfigurationSkipAction,
   normalizeHistorySkipPaths,
 } from "../sync/skip-baseline";
@@ -53,8 +60,10 @@ import {
 } from "../sync/sync-item-termination";
 import {
   formatTransferRate,
-  type TransferRateReading,
+  transferRateLevel,
+  type TransferSignalLevel,
 } from "../sync/transfer-rate";
+import { lanTransferPhaseIcon } from "../sync/lan-transfer-activity";
 import { ConfirmModal } from "./confirm-modal";
 import { applyDestructiveButton } from "./destructive-button";
 import { formatFileSize } from "./file-comparison-modal";
@@ -68,7 +77,7 @@ import {
   type RibbonStatus,
 } from "./ribbon-status";
 import {
-  handleAuthEntryAction,
+  handleSidebarAuthEntry,
   resolveAuthEntryPresentation,
 } from "./auth-entry-flow";
 import {
@@ -87,9 +96,19 @@ import { isObsidianManagedConfigPath } from "../sync/file-decision-planner-v2";
 import type { ManualResolutionEntryReason } from "../sync/manual-resolution-entry";
 import { resolveManualResolutionNotice } from "./manual-resolution-presentation";
 import {
-  resolveSyncActivityPresentation,
+  resolveSyncActivityMetric,
+  resolveSyncActivityMetricAria,
+  resolveSyncActivityRevealDelay,
+  SyncActivityRevealer,
   translateSyncActivity,
+  translateSyncActivityMetric,
+  trimSyncActivityLabel,
 } from "./sync-status-presentation";
+import {
+  formatUserClockTime,
+  formatUserDateTime,
+  formatUserDateTimeFull,
+} from "./user-time-format";
 
 interface StatusPanelState {
   isLoggedIn: boolean;
@@ -179,6 +198,27 @@ export function resolveSyncViewBodyMode(input: {
 }
 
 /**
+ * 失败／部分完成且正文为空时，用户再次点「立即同步」说明他不知道上次发生了
+ * 什么。这一次先把同步历史打开并展开那一轮；历史已经打开时不干预——用户
+ * 已经知道入口与展开方式，不再替他做决定。
+ *
+ * `autoSyncPaused` 是顶部出现「失败／部分完成」的前提：正文空闲时没有待处理、
+ * 计划或恢复项，`resolveRibbonStatus` 的 attention 只能由自动同步暂停提供。
+ */
+export function shouldRevealHistoryOnRetry(input: {
+  historyExpanded: boolean;
+  bodyMode: SyncViewBodyMode;
+  autoSyncPaused: boolean;
+  latestHistoryStatus?: SyncHistoryStatus;
+}): boolean {
+  if (input.historyExpanded) return false;
+  if (input.bodyMode !== "idle") return false;
+  if (!input.autoSyncPaused) return false;
+  return input.latestHistoryStatus === "failed"
+    || input.latestHistoryStatus === "partial";
+}
+
+/**
  * Which bodies mount the progress panel (bar + completed list).
  *
  * The body mode answers "who owns the clickable rows"; it must not double as
@@ -220,6 +260,10 @@ export function resolveSyncViewPrimaryAction(input: {
   isLoggedIn: boolean;
   isRunning: boolean;
   canCancel: boolean;
+  /** The user already requested cancellation and the executor is draining.
+   *  The status line says "正在取消…"; the primary action must stop offering
+   *  a second cancel and become the disabled processing state. */
+  cancelling: boolean;
   planReviewActive: boolean;
   planReviewDetailsState: "ready" | "recovering" | "retry";
   reviewKind: string | null | undefined;
@@ -228,8 +272,17 @@ export function resolveSyncViewPrimaryAction(input: {
   isPending: boolean;
   devicePending: boolean;
 }): SyncViewPrimaryActionKind {
+  if (input.isLoggedIn && input.cancelling) return { kind: "processing" };
   if (input.isLoggedIn && input.isRunning && input.canCancel) return { kind: "cancel" };
   if (input.isLoggedIn && input.isRunning) return { kind: "processing" };
+  // A recovery record with a real manual review action is the blocker that
+  // keeps this plan from executing. Expose its existing review button before
+  // the plan confirm so the only exit is not hidden behind the plan body.
+  // This reuses the same primary-action slot and the same "review contents"
+  // copy the recovery section already owns.
+  if (input.isLoggedIn && input.recoveryActionKey) {
+    return { kind: "recovery", actionKey: input.recoveryActionKey };
+  }
   if (input.isLoggedIn && input.planReviewActive) {
     if (input.planReviewDetailsState !== "ready") {
       return {
@@ -238,9 +291,6 @@ export function resolveSyncViewPrimaryAction(input: {
       };
     }
     return { kind: "plan-review-confirm", migration: input.reviewKind === "v2-migration" };
-  }
-  if (input.isLoggedIn && input.recoveryActionKey) {
-    return { kind: "recovery", actionKey: input.recoveryActionKey };
   }
   if (input.isLoggedIn) {
     return { kind: "sync-now" };
@@ -1599,6 +1649,22 @@ export function groupBundleConflictReviews(
 
 export const SYNC_VIEW_TYPE = "easy-sync-detail";
 
+/** Whether the sidebar's 1 Hz live sampler has anything to observe right now.
+ *  A running round/side action, a cloud reading inside its freshness window,
+ *  or a LAN transfer actually moving bytes needs the cadence; an idle view or
+ *  a connected-but-silent LAN session does not (phase changes refresh it
+ *  directly), so an open-but-idle sidebar can leave the host timer list
+ *  alone. */
+export function shouldRunSyncViewLiveTicker(
+  progress: Readonly<SyncProgressState>,
+  fullSyncRunning: boolean,
+  sideActionRunning: boolean,
+  hasLiveTransferSignal: boolean,
+): boolean {
+  return isAnySyncActivityRunning(progress, fullSyncRunning, sideActionRunning)
+    || hasLiveTransferSignal;
+}
+
 export function buildSyncViewContentKey(
   historyExpanded: boolean,
   input: SyncViewContentKeyInput,
@@ -1619,9 +1685,13 @@ export function buildSyncViewContentKey(
     const scopeRecoveryKey = scopeRecovery
       ? `${scopeRecovery.operationFingerprint}:${scopeRecovery.protocolPreflight}:${scopeRecovery.total}:${scopeRecovery.verifiedThisRun}:${scopeRecovery.reused}:${scopeRecovery.invalidated}:${scopeRecovery.remaining}:${scopeRecovery.failureStage ?? ""}:${scopeRecovery.firstFailurePath ?? ""}`
       : "";
+    // 文件夹排除快照属于当轮历史事实：出现/消失/内容变化都要触发整屏重建。
+    const excludedFoldersKey = entry.excludedFolders
+      ? `${entry.excludedFoldersTotal ?? entry.excludedFolders.length}:${entry.excludedFolders.join("|")}`
+      : "";
     return itemRecovery
-      ? `${entry.id}:${entry.status}:${messageKey}:${runFactsKey}:${itemRecovery.state}:${itemRecovery.total}:${itemRecovery.settled}:${itemRecovery.remaining}:${itemRecovery.retryAt ?? ""}:${itemRecovery.blockReason ?? ""}:${scopeRecoveryKey}`
-      : `${entry.id}:${entry.status}:${messageKey}:${runFactsKey}:${scopeRecoveryKey}`;
+      ? `${entry.id}:${entry.status}:${messageKey}:${runFactsKey}:${excludedFoldersKey}:${itemRecovery.state}:${itemRecovery.total}:${itemRecovery.settled}:${itemRecovery.remaining}:${itemRecovery.retryAt ?? ""}:${itemRecovery.blockReason ?? ""}:${scopeRecoveryKey}`
+      : `${entry.id}:${entry.status}:${messageKey}:${runFactsKey}:${excludedFoldersKey}:${scopeRecoveryKey}`;
   }).join("|");
   const historyKey = historyExpanded ? `history:open:${historyIds}` : "history:closed";
   // 更新提示行（pending 区尾部、计划审阅与核对体态的内容尾部）都只在整屏
@@ -1695,7 +1765,10 @@ function formatByteProgress(downloaded: number, total: number): string {
 
 export function syncViewProgressPercent(state: Readonly<SyncProgressState>): number {
   if (state.total <= 0) return 0;
-  return Math.min(100, Math.round((state.current / state.total) * 100));
+  return Math.min(
+    100,
+    Math.round((resolveRoundProgressCurrent(state) / state.total) * 100),
+  );
 }
 
 function configureFilePath(
@@ -1736,6 +1809,19 @@ export function shouldExpandAllVisibleDetails(
   openStates: readonly boolean[],
 ): boolean {
   return openStates.some((open) => !open);
+}
+
+/**
+ * 工具栏「全部展开／折叠」只批量开合决策面（计划分组、决策行、恢复详情、
+ * 历史轮次）。结果折叠组「大型文件排除」不是决策项：每个历史轮次最多保留
+ * 200 条路径，一次全开会把历史区撑成数千行的路径墙（2026-11-17 用户反馈：
+ * 批量按钮把该组一起展开，反复点击后内容膨胀）。该组的开合只服从用户对它
+ * 自己的点击，不写会话级覆盖，也不参与按钮的「是否已全部展开」判定。
+ */
+export function isToolbarBulkToggleTarget(details: {
+  classList?: { contains(token: string): boolean };
+}): boolean {
+  return details.classList?.contains("easy-sync-history-skip-group") !== true;
 }
 
 /** Font identity used by the text-width cache. A font change invalidates the
@@ -1784,6 +1870,10 @@ interface AdaptivePathEntry {
 export class EasySyncSyncView extends ItemView {
   plugin: EasySyncPlugin;
   private historyExpanded = false;
+  /** 失败／部分完成空白态点「立即同步」时显式展开的历史轮；保持到用户收起。 */
+  private historyRevealEntryId: string | null = null;
+  /** 被用户亲手收起的轮次：默认展开规则在本次侧栏会话内不再把它弹开。 */
+  private historyRevealCollapsedIds = new Set<string>();
   private sessionOverride: SyncViewSessionOverride = "default";
   // 组级手势与行级同族：记录用户对单个分组的显式开合（默认展开的分组也必须
   // 记住用户收起过它，否则正文重建会让它弹开）。
@@ -1858,6 +1948,16 @@ export class EasySyncSyncView extends ItemView {
   private statusIconEl: HTMLElement | null = null;
   private statusTextEl: HTMLElement | null = null;
   private statusCounterEl: HTMLElement | null = null;
+  /** One-shot deadline for the current stage's reveal. */
+  private statusRevealTimer: number | null = null;
+  /** Demand-driven 1 Hz sampler. Armed only while a round/LAN session or a
+   *  fresh transfer reading exists; an idle open sidebar arms no timer. */
+  private liveTicker: number | null = null;
+  /** Keeps the last stable stage visible through a short next stage; null only
+   *  for object-created test views before the lazy getter runs. */
+  private statusRevealer: SyncActivityRevealer | null = null;
+  private lastStableRunningLabel: string | null = null;
+  private lastStableRunningStartedAt: number | null = null;
   private statusDetailEl: HTMLElement | null = null;
   private currentFileTextEl: HTMLElement | null = null;
   private currentByteProgressEl: HTMLElement | null = null;
@@ -1910,15 +2010,13 @@ export class EasySyncSyncView extends ItemView {
       this.scheduleTransferRateFooterPosition(),
     );
     // Live reading cadence: sample the run's cumulative transfer counters
-    // once a second and refresh the indicator in place (a no-op write when
-    // nothing changed). The sidebar drives the sampler — polling lives with
-    // the only consumer, so main stays interval-free.
-    this.registerInterval(
-      window.setInterval(() => {
-        this.plugin.pollTransferRateTick();
-        this.refreshTransferRateValue();
-      }, 1000),
-    );
+    // once a second, refresh the indicator in place, and re-evaluate the
+    // running stage phrase/counter as the reveal window's fallback driver.
+    // The ticker is demand-driven (see `syncLiveTicker`): an open but idle
+    // sidebar must not wake the host every second. Polling lives with the
+    // only consumer, so main stays interval-free.
+    this.register(() => this.stopLiveTicker());
+    this.syncLiveTicker();
     this.contentEl.addEventListener(
       "toggle",
       this.handlePathLayoutToggle,
@@ -1951,6 +2049,7 @@ export class EasySyncSyncView extends ItemView {
 
   async onClose(): Promise<void> {
     this.closed = true;
+    this.stopLiveTicker();
     if (this.renderFrameId !== null) {
       compatCancelAnimationFrame(this.renderFrameId);
       this.renderFrameId = null;
@@ -1966,6 +2065,10 @@ export class EasySyncSyncView extends ItemView {
     if (this.adaptivePathResizeTimer !== null) {
       window.clearTimeout(this.adaptivePathResizeTimer);
       this.adaptivePathResizeTimer = null;
+    }
+    if (this.statusRevealTimer !== null) {
+      window.clearTimeout(this.statusRevealTimer);
+      this.statusRevealTimer = null;
     }
     this.adaptivePathScrollScopes.clear();
     this.adaptivePathProbe?.remove();
@@ -2071,6 +2174,7 @@ export class EasySyncSyncView extends ItemView {
   render(): void {
     this.fullRenderPending = true;
     this.scheduleRenderFrame();
+    this.syncLiveTicker();
   }
 
   /**
@@ -2083,6 +2187,63 @@ export class EasySyncSyncView extends ItemView {
    */
   renderProgress(): void {
     this.scheduleRenderFrame();
+    this.syncLiveTicker();
+  }
+
+  /** LAN phase changes are rare and no longer have a 1 Hz fallback ticker to
+   *  pick them up: refresh the chip now and arm the demand-driven ticker if
+   *  the session (or its fresh reading) needs it. */
+  refreshTransferIndicator(): void {
+    if (this.closed) return;
+    this.syncLiveTicker();
+    this.refreshTransferRateValue();
+    this.refreshRunningPresentation();
+  }
+
+  /** Arm the 1 Hz live sampler only while it can observe something new: a
+   *  running round/side action, a LAN session, or a transfer reading that is
+   *  still inside its freshness window. The last tick disarms it, so an idle
+   *  open sidebar arms no recurring timer at all. */
+  private syncLiveTicker(): void {
+    if (this.closed) {
+      this.stopLiveTicker();
+      return;
+    }
+    if (this.liveTicker !== null) return;
+    if (!this.shouldRunLiveTicker()) return;
+    this.liveTicker = window.setInterval(() => this.runLiveTick(), 1000);
+  }
+
+  private shouldRunLiveTicker(): boolean {
+    return shouldRunSyncViewLiveTicker(
+      this.plugin.progressStore.state,
+      this.plugin.syncExecutor?.isRunning ?? false,
+      this.plugin.syncExecutor?.hasSideActionsInFlight ?? false,
+      this.hasLiveTransferSignal(),
+    );
+  }
+
+  /** A LAN session that is merely connected has nothing to sample each
+   *  second; its phase changes call `refreshTransferIndicator` directly.
+   *  Only `transferring` (and the cloud reading, which is already
+   *  freshness-bounded by `getTransferRateReading`) needs the cadence. */
+  private hasLiveTransferSignal(): boolean {
+    const lan = this.plugin.getLanTransferIndicator?.();
+    if (lan) return lan.phase === "transferring";
+    return this.plugin.getTransferRateReading() !== null;
+  }
+
+  private runLiveTick(): void {
+    this.plugin.pollTransferRateTick();
+    this.refreshTransferRateValue();
+    this.refreshRunningPresentation();
+    if (!this.shouldRunLiveTicker()) this.stopLiveTicker();
+  }
+
+  private stopLiveTicker(): void {
+    if (this.liveTicker === null) return;
+    window.clearInterval(this.liveTicker);
+    this.liveTicker = null;
   }
 
   private scheduleRenderFrame(): void {
@@ -2115,15 +2276,17 @@ export class EasySyncSyncView extends ItemView {
   }
 
   /**
-   * 运行中的轻量重绘：顶部计数、进度条、当前文件名、在飞徽标与新增完成行。
+   * 运行中的轻量重绘：顶部阶段短语/数字、进度条、当前文件名、在飞徽标与新增
+   * 完成行。
    *
    * 任何结构态（轮次结束、进度面板尚未挂载/应该退场、核对体态、相位切换把
    * 总量清零）都不归这里管，直接退回整屏渲染——那条路径由状态回调驱动，
-   * 轻量路径只负责运行中的数字与行。
+   * 轻量路径只负责运行中的数字、短语与行。
    */
   private patchProgressOnly(): void {
     if (this.closed) return;
     const progress = this.plugin.progressStore.state;
+    const now = Date.now();
     const fullSyncRunning = this.plugin.syncExecutor?.isRunning ?? false;
     const sideActionRunning = this.plugin.syncExecutor?.hasSideActionsInFlight ?? false;
     const isRunning = isAnySyncActivityRunning(
@@ -2149,6 +2312,41 @@ export class EasySyncSyncView extends ItemView {
         isRunning,
         progressTotal: progress.total,
       });
+    // Pre-execution phases have no round total and no body panel, but their
+    // stage phrase, count and elapsed still belong to the existing top line.
+    // The branch is keyed by the phase, not by "a number exists": the reveal
+    // window can hide the number for up to a second, and falling back to a
+    // full rebuild on every scan page would recreate the churn this path is
+    // meant to avoid. Empty executing/committing rounds have no rows or panel
+    // either; they also stay on this light path so a 0-change sync does not
+    // rebuild the status panel and buttons just to reach the result.
+    const lightStage = isPreExecutionSyncPhase(progress.phase)
+      || (
+        (progress.phase === "executing" || progress.phase === "committing")
+        && progress.total <= 0
+        && progress.currentActionType === undefined
+        && progress.completedFiles.length === 0
+      );
+    if (
+      isRunning
+      && lightStage
+      && !progressPanelMissing
+      && progress.activityKind !== "mutationRecovery"
+      && this.lastContentKey !== null
+    ) {
+      const runningLabel = this.runningStatusLabel(progress, now);
+      if (this.statusTextEl && this.statusTextEl.textContent !== runningLabel) {
+        this.statusTextEl.setText(runningLabel);
+      }
+      this.updateProgressCounter({
+        isRunning,
+        progress,
+        mutationRecovery: this.plugin.getMutationRecoveryDisplayState(),
+        now,
+      });
+      this.scheduleStatusReveal(progress, now);
+      return;
+    }
     if (
       !isRunning
       || !progressBodyMounted
@@ -2164,14 +2362,15 @@ export class EasySyncSyncView extends ItemView {
     // pending body mode the phase is not part of the content key, so the top
     // kept the last stage phrase (e.g. 检查云端变更…) for the whole execution
     // while the counter ran on (2026-10-27 真机删除轮).
-    const runningLabel = this.runningStatusLabel(progress);
+    const runningLabel = this.runningStatusLabel(progress, now);
     if (this.statusTextEl && this.statusTextEl.textContent !== runningLabel) {
       this.statusTextEl.setText(runningLabel);
     }
     this.updateProgressCounter({
       isRunning,
       progress,
-      mutationRecovery: null,
+      mutationRecovery: this.plugin.getMutationRecoveryDisplayState(),
+      now,
     });
     this.updateCurrentFileDetail(progress);
     this.updateProgressBarWidth(progress);
@@ -2179,6 +2378,7 @@ export class EasySyncSyncView extends ItemView {
     // 既有行，每多完成一行就多一遍 O(n) 强制布局。原位翻转（完成→失败）
     // 也是新行，重写时已摘掉它的旧灰字目录，这里只处理新行。
     this.appendNewFileRows(progress.completedFiles);
+    this.scheduleStatusReveal(progress, now);
   }
 
   /**
@@ -2276,12 +2476,7 @@ export class EasySyncSyncView extends ItemView {
     if (!progressPanelShown && isRunning) {
       const bar = content.createDiv("easy-sync-progress-bar");
       this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
-      const total = this.roundProgressTotal(progress);
-      const percent = remoteScopeRecoveryPercent(progress)
-        ?? (total > 0
-          ? Math.min(100, Math.round((progress.current / total) * 100))
-          : 0);
-      this.progressFillEl.style.width = `${percent}%`;
+      this.updateProgressBarWidth(progress);
     }
 
 
@@ -2343,6 +2538,9 @@ export class EasySyncSyncView extends ItemView {
     // `toggleAllDetails` owns group and issue rows; a decision row inside a
     // plan group answers to its own remembered state instead.
     this.applyPlanRowExpansion();
+    // 显式展开的失败轮要压过会话级「全部折叠」；放在批量开合之后、按钮
+    // 呈现之前，让按钮下一动作读到的仍是真实 DOM 状态。
+    this.applyHistoryRevealOpenState();
     this.planRowHeights.clear();
     this.planRowLayoutRevision += 1;
     this.updateCollapseTogglePresentation();
@@ -2376,15 +2574,18 @@ export class EasySyncSyncView extends ItemView {
     // 与状态栏、Ribbon 同源）。
     const syncEntryInProgress = this.plugin.isSyncEntryInProgress;
     const syncState = this.plugin.state;
-    const isInitializing = this.plugin.auth?.isInitializing ?? false;
-    const authState = this.plugin.auth?.authState;
-    const isLoggedIn = isInitializing ? false : (authState?.isLoggedIn ?? false);
+    // F5：三载体只看活动云端的就绪事实。WebDAV 激活时这些字段是中性值
+    // （已登录＝已配置、非冷启动、无待校验会话），面板因此直接进入同步面，
+    // 不再因为「没登录过微软」显示登录入口；OneDrive 下逐字等价于旧写法。
+    const readiness = this.plugin.activeCloudReadiness();
+    const isInitializing = readiness.initializing;
+    const isLoggedIn = isInitializing ? false : readiness.loggedIn;
     const isPending = !isInitializing
       && !isLoggedIn
-      && (this.plugin.auth?.isPending ?? false);
+      && readiness.loginPending;
     // Session restored but the account is not verified yet: sync authorization
     // is closed, so the panel must not read as a healthy "synced" state.
-    const sessionPending = this.plugin.auth?.isSessionPending ?? false;
+    const sessionPending = readiness.sessionPending;
     const conflicts = (syncState?.pendingConflicts ?? [])
       .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
     // S4 设备本地删除决定（2026-10-27）：确认后到删除检查点落定前，路径仍
@@ -3159,13 +3360,37 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  /**
+   * 失败／部分完成且正文空白时，用户再点顶部「立即同步」——先把同步历史打开，
+   * 最近那条失败轮按现役默认规则自动展开；同步随后照常发起。历史已打开时
+   * 不干预，用户已经知道入口与展开方式。
+   */
+  private revealHistoryForRetry(): void {
+    const latest = this.plugin.state?.syncHistory[0];
+    if (!shouldRevealHistoryOnRetry({
+      historyExpanded: this.historyExpanded,
+      bodyMode: this.renderedBodyMode,
+      autoSyncPaused: this.plugin.autoSyncPaused,
+      latestHistoryStatus: latest?.status,
+    }) || !latest) {
+      return;
+    }
+    this.historyExpanded = true;
+    this.historyRevealEntryId = latest.id;
+    // 这次是新的显式求助：即使该轮此前被用户收起过，也重新展开。
+    this.historyRevealCollapsedIds.delete(latest.id);
+    this.render();
+  }
+
   private renderToolbar(container: HTMLElement): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const toolbar = container.createDiv("nav-header");
     const buttons = toolbar.createDiv("nav-buttons-container");
 
     this.createIconButton(buttons, "history", t("syncView.history.title"), () => {
+      // 用户亲手开关历史即接管：本次显式展开不再强撑。
       this.historyExpanded = !this.historyExpanded;
+      this.historyRevealEntryId = null;
       this.render();
     }, this.historyExpanded);
     this.createIconButton(buttons, "settings", t("syncView.openSettings"), () => {
@@ -3191,16 +3416,16 @@ export class EasySyncSyncView extends ItemView {
    *  positioning differs. */
   private renderTransferRateFooter(container: HTMLElement): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const reading = this.plugin.getTransferRateReading();
-    if (!reading) return;
+    const chip = this.resolveTransferChip();
+    if (!chip) return;
     const indicator = container.createDiv("easy-sync-transfer-rate");
     if (this.platformFacts.isMobile) {
       indicator.addClass("is-mobile-footer");
     } else {
       indicator.addClass("is-panel-footer");
     }
-    indicator.addClass(`is-${reading.level}`);
-    this.fillTransferRateIndicator(indicator, reading);
+    if (chip.level !== null) indicator.addClass(`is-${chip.level}`);
+    this.fillTransferRateIndicator(indicator, chip);
     setTooltip(indicator, t("syncView.transferRate.title"));
     if (this.platformFacts.isMobile) {
       // Invisible until the first valid anchor lands (visibility, not
@@ -3270,29 +3495,114 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  /**
+   * One chip, one data shape. The chip's icon+value slot is shared: a cloud
+   * reading draws the signal ladder, an active LAN session draws its phase
+   * icon (`house-wifi` pairing / `wifi` connected / `wifi-sync` transferring)
+   * and reuses the same value slot for the measured rate. null = nothing to
+   * show, so the carrier keeps its pre-existing "no reading, no chip" layout.
+   */
+  private resolveTransferChip(): {
+    icon: string;
+    value: string | null;
+    level: TransferSignalLevel | null;
+  } | null {
+    const lan = this.plugin.getLanTransferIndicator?.();
+    if (lan) {
+      const kbps = lan.phase === "transferring" ? lan.kbps : null;
+      return {
+        icon: lanTransferPhaseIcon(lan.phase),
+        value: kbps !== null ? formatTransferRate(kbps) : null,
+        level: kbps !== null ? transferRateLevel(kbps) : null,
+      };
+    }
+    const reading = this.plugin.getTransferRateReading();
+    if (!reading) return null;
+    return {
+      // Lucide ladder: full bars read as "excellent"; signal-zero means the
+      // link moved no bytes at all during attempted transfers.
+      icon: reading.level === "high" ? "signal" : `signal-${reading.level}`,
+      value: reading.kbps !== null ? formatTransferRate(reading.kbps) : null,
+      level: reading.level,
+    };
+  }
+
   private fillTransferRateIndicator(
     indicator: HTMLElement,
-    reading: TransferRateReading,
+    chip: { icon: string; value: string | null },
   ): void {
     const iconEl = indicator.createSpan("easy-sync-transfer-rate-icon");
-    // Lucide ladder: full bars read as "excellent"; signal-zero means the
-    // link moved no bytes at all during attempted transfers.
-    setIcon(iconEl, reading.level === "high" ? "signal" : `signal-${reading.level}`);
-    if (reading.kbps !== null) {
-      indicator.createSpan("easy-sync-transfer-rate-value")
-        .setText(formatTransferRate(reading.kbps));
+    setIcon(iconEl, chip.icon);
+    if (chip.value !== null) {
+      indicator.createSpan("easy-sync-transfer-rate-value").setText(chip.value);
     }
+  }
+
+  /**
+   * Once a second, re-evaluate the running stage phrase and its numeric slot:
+   * reveal deadlines, phase counts and the elapsed fallback. This is a light
+   * in-place patch only — no render, and no new recurring timer.
+   */
+  private refreshRunningPresentation(now = Date.now()): void {
+    const progress = this.plugin.progressStore.state;
+    if (!isAnySyncActivityRunning(
+      progress,
+      this.plugin.syncExecutor?.isRunning ?? false,
+      this.plugin.syncExecutor?.hasSideActionsInFlight ?? false,
+    )) return;
+    const runningLabel = this.runningStatusLabel(progress, now);
+    if (this.statusTextEl && this.statusTextEl.textContent !== runningLabel) {
+      this.statusTextEl.setText(runningLabel);
+    }
+    this.updateProgressCounter({
+      isRunning: true,
+      progress,
+      mutationRecovery: this.plugin.getMutationRecoveryDisplayState(),
+      now,
+    });
+    this.scheduleStatusReveal(progress, now);
+  }
+
+  /**
+   * Keep at most one pending reveal for the current stage. A stage name or
+   * count that has not survived its readable window must not repaint the line;
+   * the one-shot fires at the deadline and the next patch re-evaluates. Phase
+   * changes and lifecycle exits clear it, and the 1s interval above remains the
+   * only recurring timer.
+   */
+  private scheduleStatusReveal(
+    progress: Readonly<SyncProgressState>,
+    now = Date.now(),
+  ): void {
+    if (this.statusRevealTimer !== null) {
+      window.clearTimeout(this.statusRevealTimer);
+      this.statusRevealTimer = null;
+    }
+    if (!isAnySyncActivityRunning(
+      progress,
+      this.plugin.syncExecutor?.isRunning ?? false,
+      this.plugin.syncExecutor?.hasSideActionsInFlight ?? false,
+    )) return;
+    const delay = resolveSyncActivityRevealDelay(progress, now);
+    if (delay <= 0) return;
+    this.statusRevealTimer = window.setTimeout(() => {
+      this.statusRevealTimer = null;
+      if (!this.closed) this.renderProgress();
+    }, delay + 16);
   }
 
   /** Per-second cadence and settled-run paths update the existing indicator
    *  in place — a remove-and-rerender would flash the mobile chip and force
-   *  a pointless re-anchor. Renders only when no indicator exists yet. */
+   *  a pointless re-anchor. Renders only when no indicator exists yet.
+   *  Both sources (LAN session, cloud reading) go through `resolveTransferChip`,
+   *  so a session starting or ending swaps the icon/value without any new
+   *  carrier, copy or layout. */
   private refreshTransferRateValue(): void {
-    const reading = this.plugin.getTransferRateReading();
+    const chip = this.resolveTransferChip();
     const indicator = this.contentEl.querySelector<HTMLElement>(
       ".easy-sync-transfer-rate",
     );
-    if (!reading) {
+    if (!chip) {
       indicator?.remove();
       return;
     }
@@ -3301,15 +3611,13 @@ export class EasySyncSyncView extends ItemView {
       return;
     }
     for (const level of ["high", "medium", "low", "zero"] as const) {
-      indicator.toggleClass(`is-${level}`, reading.level === level);
+      indicator.toggleClass(`is-${level}`, chip.level === level);
     }
     const iconEl = indicator.querySelector<HTMLElement>(
       ".easy-sync-transfer-rate-icon",
     );
-    if (iconEl) {
-      setIcon(iconEl, reading.level === "high" ? "signal" : `signal-${reading.level}`);
-    }
-    const text = reading.kbps !== null ? formatTransferRate(reading.kbps) : null;
+    if (iconEl) setIcon(iconEl, chip.icon);
+    const text = chip.value;
     const valueEl = indicator.querySelector<HTMLElement>(
       ".easy-sync-transfer-rate-value",
     );
@@ -3333,6 +3641,10 @@ export class EasySyncSyncView extends ItemView {
       // 一次用户动作同时覆盖计划面与待处理面：两处共用同一份会话级覆盖，
       // 新出现的可展开项（含下一轮新计划）都服从它。
       this.sessionOverride = expand ? "expanded" : "collapsed";
+      // 工具栏批量手势是更强的用户接管：撤销本次显式展开；展开时也清掉
+      // 用户逐轮收起的记忆，让「全部展开」真正铺开所有轮次。
+      this.historyRevealEntryId = null;
+      if (expand) this.historyRevealCollapsedIds.clear();
       this.planGroupExpandedState.clear();
       // 工具栏是全局手势：行级记忆也一并清空。否则行级选择会压过这次显式
       // 选择，换窗重挂后部分行回到旧状态，按钮看起来失灵／混合（2026-10-29 现场）。
@@ -3351,7 +3663,7 @@ export class EasySyncSyncView extends ItemView {
       ...this.contentEl.querySelectorAll<HTMLDetailsElement>(
         ".easy-sync-tree-item",
       ),
-    ];
+    ].filter(isToolbarBulkToggleTarget);
     // 还没有可展开项可读时按会话覆盖回答：默认态与折叠态下「全部展开」才是
     // 用户的下一步动作，只有显式展开过才轮到「全部折叠」。
     if (details.length === 0) return this.sessionOverride !== "expanded";
@@ -3375,7 +3687,9 @@ export class EasySyncSyncView extends ItemView {
     // （含决策项的分组与决策行展开、只读项折叠）。只有用户显式点过工具栏
     // 之后，才由这一份会话级覆盖统一压过类别默认。
     if (this.sessionOverride === "default") return;
-    const details = this.contentEl.querySelectorAll<HTMLDetailsElement>(".easy-sync-tree-item");
+    const details = [
+      ...this.contentEl.querySelectorAll<HTMLDetailsElement>(".easy-sync-tree-item"),
+    ].filter(isToolbarBulkToggleTarget);
     if (this.isSessionCollapsed()) {
       const expandedPlanGroups = new Set(
         [...this.planGroupExpandedState]
@@ -3446,6 +3760,7 @@ export class EasySyncSyncView extends ItemView {
       // 一颗点了只弹 busy 的「立即同步」。
       isRunning: state.isRunning || state.syncEntryInProgress,
       canCancel: state.canCancel,
+      cancelling: state.progress.cancelRequested,
       planReviewActive: state.planReviewActive,
       planReviewDetailsState: state.planReviewDetailsState,
       reviewKind: this.plugin.state?.planReviewAuthorization?.reviewKind,
@@ -3562,6 +3877,9 @@ export class EasySyncSyncView extends ItemView {
           .setCta()
           .setDisabled(state.isInitializing)
           .onClick(() => {
+            // 失败／部分完成空白态的重试是一次求助：先把历史打开并展开那一轮，
+            // 同步仍照常发起。历史已打开时不干预（见 helper）。
+            this.revealHistoryForRetry();
             void this.plugin.startManualSync();
           });
         break;
@@ -3574,7 +3892,7 @@ export class EasySyncSyncView extends ItemView {
           button.setDisabled(true);
         } else {
           button.onClick(() => {
-            void handleAuthEntryAction(this.plugin);
+            void handleSidebarAuthEntry(this.plugin);
           });
         }
         break;
@@ -3618,7 +3936,9 @@ export class EasySyncSyncView extends ItemView {
   }
 
   private updateStatusPanel(state: StatusPanelState): void {
-    const presentation = this.getStatusPresentation(state);
+    const now = Date.now();
+    const presentation = this.getStatusPresentation(state, now);
+    if (presentation.status !== "syncing") this.resetRunningReveal();
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
 
     if (this.statusLineEl) {
@@ -3634,7 +3954,9 @@ export class EasySyncSyncView extends ItemView {
       isRunning: state.isRunning,
       progress: state.progress,
       mutationRecovery: state.mutationRecovery,
+      now,
     });
+    this.scheduleStatusReveal(state.progress, now);
 
     if (!this.statusDetailEl) return;
     const detailMode = resolveSyncViewStatusDetailMode({
@@ -3670,12 +3992,7 @@ export class EasySyncSyncView extends ItemView {
       ? state.latestHistory.endedAt
       : state.lastSyncTime;
     const timestampText = timestamp > 0
-      ? new Date(timestamp).toLocaleString(undefined, {
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      })
+      ? formatUserDateTime(timestamp, this.plugin.i18n.language)
       : "";
     // 片⑦ E1：常驻标识只属静止的时间戳态（current-file／recovery 两个分支已
     // 提前返回）；纯文本，不新增槽位与控件。
@@ -3707,45 +4024,102 @@ export class EasySyncSyncView extends ItemView {
 
   /**
    * 顶部状态行右侧的数字：运行中＝「已结算/总量」，核对态沿用原有的剩余数。
-   * 整屏渲染与轻量数字补丁共用这一处规则。
+   * 阶段计数只在阶段名站稳后出现；裸 0 不显示，已用 5 秒后才出现。整屏渲染、
+   * 轻量数字补丁与 1 秒 tick 共用这一处规则。
    */
   private updateProgressCounter(input: {
     isRunning: boolean;
     progress: Readonly<SyncProgressState>;
     mutationRecovery: MutationRecoveryDisplayState | null;
+    now?: number;
   }): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const now = input.now ?? Date.now();
     const recoveryProgress = input.progress.recoveryVerification;
-    const progressCurrent = recoveryProgress
-      ? recoveryProgress.reused + recoveryProgress.verifiedThisRun
-      : input.progress.current;
-    const progressTotal = recoveryProgress?.total
-      ?? this.roundProgressTotal(input.progress);
-    if (input.isRunning && progressTotal > 0) {
-      this.ensureStatusCounter();
-      this.statusCounterEl?.removeAttribute?.("aria-label");
-      this.statusCounterEl?.setText(
-        this.plugin.i18n.t("syncView.progress.items", {
-          current: progressCurrent,
-          total: progressTotal,
+    // 1. Cloud-scope verification keeps its existing determinate reading.
+    if (input.isRunning && recoveryProgress && recoveryProgress.total > 0) {
+      this.renderStatusCounter(
+        t("syncView.progress.items", {
+          current: recoveryProgress.reused + recoveryProgress.verifiedThisRun,
+          total: recoveryProgress.total,
         }),
+        undefined,
       );
       return;
     }
-    if (input.mutationRecovery && input.mutationRecovery.remaining > 0) {
-      this.ensureStatusCounter();
-      this.statusCounterEl?.setText(String(input.mutationRecovery.remaining));
-      this.statusCounterEl?.setAttribute?.(
-        "aria-label",
-        this.plugin.i18n.t("syncView.recovery.remainingAria", {
-          count: input.mutationRecovery.remaining,
-        }),
+    // 2. Recovery-only rounds own the slot with their settled/total count.
+    if (
+      input.progress.activityKind === "mutationRecovery"
+      && input.mutationRecovery
+      && input.mutationRecovery.remaining > 0
+    ) {
+      this.renderRecoveryCounter(input.mutationRecovery);
+      return;
+    }
+    // 3. Current phase's own count, or elapsed when it has none. These never
+    //    touch the round's current/total or mount the body progress bar.
+    const activityMetric = input.isRunning
+      ? resolveSyncActivityMetric(input.progress, now)
+      : null;
+    if (activityMetric) {
+      this.renderStatusCounter(
+        translateSyncActivityMetric(activityMetric, t, now),
+        resolveSyncActivityMetricAria(activityMetric, t, now),
       );
+      return;
+    }
+    // 4. Execution/verification (and the post-transfer commit, which keeps the
+    //    settled count) use the existing round counter.
+    const progressTotal = this.roundProgressTotal(input.progress);
+    if (input.isRunning && progressTotal > 0) {
+      // `0/N` is the correct starting reading (2026-11-20 follow-up). The
+      // download pipeline's presentation lookahead raises this same number as
+      // soon as each file's content is ready, so it no longer waits for a
+      // whole checkpoint batch; `current` stays the settled count.
+      this.renderStatusCounter(
+        t("syncView.progress.items", {
+          current: resolveRoundProgressCurrent(input.progress),
+          total: progressTotal,
+        }),
+        undefined,
+      );
+      return;
+    }
+    // 5. Fallback while a pending recovery exists outside a recovery-only run.
+    if (input.mutationRecovery && input.mutationRecovery.remaining > 0) {
+      this.renderRecoveryCounter(input.mutationRecovery);
       return;
     }
     if (this.statusCounterEl) {
       this.statusCounterEl.remove();
       this.statusCounterEl = null;
     }
+  }
+
+  private renderRecoveryCounter(state: MutationRecoveryDisplayState): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const total = Math.max(
+      state.total,
+      state.remaining,
+      state.settled,
+    );
+    const current = Math.max(0, Math.min(state.settled, total));
+    this.renderStatusCounter(
+      t("syncView.progress.items", { current, total }),
+      t("syncView.recovery.progressAria", { current, total }),
+    );
+  }
+
+  private renderStatusCounter(
+    text: string,
+    ariaLabel: string | undefined,
+  ): void {
+    this.ensureStatusCounter();
+    const counter = this.statusCounterEl;
+    if (!counter) return;
+    if (counter.textContent !== text) counter.setText(text);
+    if (ariaLabel) counter.setAttribute("aria-label", ariaLabel);
+    else counter.removeAttribute?.("aria-label");
   }
 
   private ensureStatusCounter(): void {
@@ -3782,34 +4156,89 @@ export class EasySyncSyncView extends ItemView {
       + (this.plugin.syncExecutor?.queuedSideActionCount ?? 0);
   }
 
-  /** 进度条宽度：本轮数字（已结算）或云端核验读数，二者同一判据。 */
+  /**
+   * 进度条宽度：本轮数字（已结算）或云端核验读数，二者同一判据。
+   *
+   * 三个写入点（进度体挂载、借体裸条挂载、轻量 tick）都走这里：百分比公式
+   * 只写一份，避免三处各自算一遍再各自长大。
+   */
   private updateProgressBarWidth(progress: Readonly<SyncProgressState>): void {
     if (!this.progressFillEl) return;
-    const recoveryPercent = remoteScopeRecoveryPercent(progress);
-    if (recoveryPercent !== null) {
-      this.progressFillEl.style.width = `${recoveryPercent}%`;
-      return;
-    }
     const total = this.roundProgressTotal(progress);
-    const percent = total > 0
-      ? Math.min(100, Math.round((progress.current / total) * 100))
-      : 0;
+    const percent = remoteScopeRecoveryPercent(progress)
+      ?? (total > 0
+        ? Math.min(
+          100,
+          Math.round((resolveRoundProgressCurrent(progress) / total) * 100),
+        )
+        : 0);
     this.progressFillEl.style.width = `${percent}%`;
+  }
+
+  /** Test views bypass the field initializer; create on first use. */
+  private getStatusRevealer(): SyncActivityRevealer {
+    return this.statusRevealer
+      ?? (this.statusRevealer = new SyncActivityRevealer());
+  }
+
+  private resetRunningReveal(): void {
+    this.getStatusRevealer().reset();
+    this.lastStableRunningLabel = null;
+    this.lastStableRunningStartedAt = null;
   }
 
   /**
    * Fixed-top running label (S4 boundary): stage-level short status
    * (scanning / preparing / baseline / checking / planning / verifying) while
    * the round has not started settling items, the generic running phrase once
-   * it has. Exact per-action labels stay out of the fixed top.
+   * it has. Exact per-action labels stay out of the fixed top. A young next
+   * stage keeps the last stable stage; cancellation is immediate.
    */
-  private runningStatusLabel(progress: Readonly<SyncProgressState>): string {
+  private runningStatusLabel(
+    progress: Readonly<SyncProgressState>,
+    now = Date.now(),
+  ): string {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    if (progress.phase === "executing") return t("syncView.progress");
-    return translateSyncActivity(
-      resolveSyncActivityPresentation(progress),
-      t,
-    );
+    // Cancellation is a direct user command: the light patch must keep it, not
+    // only the full status-panel render.
+    if (progress.cancelRequested) return t("syncView.cancelling");
+    // The executor has finished but the operation lock still holds the result
+    // render: keep the last stable stage for that short window instead of
+    // flashing the generic phrase before the success/attention state.
+    if (progress.phase === "done" && this.lastStableRunningLabel) {
+      return this.lastStableRunningLabel;
+    }
+    const emptyExecuting = progress.phase === "executing"
+      && progress.total <= 0
+      && progress.currentActionType === undefined;
+    if (progress.phase === "executing" && !emptyExecuting) {
+      this.resetRunningReveal();
+      return t("syncView.progress");
+    }
+    if (
+      this.lastStableRunningStartedAt
+      && this.lastStableRunningStartedAt !== progress.startedAt
+    ) {
+      this.resetRunningReveal();
+    }
+    const reveal = this.getStatusRevealer().resolve(progress, now);
+    if (!reveal.current) {
+      return this.lastStableRunningLabel ?? t("syncView.progress");
+    }
+    const label = translateSyncActivity(reveal.presentation, t);
+    // The counter already carries the stage number; drop the phrase's trailing
+    // ellipsis so the line reads "整理同步记录 3/10批" instead of "… 3/10批".
+    const displayed = resolveSyncActivityMetric(progress, now)
+      ? trimSyncActivityLabel(label)
+      : label;
+    if (
+      reveal.presentation.kind !== "syncing"
+      && reveal.presentation.kind !== "starting"
+    ) {
+      this.lastStableRunningLabel = displayed;
+      this.lastStableRunningStartedAt = progress.startedAt;
+    }
+    return displayed;
   }
 
   private getStatusPresentation(state: {
@@ -3827,7 +4256,7 @@ export class EasySyncSyncView extends ItemView {
     mutationRecovery: MutationRecoveryDisplayState | null;
     latestHistory?: SyncHistoryEntry;
     progress: Readonly<SyncProgressState>;
-  }): { status: RibbonStatus; label: string } {
+  }, now = Date.now()): { status: RibbonStatus; label: string } {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     // Cold start, and a restored session whose account is not verified yet,
     // share the same "connecting" presentation — never a ready/synced claim.
@@ -3869,7 +4298,7 @@ export class EasySyncSyncView extends ItemView {
       case "cancelling":
         return { status, label: t("syncView.cancelling") };
       case "syncing":
-        return { status, label: this.runningStatusLabel(state.progress) };
+        return { status, label: this.runningStatusLabel(state.progress, now) };
       case "attention":
         if (state.pendingCount > 0) {
           return { status, label: t("syncView.issues.title", { count: state.pendingCount }) };
@@ -3922,12 +4351,7 @@ export class EasySyncSyncView extends ItemView {
     if (state.total > 0 || recoveryPercent !== null) {
       const bar = panel.createDiv("easy-sync-progress-bar");
       this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
-      const total = this.roundProgressTotal(state);
-      const percent = recoveryPercent
-        ?? (total > 0
-          ? Math.min(100, Math.round((state.current / total) * 100))
-          : 0);
-      this.progressFillEl.style.width = `${percent}%`;
+      this.updateProgressBarWidth(state);
     }
     if (state.completedFiles.length > 0) {
       const rows = partitionCompletedProgressRows(state.completedFiles);
@@ -3978,10 +4402,7 @@ export class EasySyncSyncView extends ItemView {
     const presentation = mutationRecoveryBodyPresentation(
       state,
       t,
-      (timestamp) => new Date(timestamp).toLocaleTimeString(undefined, {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
+      (timestamp) => formatUserClockTime(timestamp, this.plugin.i18n.language),
     );
     // The visible heading is intentionally gone: the summary is the first
     // readable line, while the section keeps a programmatic group name so
@@ -4645,6 +5066,20 @@ export class EasySyncSyncView extends ItemView {
         }),
       );
     }
+    // Community-plugin identity blocks that carry no in-app exit explain the
+    // one action that clears them (repair the manifest / remove the duplicate
+    // directory). The generic "report it to the author" diagnosis below is
+    // never reached for these codes (their disposition is external), so this
+    // is the only guidance the row needs.
+    const identityGuidanceKey =
+      issue.issueCode === "plugin-manifest-invalid"
+        ? "syncView.identityBlock.guidance.manifest-invalid"
+        : issue.issueCode === "plugin-identity-collision"
+          ? "syncView.identityBlock.guidance.identity-collision"
+          : null;
+    if (identityGuidanceKey) {
+      body.createDiv("easy-sync-item-reason").setText(t(identityGuidanceKey));
+    }
     // S4 终止判据（2026-10-16 §六 S4）：这一项连续两轮事实完全相同、且没有
     // 现役人工出口时，行内只补一句终局诊断——同一事实指纹下结论不变，不会
     // 每轮换一个说法；判定来自 executor 的逐项指纹台账（本处只读）。有真实
@@ -5115,6 +5550,7 @@ export class EasySyncSyncView extends ItemView {
         this.plugin.app,
         snapshot,
         t,
+        this.plugin.i18n.language,
         (filePluginId, path) =>
           this.plugin.getCommunityPluginBundleFileDiff(filePluginId, path),
       ).awaitChoice();
@@ -5148,6 +5584,7 @@ export class EasySyncSyncView extends ItemView {
         this.plugin.app,
         snapshotPromise,
         t,
+        this.plugin.i18n.language,
         getFileDiff,
       ).awaitChoice();
       if (!choice) return;
@@ -5274,6 +5711,26 @@ export class EasySyncSyncView extends ItemView {
     ).awaitConfirm();
   }
 
+  /**
+   * 显式展开的失败轮要压过会话级「全部折叠」：整屏重建末尾在批量开合之后
+   * 再把它打开一次。用户亲手收起后 `historyRevealEntryId` 已清空，这里不再
+   * 与用户的手势对抗。
+   */
+  private applyHistoryRevealOpenState(): void {
+    const id = this.historyRevealEntryId;
+    if (id === null) return;
+    const details = [
+      ...this.contentEl.querySelectorAll<HTMLDetailsElement>(
+        "details.easy-sync-history-run",
+      ),
+    ].find((element) => element.dataset.easySyncHistoryId === id);
+    if (!details) {
+      this.historyRevealEntryId = null;
+      return;
+    }
+    if (!details.open) details.open = true;
+  }
+
   private renderHistorySection(container: HTMLElement, history: SyncHistoryEntry[]): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const section = this.createSection(container, t("syncView.history.title"));
@@ -5283,20 +5740,53 @@ export class EasySyncSyncView extends ItemView {
     }
 
     const list = section.createDiv("easy-sync-history-list");
+    const latest = history[0];
+    if (
+      this.historyRevealEntryId !== null
+      && latest
+      && latest.id !== this.historyRevealEntryId
+      && (latest.status === "failed" || latest.status === "partial")
+    ) {
+      // 新一轮又失败／部分完成：展开目标切到最新那一轮，旧轮回到默认态。
+      this.historyRevealEntryId = latest.id;
+    }
+    if (
+      this.historyRevealEntryId !== null
+      && !history.some((entry) => entry.id === this.historyRevealEntryId)
+    ) {
+      // 轮次已随 10 轮保留窗口退役，不再强撑。
+      this.historyRevealEntryId = null;
+    }
+    const historyIds = new Set(history.map((entry) => entry.id));
+    for (const id of this.historyRevealCollapsedIds) {
+      if (!historyIds.has(id)) this.historyRevealCollapsedIds.delete(id);
+    }
     history.forEach((entry, index) => {
       const details = list.createEl("details", "easy-sync-history-run easy-sync-tree-item");
-      const initiallyOpen = index === 0 && entry.status !== "success";
+      details.dataset.easySyncHistoryId = entry.id;
+      const revealed = entry.id === this.historyRevealEntryId;
+      // 默认只展开最新一条非成功轮次；用户亲手收起过的轮次在本次侧栏会话内
+      // 不再被这条默认规则弹开（收起的语义要能跨正文重建保持）。
+      const initiallyOpen = !this.historyRevealCollapsedIds.has(entry.id)
+        && (revealed || (index === 0 && entry.status !== "success"));
       details.open = initiallyOpen;
       const summary = details.createEl("summary", "easy-sync-history-summary easy-sync-tree-row");
       this.addCollapseIcon(summary);
+      // 只有 summary 点击会让宿主切换 <details>；程序化开合不会产生 click。
+      // 点击时 `details.open` 仍是切换前状态：开着即本次会收起。
+      summary.addEventListener("click", () => {
+        if (details.open) {
+          this.historyRevealCollapsedIds.add(entry.id);
+          if (this.historyRevealEntryId === entry.id) {
+            this.historyRevealEntryId = null;
+          }
+        } else {
+          this.historyRevealCollapsedIds.delete(entry.id);
+        }
+      });
       const main = summary.createSpan("easy-sync-history-main");
       main.createSpan("easy-sync-history-time").setText(
-        new Date(entry.endedAt).toLocaleString(undefined, {
-          month: "numeric",
-          day: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
+        formatUserDateTime(entry.endedAt, this.plugin.i18n.language),
       );
       main.createSpan(`easy-sync-history-status is-${entry.status}`).setText(
         t(`syncView.history.status.${entry.status}`),
@@ -5380,6 +5870,24 @@ export class EasySyncSyncView extends ItemView {
       if (skip.omitted > 0) {
         body.createDiv("easy-sync-history-omitted").setText(
           t("syncView.history.skipOmitted", { count: skip.omitted }),
+        );
+      }
+      // 文件夹排除是当轮扫描策略的一部分，不是文件动作，也不进「大型文件
+      // 排除」；历史只保留当轮配置的文件夹路径（2026-11-17 用户要求）。
+      // 独立折叠组与结果折叠组同形，默认收起且不参与工具栏批量开合。
+      const excludedFolders = collectHistoryExcludedFolders(entry);
+      if (excludedFolders.paths.length > 0) {
+        this.createFolderExclusionFold(
+          body,
+          excludedFolders.paths,
+          excludedFolders.total,
+        );
+      }
+      if (excludedFolders.omitted > 0) {
+        body.createDiv("easy-sync-history-omitted").setText(
+          t("syncView.history.folderExclusionOmitted", {
+            count: excludedFolders.omitted,
+          }),
         );
       }
       const omitted = countOmittedSyncHistorySuccessfulFiles(entry);
@@ -5507,14 +6015,63 @@ export class EasySyncSyncView extends ItemView {
     file: FileProgress,
     prepend: boolean,
   ): HTMLElement {
+    return this.appendFoldPathRow(
+      list,
+      file.path,
+      resolveFileProgressPresentation(file).icon,
+      prepend,
+    );
+  }
+
+  /** 结果折叠组与文件夹排除组共用的路径行：图标＋路径，且接入现役灰字
+   *  目录测量（`easy-sync-path-layout-item`）。 */
+  private appendFoldPathRow(
+    list: HTMLElement,
+    path: string,
+    icon: string,
+    prepend: boolean,
+  ): HTMLElement {
     const row = list.createDiv("easy-sync-file-row");
-    row.dataset.easySyncCompletedPath = file.path;
-    const icon = row.createSpan("easy-sync-file-icon");
-    setIcon(icon, resolveFileProgressPresentation(file).icon);
+    row.dataset.easySyncCompletedPath = path;
+    const iconEl = row.createSpan("easy-sync-file-icon");
+    setIcon(iconEl, icon);
     const pathEl = row.createSpan("easy-sync-file-path");
-    configureFilePath(row, pathEl, file.path, true);
+    configureFilePath(row, pathEl, path, true);
     if (prepend) list.prepend(row);
     return row;
+  }
+
+  /**
+   * 同步历史的「文件夹排除」折叠组（2026-11-17 用户要求）：只展示当轮生效
+   * 的排除文件夹路径，不展开具体文件。视觉壳与「大型文件排除」同族（复用
+   * `.easy-sync-history-skip-group`），因此默认收起、且与结果折叠组一样被
+   * `isToolbarBulkToggleTarget` 排除在工具栏批量开合之外。
+   */
+  private createFolderExclusionFold(
+    container: HTMLElement,
+    folders: readonly string[],
+    total: number,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const group = container.createEl(
+      "details",
+      "easy-sync-history-skip-group easy-sync-tree-item",
+    );
+    const summary = group.createEl(
+      "summary",
+      "easy-sync-history-skip-summary easy-sync-tree-row",
+    );
+    this.addCollapseIcon(summary);
+    const title = summary.createSpan("easy-sync-history-skip-title");
+    const list = group.createDiv(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    for (const folder of folders) {
+      this.appendFoldPathRow(list, folder, "folder", false);
+    }
+    title.setText(
+      t("syncView.folderExclusion.title", { count: total }),
+    );
   }
 
   /**
@@ -6206,12 +6763,12 @@ export class EasySyncSyncView extends ItemView {
     if (item.local || item.remote) {
       if (item.local) {
         body.createDiv("easy-sync-conflict-meta").setText(
-          `${t("conflictDetail.localLabel")}：${item.local.mtime ? new Date(item.local.mtime).toLocaleString() : "-"} (${item.local.size != null ? formatSize(item.local.size) : "-"})`,
+          `${t("conflictDetail.localLabel")}：${item.local.mtime ? formatUserDateTimeFull(item.local.mtime, this.plugin.i18n.language) : "-"} (${item.local.size != null ? formatSize(item.local.size) : "-"})`,
         );
       }
       if (item.remote) {
         body.createDiv("easy-sync-conflict-meta").setText(
-          `${t("conflictDetail.remoteLabel")}：${item.remote.mtime ? new Date(item.remote.mtime).toLocaleString() : "-"} (${item.remote.size != null ? formatSize(item.remote.size) : "-"})`,
+          `${t("conflictDetail.remoteLabel")}：${item.remote.mtime ? formatUserDateTimeFull(item.remote.mtime, this.plugin.i18n.language) : "-"} (${item.remote.size != null ? formatSize(item.remote.size) : "-"})`,
         );
       }
     }
@@ -6224,7 +6781,11 @@ export class EasySyncSyncView extends ItemView {
       void this.runItemAction(actions, () => this.plugin.resolveConflictKeepRemote(item.path));
     });
     this.createActionChip(actions, t("syncView.conflict.viewDetail"), "", () => {
-      const modal = new ConflictDetailModal(this.plugin, item);
+      const modal = new ConflictDetailModal(
+        this.plugin,
+        item,
+        (timestamp) => formatUserDateTimeFull(timestamp, this.plugin.i18n.language),
+      );
       modal.setOnResolved(() => {
         this.plugin.updateStatusBar();
         this.render();

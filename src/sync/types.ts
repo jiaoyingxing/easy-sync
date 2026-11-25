@@ -95,7 +95,19 @@ export interface RemoteFolderEntry {
   cTag?: ContentVersionToken;
 }
 
-/** Complete identity boundary for every reusable sync artifact. */
+/** S0 新增的同步后端种类；缺失按 `"onedrive"` 解读（设计 §2.1）。 */
+export type SyncProviderKind = "onedrive" | "s3" | "webdav";
+
+const SYNC_PROVIDER_KINDS: readonly string[] = ["onedrive", "s3", "webdav"];
+
+/**
+ * Complete identity boundary for every reusable sync artifact.
+ *
+ * S0（设计 §2.1）以**加性可选字段**补全 `providerKind + endpoint + account +
+ * container + root`。旧 OneDrive scope 只有四元、不写这些字段；读入时缺失
+ * 字段按默认值比较，但绝不写回对象或 envelope（写入会改字节、破坏 V2 的
+ * `JSON.stringify` 全等与 IndexedDB 摘要）。
+ */
 export interface SyncScope {
   accountId: string;
   /**
@@ -105,6 +117,16 @@ export interface SyncScope {
   driveId: string;
   vaultFolderId: string;
   filesRootId: string;
+  /** 后端种类；缺失等价于 `"onedrive"`。 */
+  providerKind?: SyncProviderKind;
+  /** 规范化 endpoint 身份（S3：origin|region；WebDAV：origin）；OneDrive 缺省。 */
+  endpointId?: string;
+  /** 容器身份（S3：bucket）；WebDAV／OneDrive 缺省。 */
+  containerId?: string;
+  /** 规范化根路径；OneDrive 缺省。 */
+  rootPath?: string;
+  /** 账号绑定摘要；缺失等价于空串（OneDrive 沿用 accountId）。 */
+  credentialBindingId?: string;
 }
 
 export function isSyncScope(value: unknown): value is SyncScope {
@@ -113,7 +135,17 @@ export function isSyncScope(value: unknown): value is SyncScope {
   return typeof scope.accountId === "string" && scope.accountId.length > 0
     && typeof scope.driveId === "string" && scope.driveId.length > 0
     && typeof scope.vaultFolderId === "string" && scope.vaultFolderId.length > 0
-    && typeof scope.filesRootId === "string" && scope.filesRootId.length > 0;
+    && typeof scope.filesRootId === "string" && scope.filesRootId.length > 0
+    && (scope.providerKind === undefined
+      || SYNC_PROVIDER_KINDS.includes(scope.providerKind))
+    && optionalScopeString(scope.endpointId)
+    && optionalScopeString(scope.containerId)
+    && optionalScopeString(scope.rootPath)
+    && optionalScopeString(scope.credentialBindingId);
+}
+
+function optionalScopeString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
 }
 
 export interface RemoteSyncState {
@@ -323,6 +355,16 @@ export interface SyncPlan {
     token: string;
     path: string;
   }>;
+  /**
+   * Path-identity folder renames decomposed into target creates plus file
+   * moves. The executor records a durable pending entry per item and settles
+   * the folder anchors after the source subtree no longer holds a file
+   * identity. Absent for every stable-identity provider and legacy path.
+   */
+  folderMoveDecompositions?: ReadonlyArray<{
+    sourcePath: string;
+    targetPath: string;
+  }>;
 }
 
 export type V2ActivationReviewKind =
@@ -427,6 +469,11 @@ export interface MutationIntentV1 {
   stateEffect?: MutationStateEffectV1;
   expectedLocal: MutationLocalExpectation;
   expectedRemote: MutationRemoteExpectation;
+  /**
+   * Remote id contract: omitted = stable id (OneDrive); `"path"` = id is the
+   * relative path and changes on move (WebDAV/S3 path identity).
+   */
+  identityMode?: "stable" | "path";
   /** Exact result bytes persisted in merge-ready storage before a merge mutates either side. */
   target?: { hash: string; size: number };
   createdAt: number;
@@ -711,6 +758,17 @@ export interface CommunityPluginBundlePresentationV1 {
   localVersion: string | null;
   remoteVersion: string | null;
   files: CommunityPluginBundleFilePresentationV1[];
+  /** Logical identity each side's manifest declares. Display only: the drift
+   *  notice names both plugins so a keep-side choice is never blind. Absent
+   *  when a side's manifest could not be parsed. */
+  localIdentity?: CommunityPluginBundleManifestIdentityV1 | null;
+  remoteIdentity?: CommunityPluginBundleManifestIdentityV1 | null;
+}
+
+/** One side's declared manifest identity (id plus display name, if any). */
+export interface CommunityPluginBundleManifestIdentityV1 {
+  id: string;
+  name: string | null;
 }
 
 /**
@@ -857,7 +915,7 @@ export type SyncFileErrorTierV1 = (typeof SYNC_FILE_ERROR_TIERS)[number];
  * call). Reports render a missing field as "—" instead of guessing.
  */
 export interface SyncFileErrorFactV1 {
-  /** `OneDriveErrorType` value (e.g. "NetworkError", "ServerError"). */
+  /** `RemoteErrorType` value (e.g. "NetworkError", "ServerError"). */
   errorType?: string;
   /** HTTP status; 0 means no HTTP response at all (dropped link, deadline). */
   statusCode?: number;
@@ -938,7 +996,15 @@ export function sameSyncScope(left: SyncScope | null, right: SyncScope | null): 
   return left?.accountId === right?.accountId
     && isSameDriveId(left?.driveId, right?.driveId)
     && left?.vaultFolderId === right?.vaultFolderId
-    && left?.filesRootId === right?.filesRootId;
+    && left?.filesRootId === right?.filesRootId
+    // S0：新字段缺失按默认值比较（providerKind = "onedrive"，其余 = ""）。
+    // 只读比较，不把默认值写回 scope；否则旧 envelope 的 JSON.stringify
+    // 结果与 IndexedDB 摘要都会改变。
+    && (left?.providerKind ?? "onedrive") === (right?.providerKind ?? "onedrive")
+    && (left?.endpointId ?? "") === (right?.endpointId ?? "")
+    && (left?.containerId ?? "") === (right?.containerId ?? "")
+    && (left?.rootPath ?? "") === (right?.rootPath ?? "")
+    && (left?.credentialBindingId ?? "") === (right?.credentialBindingId ?? "");
 }
 
 export function sameCanonicalPlanIdentityV2(

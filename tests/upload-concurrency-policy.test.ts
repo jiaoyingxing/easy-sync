@@ -220,3 +220,52 @@ describe("largeUploadConcurrency (B② cross-file parallelism)", () => {
     expect(largeUploadConcurrency(true)).toBe(1);
   });
 });
+
+describe("UploadConcurrencyPolicy warm start", () => {
+  it("starts at the depth the previous round settled on and keeps climbing", () => {
+    const policy = new UploadConcurrencyPolicy(false, { initialConcurrency: 6 });
+
+    expect(policy.limit).toBe(6);
+    // The first window still takes the optimistic step; it is the same AIMD
+    // rule, just measured from a warm depth instead of the floor.
+    expect(feedWindow(policy).map((change) => change.to)).toEqual([7]);
+    expect(policy.limit).toBe(7);
+  });
+
+  it("clamps a remembered depth into the platform range", () => {
+    expect(new UploadConcurrencyPolicy(false, { initialConcurrency: 99 }).limit)
+      .toBe(DESKTOP_UPLOAD_MAX_CONCURRENCY);
+    expect(new UploadConcurrencyPolicy(true, { initialConcurrency: 8 }).limit)
+      .toBe(MOBILE_UPLOAD_MAX_CONCURRENCY);
+    // Serial is a real settled depth (a round that stepped down to one) and
+    // must not be lifted back to the desktop floor by its own memory.
+    expect(new UploadConcurrencyPolicy(false, { initialConcurrency: 1 }).limit)
+      .toBe(1);
+  });
+
+  it("falls back to the floor when the remembered depth is unusable", () => {
+    expect(new UploadConcurrencyPolicy(false, { initialConcurrency: 0 }).limit)
+      .toBe(2);
+    expect(new UploadConcurrencyPolicy(false, { initialConcurrency: Number.NaN }).limit)
+      .toBe(2);
+    expect(new UploadConcurrencyPolicy(true, { initialConcurrency: -3 }).limit)
+      .toBe(1);
+  });
+
+  it("still halves on a throttle and steps down on a failure streak", () => {
+    const policy = new UploadConcurrencyPolicy(false, { initialConcurrency: 8 });
+
+    const throttled = policy.noteThrottle(0, 2);
+    expect(throttled.change).toMatchObject({ from: 8, to: 4, reason: "throttle" });
+    expect(policy.limit).toBe(4);
+
+    const warmAgain = new UploadConcurrencyPolicy(false, { initialConcurrency: 6 });
+    expect(warmAgain.noteFailure()).toBeNull();
+    expect(warmAgain.noteFailure()).toMatchObject({
+      from: 6,
+      to: 5,
+      reason: "regression",
+      cause: "failure-streak",
+    });
+  });
+});

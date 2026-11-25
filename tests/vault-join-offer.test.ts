@@ -11,6 +11,10 @@ const vaultJoinAwaitAction = vi.hoisted(() => vi.fn());
 const vaultJoinArgs = vi.hoisted(() => [] as unknown[][]);
 const vaultJoinListAwaitAction = vi.hoisted(() => vi.fn());
 const vaultJoinListArgs = vi.hoisted(() => [] as unknown[][]);
+const rsOfferAwaitAction = vi.hoisted(() => vi.fn());
+const rsOfferArgs = vi.hoisted(() => [] as unknown[][]);
+const rsFailureAwaitAction = vi.hoisted(() => vi.fn());
+const rsFailureArgs = vi.hoisted(() => [] as unknown[][]);
 
 vi.mock("../src/auth/auth-module", () => ({
   AuthModule: class {},
@@ -97,6 +101,25 @@ vi.mock("../src/ui/vault-join-repository-list-modal", () => ({
       vaultJoinListArgs.push(args);
     }
   },
+}));
+
+vi.mock("../src/ui/rs-migration-offer-modal", () => ({
+  RsMigrationOfferModal: class {
+    awaitAction = rsOfferAwaitAction;
+    constructor(...args: unknown[]) {
+      rsOfferArgs.push(args);
+    }
+  },
+}));
+
+vi.mock("../src/ui/rs-migration-failure-modal", () => ({
+  RsMigrationFailureModal: class {
+    awaitAction = rsFailureAwaitAction;
+    constructor(...args: unknown[]) {
+      rsFailureArgs.push(args);
+    }
+  },
+  RsMigrationGuideModal: class {},
 }));
 
 import EasySyncPlugin from "../src/main";
@@ -610,5 +633,117 @@ describe("Remotely Save detection failure visibility (2026-10-10 R2)", () => {
 
     expect(notice.show).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("Remotely Save destination pre-check (2026-11-17 P2)", () => {
+  afterEach(() => {
+    rsOfferAwaitAction.mockReset();
+    rsOfferArgs.length = 0;
+    rsFailureAwaitAction.mockReset();
+    rsFailureArgs.length = 0;
+  });
+
+  function attachRsOfferDeps(
+    plugin: EasySyncPlugin,
+    destination: () => Promise<unknown[]>,
+  ): { initVaultScope: ReturnType<typeof vi.fn> } {
+    const initVaultScope = vi.fn().mockResolvedValue({
+      driveId: "drive-1",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    });
+    plugin.onedrive = {
+      ensureDriveAvailable: vi.fn().mockResolvedValue(undefined),
+      detectRemotelySaveRepository: vi.fn().mockResolvedValue({
+        driveId: "drive-1",
+        appsContainerId: "apps-id",
+        remotelySaveDirId: "rs-dir-id",
+        vaultDirId: "rs-vault-dir-id",
+      }),
+      initVaultScope,
+      listFolderChildrenById: vi.fn(destination),
+      setAbortSignal: vi.fn(),
+    } as never;
+    plugin.syncExecutor = { isRunning: false } as never;
+    plugin.state = {
+      lastSyncTime: 0,
+      baseSnapshot: [],
+      planReviewActive: false,
+    } as never;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    return { initVaultScope };
+  }
+
+  function callRsOffer(plugin: EasySyncPlugin): Promise<string> {
+    return (plugin as never as {
+      maybeRunRsMigrationOffer(): Promise<string>;
+    }).maybeRunRsMigrationOffer();
+  }
+
+  it("refuses the migration choice when the destination already has content", async () => {
+    const { plugin } = makePlugin();
+    const { initVaultScope } = attachRsOfferDeps(
+      plugin,
+      async () => [{ id: "existing" }],
+    );
+    rsFailureAwaitAction.mockResolvedValue({ action: "fresh-sync" });
+
+    await expect(callRsOffer(plugin)).resolves.toBe("fresh");
+
+    expect(initVaultScope).toHaveBeenCalledWith("奇奇怪怪", {
+      createMissing: false,
+    });
+    expect(rsOfferArgs).toHaveLength(0);
+    expect(rsFailureArgs).toHaveLength(1);
+    const views = rsFailureArgs[0][1] as Record<string, unknown>;
+    expect(views.title).toBe("rsMigration.unavailableTitle");
+    expect(views.body).toBe("rsMigration.failureBodyDestination");
+    expect(views.guideBody).toBe("rsMigration.guideBodyDestination");
+    expect(views.retryLabel).toBeUndefined();
+    expect(views.freshLabel).toBe("rsMigration.failureFreshSync");
+  });
+
+  it("keeps the ordinary migration offer when the destination is empty", async () => {
+    const { plugin } = makePlugin();
+    attachRsOfferDeps(plugin, async () => []);
+    rsOfferAwaitAction.mockResolvedValue({ action: "fresh-sync" });
+
+    await expect(callRsOffer(plugin)).resolves.toBe("fresh");
+
+    expect(rsOfferArgs).toHaveLength(1);
+    expect(rsFailureArgs).toHaveLength(0);
+  });
+
+  it("falls back to the ordinary offer when the pre-check cannot decide", async () => {
+    const { plugin } = makePlugin();
+    attachRsOfferDeps(plugin, async () => {
+      throw new Error("network down");
+    });
+    rsOfferAwaitAction.mockResolvedValue({ action: "fresh-sync" });
+
+    await expect(callRsOffer(plugin)).resolves.toBe("fresh");
+
+    expect(rsOfferArgs).toHaveLength(1);
+    expect(rsFailureArgs).toHaveLength(0);
+    const warn = (plugin.diag as never as {
+      warn: ReturnType<typeof vi.fn>;
+    }).warn;
+    expect(warn).toHaveBeenCalledWith(
+      "state",
+      "EasySync destination pre-check failed; the migration offer keeps its normal shape",
+      expect.objectContaining({ reason: "network down", mutations: 0 }),
+    );
+  });
+
+  it("treats closing the unavailable dialog as an abort", async () => {
+    const { plugin } = makePlugin();
+    attachRsOfferDeps(plugin, async () => [{ id: "existing" }]);
+    rsFailureAwaitAction.mockResolvedValue({ action: "dismiss" });
+
+    await expect(callRsOffer(plugin)).resolves.toBe("abort");
+
+    expect(rsOfferArgs).toHaveLength(0);
+    expect(rsFailureArgs).toHaveLength(1);
   });
 });

@@ -1100,6 +1100,25 @@ export function isIndexedDbRollbackFormRecoveryError(error: unknown): boolean {
   );
 }
 
+/**
+ * The two immutable-publication collisions that can only be produced when an
+ * earlier attempt wrote a record for a sequence whose database transaction
+ * never committed. The restart path proves that with the active metadata and
+ * retires exactly one such record; a caller that holds the same proof may do
+ * the same in-session instead of failing every later commit on different
+ * bytes until the app restarts.
+ *
+ * Both messages are fail-closed in their own layer: they are only recognized
+ * here, never overridden there.
+ */
+export function isIndexedDbRecoveryRecordCollision(error: unknown): boolean {
+  const message = describeError(error);
+  return (
+    message === "IndexedDB recovery target already contains different bytes"
+    || message === "IndexedDB recovery staging already contains different bytes"
+  );
+}
+
 async function validateRecordRaw(raw: string): Promise<void> {
   await parseAndVerifyRecord(raw);
 }

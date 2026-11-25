@@ -26,7 +26,7 @@
  */
 import type { OneDriveClient } from "../onedrive/client";
 import type { DriveItem } from "../onedrive/types";
-import { OneDriveError, OneDriveErrorType } from "../onedrive/types";
+import { RemoteError, RemoteErrorType } from "../remote/errors";
 import { describeError } from "../obsidian-compat";
 import type {
   BaseFileEntry,
@@ -115,6 +115,50 @@ export function seedBaseEntriesFromRsAdoption(
     });
   }
   return seeds;
+}
+
+type RsMigrationDestinationProbe =
+  | { status: "empty" }
+  | { status: "non-empty" }
+  | { status: "unknown"; reason: string };
+
+/** Read-only pre-check for the adoption offer: does this vault's EasySync
+ *  `files/` root already hold children? The read-only vault-scope resolver
+ *  issues GET requests only (no App Folder bootstrap, no `.easy-sync`), so
+ *  the offer can refuse an impossible migration before the user chooses.
+ *  A missing layout counts as empty (the transaction would create it). Any
+ *  other failure is reported as unknown: callers keep the ordinary offer and
+ *  the transaction's write-time guard stays authoritative. */
+export async function probeRsMigrationDestination(
+  onedrive: Pick<OneDriveClient, "initVaultScope" | "listFolderChildrenById">,
+  vaultName: string,
+): Promise<RsMigrationDestinationProbe> {
+  let filesRootId: string;
+  try {
+    const scope = await onedrive.initVaultScope(vaultName, {
+      createMissing: false,
+    });
+    filesRootId = scope.filesRootId;
+  } catch (error) {
+    return isNotFound(error)
+      ? { status: "empty" }
+      : { status: "unknown", reason: describeError(error) };
+  }
+  try {
+    const children = await onedrive.listFolderChildrenById(filesRootId);
+    return children.length > 0
+      ? { status: "non-empty" }
+      : { status: "empty" };
+  } catch (error) {
+    return isNotFound(error)
+      ? { status: "empty" }
+      : { status: "unknown", reason: describeError(error) };
+  }
+}
+
+function isNotFound(error: unknown): boolean {
+  return error instanceof RemoteError
+    && error.type === RemoteErrorType.NotFound;
 }
 
 export async function runRsMigrationTransaction(
@@ -314,8 +358,8 @@ async function moveAllChildren(args: {
         movedNames,
       );
       return {
-        status: error instanceof OneDriveError
-          && error.type === OneDriveErrorType.Forbidden
+        status: error instanceof RemoteError
+          && error.type === RemoteErrorType.Forbidden
           ? "forbidden"
           : "failed",
         reason: `move-failed: ${errorMessage(error)}`,
@@ -396,7 +440,7 @@ async function cleanupRemotelySaveMetadataFiles(
 }
 
 function errorMessage(error: unknown): string {
-  if (error instanceof OneDriveError) {
+  if (error instanceof RemoteError) {
     return `${error.type}${error.graphCode ? `:${error.graphCode}` : ""}`;
   }
   return describeError(error);

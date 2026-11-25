@@ -8,6 +8,24 @@ import en from "../src/i18n/en";
 const VALUES = Object.entries(en as unknown as Record<string, string>);
 
 describe("en copy contracts", () => {
+  // Scan floor + live detectors (测试与检查规范 §2): a renamed/emptied locale
+  // file would otherwise let every loop below pass by scanning nothing, and a
+  // broken regex would do the same. These three assertions are the gate's
+  // self-check, not copy rules.
+  it("keeps the scan surface non-empty and the detectors live", () => {
+    expect(VALUES.length).toBeGreaterThanOrEqual(1000);
+    expect(VALUES.every(([, value]) => typeof value === "string")).toBe(true);
+    // The corpus really contains the positive form the first rule looks for...
+    expect(VALUES.filter(([, value]) => /\bcloud\b/i.test(value)).length)
+      .toBeGreaterThan(0);
+    // ...and the curly quotes the second rule accepts.
+    expect(VALUES.filter(([, value]) => /[“”‘’]/.test(value)).length)
+      .toBeGreaterThan(0);
+    // The detectors themselves fire on planted bad samples.
+    expect(/\bremote\b/i.test("remote copy")).toBe(true);
+    expect(/['"]/.test("it's here")).toBe(true);
+  });
+
   it("keeps cloud as the only cloud-side word outside the stable-code layer", () => {
     for (const [key, value] of VALUES) {
       if (key.startsWith("error.present.")) continue;
@@ -22,15 +40,20 @@ describe("en copy contracts", () => {
     }
   });
 
-  it("pins the conflict buttons the identity-mismatch notice quotes", () => {
+  it("pins the drift notice naming both sides and the keep-side buttons", () => {
     expect(en["syncView.conflict.keepLocal"]).toBe("Keep local");
     expect(en["syncView.conflict.keepRemote"]).toBe("Keep cloud");
+    // The drift notice must name WHICH plugin sits on each side: keeping a
+    // side replaces one plugin with another, so the two identities are the
+    // fact the user decides on (2026-11-23). Both placeholders are required.
     expect(en["syncView.pluginBundleReview.identityMismatchNotice"]).toContain(
-      "“Keep local”",
+      "({local})",
     );
     expect(en["syncView.pluginBundleReview.identityMismatchNotice"]).toContain(
-      "“Keep cloud”",
+      "({remote})",
     );
+    expect(en["syncView.pluginBundleReview.identityWithName"]).toContain("{name}");
+    expect(en["syncView.pluginBundleReview.identityWithName"]).toContain("{id}");
   });
 
   it("pins the one-way keep action name quoted by the reminders-off row", () => {

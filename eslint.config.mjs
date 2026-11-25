@@ -41,6 +41,14 @@ export default defineConfig([
     rules: { "obsidianmd/rule-custom-message": "off" },
   },
   {
+    // 该文件装的是 structuredClone 的宿主探测与 polyfill，方法存在性契约
+    // 必须以 globalThis 为准（下游按全局可见性消费）；它不是 UI／弹窗对象，
+    // 官方 no-global-this 面向的 popout 窗口兼容问题在此不适用。理由在这里
+    // 登记，保持全仓 lint 零告警。
+    files: ["src/structured-clone-compat.ts"],
+    rules: { "obsidianmd/no-global-this": "off" },
+  },
+  {
     languageOptions: {
       parserOptions: {
         projectService: {

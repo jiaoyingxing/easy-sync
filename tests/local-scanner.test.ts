@@ -7,6 +7,7 @@ import {
 } from "../src/sync/local-scanner";
 import type { ScanConfig } from "../src/sync/types";
 import type { PluginScopeSelection } from "../src/sync/community-plugin-sync-policy";
+import { functionBody, readSourceFile } from "./helpers/source-scope";
 
 const content = new TextEncoder().encode("test").buffer;
 
@@ -228,6 +229,90 @@ describe("LocalScanner plugin config paths", () => {
     expect(result.entries.map((entry) => entry.path).sort()).toEqual(expected.sort());
   });
 
+  it.each([true, false])(
+    "recognizes the installed folder from manifest.dir, not the plugin id (includeOwnPluginCode=%s)",
+    async (includeOwnPluginCode) => {
+      // A manual install can live in `.obsidian/plugins/EasySync` while the
+      // manifest id stays `easy-sync`. The plugin's own data.json must never
+      // become an ordinary sync-scoped file: every plan-review write would
+      // otherwise invalidate the plan that was just reviewed (field loop).
+      const directories: Record<string, { files: string[]; folders: string[] }> = {
+        ".obsidian/plugins": {
+          files: [],
+          folders: [
+            ".obsidian/plugins/EasySync",
+            ".obsidian/plugins/example-plugin",
+          ],
+        },
+        ".obsidian/plugins/EasySync": {
+          files: [
+            ".obsidian/plugins/EasySync/main.js",
+            ".obsidian/plugins/EasySync/manifest.json",
+            ".obsidian/plugins/EasySync/styles.css",
+            ".obsidian/plugins/EasySync/data.json",
+            ".obsidian/plugins/EasySync/state-v2.json",
+          ],
+          folders: [".obsidian/plugins/EasySync/tmp"],
+        },
+        ".obsidian/plugins/EasySync/tmp": {
+          files: [".obsidian/plugins/EasySync/tmp/download.part"],
+          folders: [],
+        },
+        ".obsidian/plugins/example-plugin": {
+          files: [".obsidian/plugins/example-plugin/data.json"],
+          folders: [],
+        },
+      };
+      const adapter = {
+        exists: vi.fn(async () => true),
+        list: vi.fn(async (path: string) =>
+          directories[path] ?? { files: [], folders: [] }),
+        stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+        readBinary: vi.fn(async () => content),
+      };
+      const vault = {
+        configDir: ".obsidian",
+        adapter,
+        getFiles: vi.fn(() => []),
+      } as unknown as Vault;
+      const scanner = new LocalScanner(
+        vault,
+        {
+          excludePaths: [".obsidian/"],
+          includePaths: [".obsidian/plugins/"],
+          maxFileSize: 50 * 1024 * 1024,
+          includeOwnPluginCode,
+          includePluginCode: true,
+          includePluginData: true,
+        },
+        "easy-sync",
+        ".obsidian/plugins/EasySync",
+      );
+
+      const result = await scanner.scanAll();
+
+      expect(result.entries.map((entry) => entry.path).sort()).toEqual([
+        ...(includeOwnPluginCode
+          ? [
+              ".obsidian/plugins/EasySync/main.js",
+              ".obsidian/plugins/EasySync/manifest.json",
+              ".obsidian/plugins/EasySync/styles.css",
+            ]
+          : []),
+        ".obsidian/plugins/example-plugin/data.json",
+      ].sort());
+      expect(scanner.shouldSyncPath(
+        ".obsidian/plugins/EasySync/data.json",
+      )).toBe(false);
+      expect(scanner.shouldSyncPath(
+        ".obsidian/plugins/EasySync/state-v2.json",
+      )).toBe(false);
+      expect(scanner.shouldSyncFolderPath(
+        ".obsidian/plugins/EasySync/tmp",
+      )).toBe(false);
+    },
+  );
+
   it("normalizes full folder paths and never scans EasySync logs twice", async () => {
     const { scanner, adapter } = makeScanner(true, true);
 
@@ -411,6 +496,71 @@ describe("LocalScanner folder topology", () => {
     expect(result.folderScanFailures).toEqual([]);
   });
 
+  it("reports examined files against the vault file list", async () => {
+    const files = [0, 1, 2].map((index) =>
+      Object.assign(new TFile(`note-${index}.md`), {
+        stat: { size: content.byteLength, mtime: 1 },
+      }));
+    const adapter = {
+      exists: vi.fn(async () => true),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const reports: Array<[number, number | undefined]> = [];
+    const result = await scanner.scanAll((current, total) => {
+      reports.push([current, total]);
+    });
+
+    expect(result.entries).toHaveLength(3);
+    expect(reports).toEqual([[3, 3]]);
+  });
+
+  it("omits the vault-file denominator when include paths extend the scan", async () => {
+    const files = [0, 1, 2].map((index) =>
+      Object.assign(new TFile(`note-${index}.md`), {
+        stat: { size: content.byteLength, mtime: 1 },
+      }));
+    const adapter = {
+      exists: vi.fn(async () => true),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [".obsidian/snippets/"],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const reports: Array<[number, number | undefined]> = [];
+    await scanner.scanAll((current, total) => {
+      reports.push([current, total]);
+    });
+
+    expect(reports).toEqual([[3, undefined]]);
+  });
+
   it("keeps file sync complete but rejects folder shadow when folder enumeration is unavailable", async () => {
     const adapter = {
       exists: vi.fn(async () => false),
@@ -559,6 +709,199 @@ describe("LocalScanner large file boundary", () => {
     expect(result.skippedLarge).toEqual(["too-large.zip"]);
   });
 
+  it("stops the walk at the next file boundary when the round cancel aborts the scan", async () => {
+    // First sync over a big vault reads every file whole; a cancel must end
+    // the walk instead of running to completion (2026-11-23 field report: a
+    // phone sat on "scanning local files" for a day with no way out).
+    const controller = new AbortController();
+    const readBinary = vi.fn(async (path: string) => {
+      // Cancel lands while the third file is being read.
+      if (path === "note-2.md") controller.abort();
+      return content;
+    });
+    const files = [0, 1, 2, 3, 4].map((index) =>
+      Object.assign(new TFile(`note-${index}.md`), {
+        stat: { size: content.byteLength, mtime: 1 },
+      }));
+    const adapter = {
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary,
+      read: vi.fn(async () => JSON.stringify({ format: 1, entries: {} })),
+      write: vi.fn(async () => {}),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const result = await scanner.scanAll(undefined, controller.signal);
+
+    expect(result.aborted).toBe(true);
+    // The walk stopped instead of hashing the remaining files.
+    expect(readBinary).toHaveBeenCalledTimes(3);
+    expect(result.entries.map((entry) => entry.path)).toEqual([
+      "note-0.md",
+      "note-1.md",
+      "note-2.md",
+    ]);
+    // A partial walk is never a healthy scan and never publishes a complete
+    // view — but the three hashes already paid for are upserted, so the next
+    // attempt can resume instead of re-reading them.
+    expect(result.complete).toBe(false);
+    expect(result.folderScanComplete).toBe(false);
+    expect(adapter.write).toHaveBeenCalledTimes(1);
+    const persisted = JSON.parse(String(adapter.write.mock.calls[0][1]));
+    expect(Object.keys(persisted.entries).sort()).toEqual([
+      "note-0.md",
+      "note-1.md",
+      "note-2.md",
+    ]);
+  });
+
+  it("resumes a cancelled first scan from the persisted hashes", async () => {
+    // The field failure was a phone stuck on "scanning local files" for a
+    // day: every host freeze discarded every hash, so each retry began from
+    // zero. The interrupted walk must hand its prefix to the next scan.
+    const controller = new AbortController();
+    const files = [0, 1, 2, 3, 4].map((index) =>
+      Object.assign(new TFile(`note-${index}.md`), {
+        stat: { size: content.byteLength, mtime: 1 },
+      }));
+    const firstAdapter = {
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async (path: string) => {
+        if (path === "note-2.md") controller.abort();
+        return content;
+      }),
+      read: vi.fn(async () => { throw new Error("no cache"); }),
+      write: vi.fn(async () => {}),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const firstScanner = new LocalScanner({
+      adapter: firstAdapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const interrupted = await firstScanner.scanAll(undefined, controller.signal);
+
+    expect(interrupted.aborted).toBe(true);
+    const persistedCache = String(firstAdapter.write.mock.calls[0][1]);
+
+    const secondRead = vi.fn(async () => content);
+    const secondAdapter = {
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: secondRead,
+      read: vi.fn(async () => persistedCache),
+      write: vi.fn(async () => {}),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const secondScanner = new LocalScanner({
+      adapter: secondAdapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const resumed = await secondScanner.scanAll();
+
+    expect(resumed.complete).toBe(true);
+    expect(secondRead.mock.calls.map(([path]) => path)).toEqual([
+      "note-3.md",
+      "note-4.md",
+    ]);
+  });
+
+  it("still finishes the whole walk when the round signal never aborts", async () => {
+    const controller = new AbortController();
+    const files = [0, 1, 2].map((index) =>
+      Object.assign(new TFile(`note-${index}.md`), {
+        stat: { size: content.byteLength, mtime: 1 },
+      }));
+    const adapter = {
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+      read: vi.fn(async () => JSON.stringify({ format: 1, entries: {} })),
+      write: vi.fn(async () => {}),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const result = await scanner.scanAll(undefined, controller.signal);
+
+    expect(result.aborted).toBeUndefined();
+    expect(result.complete).toBe(true);
+    expect(result.entries).toHaveLength(3);
+    expect(adapter.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("checkpoints the scan cache every 200 hashes during a long walk", async () => {
+    // A host can freeze mid-scan at any point; the checkpoint bounds the
+    // rework to the files hashed since the last write instead of the whole
+    // walk. Three writes for 450 files: checkpoints at 200 and 400, then the
+    // tail save flushes the last 50.
+    const files = Array.from({ length: 450 }, (_, index) =>
+      Object.assign(new TFile(`note-${index}.md`), {
+        stat: { size: content.byteLength, mtime: 1 },
+      }));
+    const adapter = {
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+      read: vi.fn(async () => JSON.stringify({ format: 1, entries: {} })),
+      write: vi.fn(async () => {}),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const scanner = new LocalScanner({
+      adapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => files),
+    } as unknown as Vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.complete).toBe(true);
+    expect(adapter.write).toHaveBeenCalledTimes(3);
+    const firstCheckpoint = JSON.parse(String(adapter.write.mock.calls[0][1]));
+    expect(Object.keys(firstCheckpoint.entries)).toHaveLength(200);
+  });
+
   it("reuses TFile.stat for regular vault files instead of re-statting each path", async () => {
     const adapter = {
       stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
@@ -674,29 +1017,79 @@ describe("LocalScanner large file boundary", () => {
     expect(restored).toHaveLength(1);
     expect(restored[0]).toEqual(history[0]);
   });
+
+  it("reports scan cost facts for the diagnostic summary", async () => {
+    // Diagnostic only: the run summary prints these numbers so a field report
+    // can tell "big vault" from "stuck" without a debug build.
+    const files = [0, 1].map((index) => ({
+      path: `note-${index}.md`,
+      stat: { size: content.byteLength, mtime: 1 },
+    }));
+    const adapter = {
+      read: vi.fn(async () => JSON.stringify({ format: 1, entries: {} })),
+      write: vi.fn(async () => undefined),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => files),
+      getAllLoadedFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+    });
+
+    const cold = await scanner.scanAll();
+    expect(cold.metrics).toMatchObject({
+      files: 2,
+      bytes: content.byteLength * 2,
+      cacheHits: 0,
+    });
+    expect(cold.metrics!.readMs).toBeGreaterThanOrEqual(0);
+    expect(cold.metrics!.hashMs).toBeGreaterThanOrEqual(0);
+
+    const warm = await scanner.scanAll();
+    expect(warm.metrics).toMatchObject({
+      files: 2,
+      bytes: content.byteLength * 2,
+      cacheHits: 2,
+      readMs: 0,
+      hashMs: 0,
+    });
+    expect(adapter.readBinary).toHaveBeenCalledTimes(2);
+  });
 });
 
-describe("LocalScanner scan cache global history bounds", () => {
-  const GLOBAL_ENTRY_LIMIT = 20_000;
+describe("LocalScanner scan cache global history bounds", () => {  const GLOBAL_ENTRY_LIMIT = 20_000;
   const GLOBAL_BYTE_LIMIT = 8 * 1024 * 1024;
   const LOW_WATER = 0.9;
 
-  /** Seed `pathCount` paths x 16 entries with globally distinct observedAt
-   *  increasing with path order, so "oldest" is exactly the first paths. */
-  function seedHistoryCache(pathCount: number, hash: string) {
+  /** Seed `pathCount` paths x `entriesPerPath` entries with globally distinct
+   *  observedAt increasing with path order, so "oldest" is exactly the first
+   *  paths. The default matches the per-path cap (4, 2026-11-23); raw caches
+   *  written under the old 16-entry cap are trimmed on load by the parser. */
+  function seedHistoryCache(
+    pathCount: number,
+    hash: string,
+    entriesPerPath = 4,
+  ) {
     const histories: Record<string, unknown[]> = {};
     const paths: string[] = [];
     for (let pathIndex = 0; pathIndex < pathCount; pathIndex += 1) {
       const path = `history/path-${String(pathIndex).padStart(4, "0")}.md`;
       paths.push(path);
       const entries = [];
-      for (let entryIndex = 0; entryIndex < 16; entryIndex += 1) {
+      for (let entryIndex = 0; entryIndex < entriesPerPath; entryIndex += 1) {
         entries.push({
           mtime: pathIndex + entryIndex,
           size: entryIndex,
           hash,
           binary: false,
-          observedAt: pathIndex * 16 + entryIndex + 1,
+          observedAt: pathIndex * entriesPerPath + entryIndex + 1,
         });
       }
       histories[path] = entries;
@@ -749,9 +1142,26 @@ describe("LocalScanner scan cache global history bounds", () => {
     return bytes;
   }
 
+  it("trims a pre-existing 16-entry chain to the current 4-entry cap on load", async () => {
+    // Caches written before 2026-11-23 can hold 16 entries per path. The
+    // parser applies the current cap on read, so the next checkpoint/save
+    // writes the smaller shape without a migration step.
+    const { paths, cacheJson } = seedHistoryCache(1, "c".repeat(64), 16);
+    const { scanner } = makeSeededScanner(cacheJson);
+    await scanner.scanAll();
+
+    const retained = scanner.pathHistory(paths[0]!);
+    expect(retained).toHaveLength(4);
+    // The newest four survive; the oldest twelve are gone.
+    expect(retained.map((entry) => entry.observedAt)).toEqual([
+      13, 14, 15, 16,
+    ]);
+  });
+
   it("evicts the oldest entries across paths down to the 20,000-entry low-water mark on load", async () => {
-    const { paths, cacheJson } = seedHistoryCache(1_400, "a".repeat(64));
-    // 22,400 seeded entries stay well under the byte cap, so entries bind.
+    // 5,500 paths x 4 entries = 22,000 seeded entries (the per-path cap is 4
+    // since 2026-11-23); this stays well under the byte cap, so entries bind.
+    const { paths, cacheJson } = seedHistoryCache(5_500, "a".repeat(64));
     expect(cacheJson.length).toBeLessThan(GLOBAL_BYTE_LIMIT);
 
     const { scanner, adapter } = makeSeededScanner(cacheJson);
@@ -759,17 +1169,17 @@ describe("LocalScanner scan cache global history bounds", () => {
 
     const entryTarget = Math.floor(GLOBAL_ENTRY_LIMIT * LOW_WATER);
     expect(totalEntries(scanner, paths)).toBe(entryTarget);
-    // 22,400 seeded - 18,000 retained = 4,400 oldest entries evicted, which
-    // is exactly the first 275 paths.
+    // 22,000 seeded - 18,000 retained = 4,000 oldest entries evicted, which
+    // is exactly the first 1,000 paths.
     expect(scanner.pathHistory(paths[0]!)).toHaveLength(0);
-    expect(scanner.pathHistory(paths[274]!)).toHaveLength(0);
-    expect(scanner.pathHistory(paths[275]!)).toHaveLength(16);
-    expect(scanner.pathHistory(paths[275]!)[0]).toMatchObject({
-      observedAt: 4_401,
+    expect(scanner.pathHistory(paths[999]!)).toHaveLength(0);
+    expect(scanner.pathHistory(paths[1_000]!)).toHaveLength(4);
+    expect(scanner.pathHistory(paths[1_000]!)[0]).toMatchObject({
+      observedAt: 4_001,
     });
-    const newest = scanner.pathHistory(paths[1_399]!);
-    expect(newest).toHaveLength(16);
-    expect(newest[newest.length - 1]).toMatchObject({ observedAt: 22_400 });
+    const newest = scanner.pathHistory(paths[5_499]!);
+    expect(newest).toHaveLength(4);
+    expect(newest[newest.length - 1]).toMatchObject({ observedAt: 22_000 });
 
     // The shrunk cache is persisted and a second load leaves it untouched.
     const persisted = adapter.write.mock.calls[0]?.[1] as string | undefined;
@@ -785,9 +1195,9 @@ describe("LocalScanner scan cache global history bounds", () => {
   });
 
   it("evicts by the approximate 8 MB byte cap when oversized entries bind first", async () => {
-    // 300 paths x 16 entries x ~2 KB hashes is ~10 MB: over the byte cap while
+    // 1,200 paths x 4 entries x ~2 KB hashes is ~10 MB: over the byte cap while
     // staying far below the 20,000-entry cap.
-    const { paths, cacheJson } = seedHistoryCache(300, "b".repeat(2_048));
+    const { paths, cacheJson } = seedHistoryCache(1_200, "b".repeat(2_048));
     expect(cacheJson.length).toBeGreaterThan(GLOBAL_BYTE_LIMIT);
 
     const { scanner } = makeSeededScanner(cacheJson);
@@ -800,8 +1210,8 @@ describe("LocalScanner scan cache global history bounds", () => {
     expect(totalBytes(scanner, paths)).toBeLessThanOrEqual(byteTarget);
     // Oldest paths lost their chains; the newest path is fully retained.
     expect(scanner.pathHistory(paths[0]!)).toHaveLength(0);
-    const newest = scanner.pathHistory(paths[299]!);
-    expect(newest).toHaveLength(16);
+    const newest = scanner.pathHistory(paths[1_199]!);
+    expect(newest).toHaveLength(4);
     expect(newest[newest.length - 1]).toMatchObject({ observedAt: 4_800 });
   });
 });
@@ -1049,7 +1459,7 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
     expect(adapter.stat).not.toHaveBeenCalled();
   });
 
-  it("does not prune or persist the scan cache after an incomplete traversal", async () => {
+  it("does not rewrite the scan cache when an incomplete traversal hashed nothing", async () => {
     const adapter = {
       exists: vi.fn(async () => true),
       read: vi.fn(async () => JSON.stringify({
@@ -1078,6 +1488,56 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
 
     expect(result.failedPaths).toContain(".obsidian/plugins");
     expect(adapter.write).not.toHaveBeenCalled();
+  });
+
+  it("keeps prior entries and upserts new hashes after an incomplete traversal", async () => {
+    // One unreadable file used to discard the whole round's cache work. It
+    // must not: an incomplete walk may add content facts (upsert), it may
+    // never infer deletions (prune) — DECISIONS 2026-11-23.03's boundary.
+    const adapter = {
+      exists: vi.fn(async () => true),
+      read: vi.fn(async () => JSON.stringify({
+        format: 1,
+        entries: {
+          "previous.md": {
+            mtime: 1,
+            size: content.byteLength,
+            hash: "aa".repeat(32),
+            binary: false,
+          },
+        },
+      })),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async (path: string) => {
+        if (path === "bad.md") throw new Error("simulated read failure");
+        return content;
+      }),
+      write: vi.fn(async () => undefined),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => [
+        { path: "fresh.md", stat: { size: content.byteLength, mtime: 1 } },
+        { path: "bad.md", stat: { size: content.byteLength, mtime: 1 } },
+      ]),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.complete).toBe(false);
+    expect(result.failedPaths).toEqual(["bad.md"]);
+    expect(adapter.write).toHaveBeenCalledTimes(1);
+    const persisted = JSON.parse(String(adapter.write.mock.calls[0][1]));
+    expect(Object.keys(persisted.entries).sort()).toEqual([
+      "fresh.md",
+      "previous.md",
+    ]);
   });
 
   it("collects orphaned .easy-sync-recovery copies without entering entries", async () => {
@@ -1297,5 +1757,17 @@ describe("LocalScanner.inspectFileStat", () => {
     });
     expect(adapter.stat).not.toHaveBeenCalled();
     expect(adapter.readBinary).not.toHaveBeenCalled();
+  });
+});
+
+describe("local scan host yielding", () => {
+  it("yields every 50 examined files, not only after hashing", () => {
+    const source = readSourceFile("src/sync/local-scanner.ts");
+    const body = functionBody(source, "private async scanVaultFiles(");
+    // A warm scan is all cache hits; the old sleep lived only on the hash
+    // path, so the whole walk ran as one synchronous main-thread block.
+    expect(body).toContain("examinedCount % SCAN_SLEEP_EVERY === 0");
+    expect(body).toContain("await yieldToHost()");
+    expect(body).not.toContain("fileCount");
   });
 });

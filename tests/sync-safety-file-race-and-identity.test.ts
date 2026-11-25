@@ -1973,15 +1973,18 @@ describe("replaced-identity upload state-only rebind", () => {
     expect(harness.onedrive.uploadFile).not.toHaveBeenCalled();
   });
 
-  it("keeps the record blocked when the replacement content differs", async () => {
+  it("retires the upload instead of rebinding when the replacement content differs (P1)", async () => {
     const harness = await makeReplacedIdentityUploadHarness({
       remoteContent: "different",
     });
 
-    await expect(harness.recover()).rejects.toThrow();
+    // P1：新身份上的内容与目标不同，不能声称它是本机这次上传；intent 按
+    // 「未发生」退休，锚点不重绑。下一轮计划用远端新身份 + 本机内容产出
+    // 冲突，由用户选边；两侧内容都不动。
+    await harness.recover();
     expect(harness.state.settleReplacedIdentityUploadResolved)
       .not.toHaveBeenCalled();
-    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.state.mutationLedger).toEqual([]);
     expect(harness.anchorForPath()!.remoteId).toBe(harness.oldRemoteId);
   });
 

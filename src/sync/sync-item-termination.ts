@@ -220,6 +220,19 @@ export function resolvePendingIssueDisposition(input: {
   ) {
     return "retryable-external";
   }
+  // Community-plugin identity blocks with no automatic exit: the row is
+  // waiting on a fact the user controls outside EasySync (repair the manifest,
+  // rename or remove one of two directories declaring the same id, or make one
+  // side the same plugin again). Nothing about "this build" is missing, so a
+  // two-identical-rounds diagnosis here would misdirect the user into filing a
+  // report instead of fixing the directory.
+  if (
+    input.issueCode === "plugin-manifest-invalid"
+    || input.issueCode === "plugin-identity-collision"
+    || input.issueCode === "plugin-identity-drift"
+  ) {
+    return "retryable-external";
+  }
   if (input.reason?.startsWith(BREAKER_DEFERRAL_REASON_PREFIX) === true) {
     return "retryable-external";
   }

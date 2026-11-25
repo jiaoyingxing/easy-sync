@@ -46,6 +46,7 @@ import {
   upsertBaseStateEnvelopeV2,
 } from "../src/sync/file-state-controller-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { toRemoteScanFactsV1 } from "../src/sync/remote-facts-adapter";
 import {
   localDeleteDecisionPathHash,
   localFolderDeleteDecisionPathHash,
@@ -135,7 +136,7 @@ function envelope(input: {
     },
     scope,
     remoteIndex: buildRemoteIndexV2(
-      items,
+      toRemoteScanFactsV1(items),
       scope.filesRootId,
       null,
       2,

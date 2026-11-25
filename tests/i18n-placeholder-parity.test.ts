@@ -189,4 +189,17 @@ describe("i18n placeholder parity", () => {
     );
     expect(en["rsMigration.guideOk"]).toBe("Got it");
   });
+
+  it("locks the 2026-11-17 destination pre-check copy", () => {
+    expect(zhCN["rsMigration.unavailableTitle"]).toBe("无法自动迁移旧仓库");
+    expect(en["rsMigration.unavailableTitle"]).toBe(
+      "Automatic migration is unavailable",
+    );
+    expect(zhCN["rsMigration.guideBodyDestination"]).toBe(
+      "EasySync 的云端目录里已有内容。手动移动时如果遇到同名文件，请先核对再决定保留哪一个，不要直接覆盖。\n1. 打开 onedrive.live.com，进入「应用」文件夹中的「remotely-save」。\n2. 进入与你笔记本同名的文件夹，全选内容。\n3. 移动到「应用」→「EasySync」→「vaults」→ 同名文件夹 →「files」。\n4. 回到 EasySync 点「立即同步」，确认迁移计划即可。",
+    );
+    expect(en["rsMigration.guideBodyDestination"]).toBe(
+      "EasySync’s cloud folder already has content. If you see files with the same name while moving, compare them first and decide which to keep — do not overwrite blindly.\n1. Open onedrive.live.com and go to the “Apps” folder, then “remotely-save”.\n2. Open the folder named after your vault and select everything.\n3. Move it into “Apps” → “EasySync” → “vaults” → the matching folder → “files”.\n4. Back in EasySync, click “Sync now” and confirm the migration plan.",
+    );
+  });
 });

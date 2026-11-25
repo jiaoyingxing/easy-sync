@@ -11,6 +11,17 @@
 
 import { requestUrl, type DataAdapter, type RequestUrlResponse } from "obsidian";
 import { sha256Hex } from "../crypto";
+import type { LanContentHint, LanContentSource, LanSourceProvider } from "../sync/lan-content-source";
+import {
+  normalizeLanRouteType,
+  type LanDiagnosticReason,
+  type LanDiagnostics,
+  type LanRouteType,
+} from "../sync/lan-diagnostics";
+import {
+  DEFAULT_LAN_ACCELERATION_ENABLED,
+  lanAccelerationThresholdBytes,
+} from "../sync/lan-acceleration";
 import {
   compatClearTimeout,
   compatSetTimeout,
@@ -49,6 +60,8 @@ import {
   uploadSessionChunkTimeoutMs,
   type UploadMissingRange,
 } from "./upload-session-policy";
+import { ONEDRIVE_CAPABILITIES } from "./capabilities";
+import type { ProviderCapabilities } from "../sync/provider-capabilities";
 import {
   fingerprintCdnDownloadFailure,
   isPreSignedContentHost,
@@ -189,6 +202,18 @@ const MAX_CLOUD_BOOTSTRAP_BYTES = 64 * 1024 * 1024;
 const MAX_SHARED_PROTOCOL_BYTES = 1024 * 1024;
 const ONEDRIVE_PERSONAL_DRIVE_ID_PATTERN = /^[0-9a-f]{16}$/i;
 
+/** Cross-round memory of the multi-range tier (2026-11-19). A completed round
+ *  hands its settled tier to the next one; a throttled round clears the memory
+ *  instead of carrying a tier the service just rejected. Kept pure so the
+ *  boundary is testable without a live download. */
+export function nextRangeStreamMemory(
+  memory: number | null,
+  observation: { rateLimited: boolean; settledStreams: number | null },
+): number | null {
+  if (observation.rateLimited) return null;
+  return observation.settledStreams ?? memory;
+}
+
 function isSameGraphDriveId(actual: string, expected: string): boolean {
   if (actual === expected) return true;
   return ONEDRIVE_PERSONAL_DRIVE_ID_PATTERN.test(actual)
@@ -246,6 +271,9 @@ interface RequestOptions {
   maxResponseBytesDeclaredKind?: ResponseByteBudgetKind;
   responseLabel?: string;
   sharedSyncProtocolRequestKey?: string;
+  /** Control-plane traffic (for example LAN signaling) must not appear in the
+   *  file-transfer run metrics or token-acquisition counters. */
+  suppressMetrics?: boolean;
 }
 
 type OneDriveEndpointCategory =
@@ -366,6 +394,16 @@ export class OneDriveClient {
   private storageVaultNames = new Map<string, string>();
   private vaultScopes = new Map<string, RemoteVaultScope>();
   private abortSignal: AbortSignal | null = null;
+  /** S2a dev-only LAN source: in-memory only, never persisted or sent to Graph. */
+  private lanContentSource: LanContentSource | null = null;
+  /** S5a automatic connection provider; `null` while the setting is off. */
+  private lanSourceProvider: LanSourceProvider | null = null;
+  /** S4 runtime gate. Product default on (2026-11-24); main.ts pushes the
+   *  persisted value before any sync, and no source/provider means no attempt
+   *  regardless of this flag. */
+  private lanAccelerationEnabled = DEFAULT_LAN_ACCELERATION_ENABLED;
+  private lanAccelerationThresholdBytes = lanAccelerationThresholdBytes(8);
+  private lanDiagnostics: LanDiagnostics | null = null;
   /** Remember which download strategy worked last in this sync round so
    *  subsequent files skip the waterfall of known-broken tiers. */
   private downloadMethod: "downloadUrl" | "content" | null = null;
@@ -427,8 +465,167 @@ export class OneDriveClient {
     this.rangeStreamAdaptation = createRangeStreamAdaptation({ diag: this.diag });
   }
 
+  /** 静态能力声明；getter 不占实例字段，也不读取 token / 网络 / 配置。 */
+  get capabilities(): ProviderCapabilities {
+    return ONEDRIVE_CAPABILITIES;
+  }
+
   setAbortSignal(signal: AbortSignal | null): void {
     this.abortSignal = signal;
+  }
+
+  /** S2a: install/remove the dev-only LAN source for the next downloads. */
+  setLanContentSource(source: LanContentSource | null): void {
+    this.lanContentSource = source;
+  }
+
+  /**
+   * S5a: register the automatic connection provider.
+   *
+   * The client never starts a connection itself; it only asks this provider for
+   * a source when a download is about to try LAN. Passing `null` (setting off)
+   * also stops the provider so no watcher keeps polling in the background.
+   */
+  setLanSourceProvider(provider: LanSourceProvider | null): void {
+    this.lanSourceProvider = provider;
+    if (provider === null) {
+      this.lanContentSource = null;
+    }
+  }
+
+  /**
+   * Start a background acquisition early.
+   *
+   * The sync entry calls this before planning so the handshake overlaps the
+   * scan instead of starting once a download is already blocked on it. It is
+   * a hint only: no source, no wait and no cloud-call change happens here.
+   *
+   * `expectDownloads` is the caller's honest expectation: on the first round
+   * of a device that has never downloaded anything, prewarming would write a
+   * cloud request that no peer answers. Devices that only upload stay silent
+   * and let the peer (the device that actually downloads) ask for the room.
+   */
+  prewarmLanSource(expectDownloads: boolean): void {
+    if (!expectDownloads) return;
+    if (!this.lanAccelerationEnabled) return;
+    if (this.lanContentSource !== null) return;
+    this.lanSourceProvider?.prewarm?.();
+  }
+
+  /** S4: apply the setting immediately; no restart and no extra I/O. */
+  setLanAcceleration(config: {
+    enabled: boolean;
+    thresholdBytes: number;
+  } | null): void {
+    this.lanAccelerationEnabled = config?.enabled === true;
+    this.lanAccelerationThresholdBytes = config === null
+      || !Number.isFinite(config.thresholdBytes)
+      || config.thresholdBytes < 0
+      ? lanAccelerationThresholdBytes(8)
+      : config.thresholdBytes;
+  }
+
+  setLanDiagnostics(diagnostics: LanDiagnostics | null): void {
+    this.lanDiagnostics = diagnostics;
+  }
+
+  /**
+   * Gate shared with the executor: the switch, an installed source (or a
+   * registered provider that can install one) and the per-file threshold must
+   * all agree before a LAN attempt is created. The executor uses this so
+   * disabled/below-threshold downloads keep the exact cloud call shape.
+   *
+   * Stays synchronous: a provider is only a promise to try, not a channel.
+   */
+  shouldAttemptLan(fileSize: number): boolean {
+    return this.lanAccelerationEnabled
+      && (this.lanContentSource !== null || this.lanSourceProvider !== null)
+      && Number.isFinite(fileSize)
+      && fileSize >= this.lanAccelerationThresholdBytes;
+  }
+
+  /** Why this call cannot try LAN; null means "go ahead". */
+  private lanSkipReason(hint: LanContentHint): LanDiagnosticReason | null {
+    if (!this.lanAccelerationEnabled) return "disabled";
+    if (this.lanContentSource === null && this.lanSourceProvider === null) {
+      return "no-source";
+    }
+    if (!(hint.size >= this.lanAccelerationThresholdBytes)) {
+      return "below-threshold";
+    }
+    return null;
+  }
+
+  /**
+   * Resolve the source for one attempt: the installed one, or one acquired by
+   * the provider within its own bounded window.
+   *
+   * A provider failure is a normal fallback, never an error for the caller:
+   * `null` keeps the cloud download untouched and the diagnostic snapshot
+   * records why. No retry loop lives here.
+   */
+  private async resolveLanSource(
+    hint: LanContentHint,
+  ): Promise<LanContentSource | null> {
+    if (this.lanContentSource !== null) return this.lanContentSource;
+    const provider = this.lanSourceProvider;
+    if (provider === null) return null;
+    try {
+      const acquired = await provider.acquire(hint);
+      if (acquired === null) {
+        this.recordLanAttempt({
+          outcome: "skipped",
+          reason: "no-source",
+          route: "unknown",
+          bytes: 0,
+          elapsedMs: 0,
+        });
+        return null;
+      }
+      // The provider may already have injected the source; adopting it here
+      // keeps later files from asking again.
+      this.lanContentSource = acquired;
+      this.diag?.log("execute", "LAN source acquired for download", {
+        path: hint.path,
+        size: hint.size,
+      });
+      return acquired;
+    } catch (error) {
+      this.recordLanAttempt({
+        outcome: "fallback",
+        reason: "source-error",
+        route: "unknown",
+        bytes: 0,
+        elapsedMs: 0,
+      });
+      this.diag?.log("execute", "LAN source acquisition failed; falling back", {
+        error: describeError(error),
+      });
+      return null;
+    }
+  }
+
+  private recordLanAttempt(snapshot: {
+    outcome: "hit" | "fallback" | "rejected" | "skipped";
+    reason?: LanDiagnosticReason;
+    route: LanRouteType;
+    bytes: number;
+    elapsedMs: number;
+  }): void {
+    this.lanDiagnostics?.record({
+      ...snapshot,
+      at: Date.now(),
+    });
+  }
+
+  private async readLanRoute(
+    source: LanContentSource,
+  ): Promise<LanRouteType> {
+    try {
+      return normalizeLanRouteType(await source.getRouteType?.());
+    } catch {
+      return "unknown";
+    }
   }
 
   /** Node-https multi-range downloader (C 载体, 2026-09-14). Lazily resolved
@@ -447,11 +644,17 @@ export class OneDriveClient {
   /** Round-scoped stream-count plan for desktop multi-range downloads (G3,
    *  2026-10-27). One instance is shared by every large file in the round, so
    *  a second file starts where the previous one stopped instead of probing
-   *  from 8 again. `resetDownloadStrategy()` restores the 8-stream start; the
-   *  state deliberately never reaches data.json (link conditions are
-   *  round-local, and a stale high tier after a network switch is worse than
-   *  one cheap first file). */
+   *  from 8 again. `resetDownloadStrategy()` restores the start; the state
+   *  deliberately never reaches data.json (link conditions are round-local),
+   *  and the one value that does cross rounds is the settled tier below. */
   private rangeStreamAdaptation: RangeStreamAdaptation;
+
+  /** The tier the previous completed round settled on (confirmed knee or hold
+   *  band, 2026-11-19). The next round starts one rung below it and re-proves
+   *  the step with the ordinary probe machinery, so a link that changed
+   *  between rounds falls back instead of inheriting a stale high tier. A 429
+   *  clears it; session memory only, never persisted. */
+  private lastRangeStreamSettled: number | null = null;
 
   /** Start an in-memory diagnostic scope for one sync round. */
   beginRunMetrics(): void {
@@ -529,12 +732,12 @@ export class OneDriveClient {
     );
   }
 
-  private async acquireToken(): Promise<string> {
-    const startedAt = Date.now();
+  private async acquireToken(suppressMetrics = false): Promise<string> {
+    const startedAt = suppressMetrics ? null : Date.now();
     try {
       return await this.getToken();
     } finally {
-      this.recordTokenAcquisition(startedAt);
+      if (startedAt !== null) this.recordTokenAcquisition(startedAt);
     }
   }
 
@@ -697,8 +900,12 @@ export class OneDriveClient {
     };
   }
 
-  /** Ensure a directory exists and return its metadata when Graph creates it. */
-  async createFolder(folderPath: string): Promise<DriveItem | null> {
+  /** Ensure a directory exists and return its metadata when Graph creates it.
+   *  `suppressMetrics` keeps control-plane folder setup out of file metrics. */
+  async createFolder(
+    folderPath: string,
+    suppressMetrics = false,
+  ): Promise<DriveItem | null> {
     // For path-based creation, we use:
     // PUT /me/drive/special/approot:/path/to/folder
     const encodedName = folderPath.split("/").pop() || "";
@@ -711,6 +918,8 @@ export class OneDriveClient {
           folder: {},
           "@microsoft.graph.conflictBehavior": "fail",
         },
+        undefined,
+        { suppressMetrics },
       );
       return response.json as DriveItem;
     } catch (e) {
@@ -1029,8 +1238,7 @@ export class OneDriveClient {
    * endpoint).
    *
    * 已在真实账号实测可用（2026-10-19，应用文件夹权限域 `Files.ReadWrite.AppFolder`
-   * + `Files.Read`，探针目录已清理；原始证据：
-   * `.tmp/20261027-235123-docs-evidence迁出/20261019-171659 回收站恢复能力实测-原始证据.json`）：
+   * + `Files.Read`；原始证据已随临时区清理退役，见日志 `20261019-171659`）：
    * 成功应答 200 带响应体，文件回到原父目录、名字与内容逐字节不变；旧文档口径的
    * 204 一并接受（2xx 一律当成功）。
    *
@@ -1202,11 +1410,15 @@ export class OneDriveClient {
     vaultName: string,
     filePaths: readonly string[],
     metadataReason: OneDriveMetadataReason = "other",
+    options: { chunkConcurrency?: number } = {},
   ): Promise<Map<string, DriveItem | null>> {
     const uniquePaths = [...new Set(filePaths.filter(Boolean))];
     const resolved = new Map<string, DriveItem | null>();
+    const chunks: string[][] = [];
     for (let offset = 0; offset < uniquePaths.length; offset += 20) {
-      const batchPaths = uniquePaths.slice(offset, offset + 20);
+      chunks.push(uniquePaths.slice(offset, offset + 20));
+    }
+    const readChunk = async (batchPaths: string[]): Promise<void> => {
       try {
         await this.readFilePathBatch(
           vaultName,
@@ -1228,7 +1440,31 @@ export class OneDriveClient {
           },
         );
       }
+    };
+    // A wave's absence proof is on the critical path before its first erase,
+    // and a 20-path `$batch` costs ~5 s on the field link (its own latency
+    // grows with the sub-request count). The caller may therefore run a few
+    // chunks beside each other; every chunk still isolates its own failure.
+    const chunkConcurrency = Math.max(
+      1,
+      Math.min(
+        Math.floor(options.chunkConcurrency ?? 1) || 1,
+        chunks.length || 1,
+      ),
+    );
+    if (chunkConcurrency === 1) {
+      for (const chunk of chunks) await readChunk(chunk);
+      return resolved;
     }
+    const queue = chunks.slice();
+    const workers = Array.from({ length: chunkConcurrency }, async () => {
+      for (;;) {
+        const chunk = queue.shift();
+        if (!chunk) return;
+        await readChunk(chunk);
+      }
+    });
+    await Promise.all(workers);
     return resolved;
   }
 
@@ -1530,15 +1766,26 @@ export class OneDriveClient {
   }
 
   /** Reset the per-round download strategy hint. Called at the start of
-   *  each sync round so the first file runs the full waterfall. */
+   *  each sync round so the first file runs the full waterfall. The settled
+   *  multi-range tier is carried across rounds one rung below itself
+   *  (2026-11-19 warm start); a 429 clears it. */
   resetDownloadStrategy(): void {
+    this.lastRangeStreamSettled = nextRangeStreamMemory(
+      this.lastRangeStreamSettled,
+      {
+        rateLimited: this.rangeStreamAdaptation.hadRateLimitThisRound,
+        settledStreams: this.rangeStreamAdaptation.settledStreamsForNextRound(),
+      },
+    );
     this.downloadMethod = null;
     this.contentFailedThisRound = false;
     this.cdnFailedThisRound = false;
     this.cdnTransportFailuresThisRound = 0;
     this.cdnCircuitOpenThisRound = false;
     this.slowLinkEvidence = createSlowLinkEvidence();
-    this.rangeStreamAdaptation.reset();
+    this.rangeStreamAdaptation.reset({
+      settledStreams: this.lastRangeStreamSettled ?? undefined,
+    });
   }
 
   /** One CDN-path attempt ended. Two independent rules read the same failure:
@@ -2658,6 +2905,213 @@ export class OneDriveClient {
     });
   }
 
+  /**
+   * S2a: LAN-first buffered download. The hint carries the authorized remote
+   * sha256/size; any source failure or mismatch falls back to the unchanged
+   * cloud waterfall. The LAN attempt deliberately runs before
+   * `downloadWithWaterfall`, so Graph metric and CDN breaker state stay clean.
+   */
+  async downloadFileWithLan(
+    vaultName: string,
+    filePath: string,
+    downloadUrl: string | undefined,
+    driveItemId: string | undefined,
+    fileSize: number,
+    onProgress: ((downloaded: number, total: number) => void) | undefined,
+    lanHint: LanContentHint,
+  ): Promise<ArrayBuffer> {
+    const skipReason = this.lanSkipReason(lanHint);
+    if (skipReason !== null) {
+      // Settings are off or the file is below the threshold: no LAN log and no
+      // cloud-call change, only the bounded in-memory diagnostic snapshot.
+      this.recordLanAttempt({
+        outcome: "skipped",
+        reason: skipReason,
+        route: "unknown",
+        bytes: 0,
+        elapsedMs: 0,
+      });
+    } else {
+      // S5a: the first eligible file of a session may need to acquire the
+      // channel; later files reuse the installed source with no handshake.
+      const source = await this.resolveLanSource(lanHint);
+      if (source !== null) {
+        const startedAt = Date.now();
+        try {
+          const result = await source.downloadFile(
+            lanHint,
+            onProgress,
+            this.abortSignal ?? undefined,
+          );
+          const actual = await sha256Hex(result.bytes);
+          const elapsedMs = Date.now() - startedAt;
+          const route = await this.readLanRoute(source);
+          if (result.bytes.byteLength === lanHint.size
+            && actual === result.sha256.toLowerCase()
+            && (lanHint.expectedSha256 === undefined
+              || actual === lanHint.expectedSha256.toLowerCase())) {
+            if (route === "relay") {
+              // A relay is not the same-LAN path this feature promises; the
+              // cloud waterfall is the fallback, not a slower detour.
+              this.recordLanAttempt({
+                outcome: "fallback",
+                reason: "route-relay",
+                route,
+                bytes: result.bytes.byteLength,
+                elapsedMs,
+              });
+              this.diag?.log("execute", `LAN relay route; falling back: ${filePath}`);
+            } else {
+              this.recordLanAttempt({
+                outcome: "hit",
+                route,
+                bytes: result.bytes.byteLength,
+                elapsedMs,
+              });
+              this.diag?.log("execute", `LAN content hit: ${filePath}`, {
+                bytes: result.bytes.byteLength,
+              });
+              return result.bytes;
+            }
+          } else {
+            this.recordLanAttempt({
+              outcome: "rejected",
+              reason: "hash-mismatch",
+              route,
+              bytes: result.bytes.byteLength,
+              elapsedMs,
+            });
+            this.diag?.log("execute", `LAN content rejected; falling back: ${filePath}`);
+          }
+        } catch (error) {
+          this.recordLanAttempt({
+            outcome: "fallback",
+            reason: "source-error",
+            route: await this.readLanRoute(source),
+            bytes: 0,
+            elapsedMs: Date.now() - startedAt,
+          });
+          this.diag?.log("execute", `LAN content failed; falling back: ${filePath}`, {
+            error: describeError(error),
+          });
+        }
+      }
+    }
+    return this.downloadFile(
+      vaultName,
+      filePath,
+      downloadUrl,
+      driveItemId,
+      fileSize,
+      onProgress,
+    );
+  }
+
+  /**
+   * S2a: LAN-first temp-file download (mobile path, wired in S3). Same
+   * fallback rule; a failed LAN prefix is removed before the cloud writer.
+   */
+  async downloadFileToPathWithLan(
+    vaultName: string,
+    filePath: string,
+    localPath: string,
+    adapter: DataAdapter,
+    downloadUrl: string | undefined,
+    driveItemId: string | undefined,
+    fileSize: number,
+    expectedSha256: string | undefined,
+    onProgress: ((downloaded: number, total: number) => void) | undefined,
+    lanHint: LanContentHint,
+  ): Promise<DownloadToPathResult> {
+    const skipReason = this.lanSkipReason(lanHint);
+    if (skipReason !== null) {
+      this.recordLanAttempt({
+        outcome: "skipped",
+        reason: skipReason,
+        route: "unknown",
+        bytes: 0,
+        elapsedMs: 0,
+      });
+    } else {
+      // S5a: same acquisition seam as the buffered lane.
+      const source = await this.resolveLanSource(lanHint);
+      if (source !== null) {
+        const startedAt = Date.now();
+        try {
+          const result = await source.downloadFileToPath(
+            lanHint,
+            localPath,
+            adapter,
+            onProgress,
+            this.abortSignal ?? undefined,
+          );
+          const elapsedMs = Date.now() - startedAt;
+          const route = await this.readLanRoute(source);
+          if (result.size === lanHint.size
+            && result.hash.length > 0
+            && (lanHint.expectedSha256 === undefined
+              || result.hash.toLowerCase() === lanHint.expectedSha256.toLowerCase())) {
+            if (route === "relay") {
+              await adapter.remove(localPath).catch(() => undefined);
+              this.recordLanAttempt({
+                outcome: "fallback",
+                reason: "route-relay",
+                route,
+                bytes: result.size,
+                elapsedMs,
+              });
+              this.diag?.log("execute", `LAN relay route; falling back: ${filePath}`);
+            } else {
+              this.recordLanAttempt({
+                outcome: "hit",
+                route,
+                bytes: result.size,
+                elapsedMs,
+              });
+              this.diag?.log("execute", `LAN content hit (path): ${filePath}`, {
+                bytes: result.size,
+              });
+              return result;
+            }
+          } else {
+            await adapter.remove(localPath).catch(() => undefined);
+            this.recordLanAttempt({
+              outcome: "rejected",
+              reason: "hash-mismatch",
+              route,
+              bytes: result.size,
+              elapsedMs,
+            });
+            this.diag?.log("execute", `LAN content rejected; falling back: ${filePath}`);
+          }
+        } catch (error) {
+          await adapter.remove(localPath).catch(() => undefined);
+          this.recordLanAttempt({
+            outcome: "fallback",
+            reason: "source-error",
+            route: await this.readLanRoute(source),
+            bytes: 0,
+            elapsedMs: Date.now() - startedAt,
+          });
+          this.diag?.log("execute", `LAN content failed; falling back: ${filePath}`, {
+            error: describeError(error),
+          });
+        }
+      }
+    }
+    return this.downloadFileToPath(
+      vaultName,
+      filePath,
+      localPath,
+      adapter,
+      downloadUrl,
+      driveItemId,
+      fileSize,
+      expectedSha256,
+      onProgress,
+    );
+  }
+
   /** Download directly to a local temp file.
    *
    *  Used by the sync executor on modern mobile runtimes to avoid holding
@@ -3248,6 +3702,195 @@ export class OneDriveClient {
       eTag,
     );
     return requirePluginControlFileVersion(response.json, "CloudBootstrapV2");
+  }
+
+  // ---- Generic plugin control files (LAN signaling) ----
+
+  /** Read one exact plugin-control text file by `.easy-sync`-relative path.
+   *  Returns null only when the exact path does not exist. Metrics are
+   *  suppressed because signaling is not file-transfer work. */
+  async readPluginControlText(
+    vaultName: string,
+    relativePath: string,
+    maxBytes: number,
+    label = "Plugin control file",
+  ): Promise<{ id: string; eTag: string; text: string } | null> {
+    const storageVaultName = this.getStorageVaultName(vaultName);
+    const apiPath = APP_FOLDER_PATHS.pluginItem(storageVaultName, relativePath);
+    let item: DriveItem;
+    try {
+      const response = await this.request("GET", apiPath, undefined, undefined, {
+        expectedNotFound: true,
+        suppressMetrics: true,
+      });
+      item = response.json as DriveItem;
+    } catch (error) {
+      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+        return null;
+      }
+      throw error;
+    }
+    if (!item.file) throw new Error(`${label} is not a file`);
+    if (!item.id || !item.eTag) {
+      throw new Error(`${label} metadata is incomplete`);
+    }
+    assertDeclaredRemoteSize(item.size, maxBytes, label);
+    if (item["@microsoft.graph.downloadUrl"]) {
+      try {
+        const response = await withTimeout(
+          requestUrl({
+            url: item["@microsoft.graph.downloadUrl"],
+            method: "GET",
+          }),
+          METADATA_READ_TIMEOUT_MS,
+        );
+        return {
+          id: item.id,
+          eTag: item.eTag,
+          text: responseToText(response, maxBytes, label),
+        };
+      } catch (error) {
+        if (isResponseByteBudgetError(error)) throw error;
+        rethrowUncancellableRequestTimeout(error);
+        // Fall through to the authenticated ID /content path.
+      }
+    }
+    const response = await this.request(
+      "GET",
+      `/me/drive/items/${encodeURIComponent(item.id)}/content`,
+      undefined,
+      undefined,
+      {
+        maxResponseBytes: maxBytes,
+        responseLabel: label,
+        suppressMetrics: true,
+      },
+    );
+    return {
+      id: item.id,
+      eTag: item.eTag,
+      text: responseToText(response, maxBytes, label),
+    };
+  }
+
+  /** Write one exact plugin-control text file by `.easy-sync`-relative path.
+   *  `createOnly` maps to Graph's fail-on-conflict PUT; `ifMatch` maps to an
+   *  If-Match version guard. */
+  async writePluginControlText(
+    vaultName: string,
+    relativePath: string,
+    content: string,
+    options: { createOnly?: boolean; ifMatch?: string } = {},
+  ): Promise<{ id: string; eTag: string }> {
+    if (options.createOnly === true && options.ifMatch !== undefined) {
+      throw new Error("Plugin control write cannot be both create-only and If-Match");
+    }
+    const apiPath = options.createOnly === true
+      ? `${APP_FOLDER_PATHS.pluginItem(this.getStorageVaultName(vaultName), relativePath)}:/content?@microsoft.graph.conflictBehavior=fail`
+      : `${APP_FOLDER_PATHS.pluginItem(this.getStorageVaultName(vaultName), relativePath)}:/content`;
+    const response = await this.request(
+      "PUT",
+      apiPath,
+      content,
+      "application/json",
+      { suppressMetrics: true },
+      options.ifMatch,
+    );
+    return requirePluginControlFileVersion(response.json, "LAN signal");
+  }
+
+  /** Delete one exact plugin-control item by relative path. Returns false when
+   *  the item is already absent. */
+  async deletePluginControlItem(
+    vaultName: string,
+    relativePath: string,
+    ifMatch?: string,
+  ): Promise<boolean> {
+    const apiPath = APP_FOLDER_PATHS.pluginItem(
+      this.getStorageVaultName(vaultName),
+      relativePath,
+    );
+    try {
+      await this.request(
+        "DELETE",
+        apiPath,
+        undefined,
+        undefined,
+        { expectedNotFound: true, suppressMetrics: true },
+        ifMatch,
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /** List one plugin-control folder's immediate children. A missing folder is
+   *  an empty listing; pagination is followed to completion. */
+  async listPluginControlChildren(
+    vaultName: string,
+    relativePath: string,
+  ): Promise<DriveItem[]> {
+    const basePath = APP_FOLDER_PATHS.pluginItem(
+      this.getStorageVaultName(vaultName),
+      relativePath,
+    );
+    const children: DriveItem[] = [];
+    const seen = new Set<string>();
+    let url: string | null =
+      `${basePath}:/children?$select=id,name,size,eTag,file,folder`;
+    while (url) {
+      if (seen.has(url)) {
+        throw new Error("Plugin control directory pagination repeated a page");
+      }
+      seen.add(url);
+      let data: { value?: DriveItem[]; "@odata.nextLink"?: unknown };
+      try {
+        const response = await this.request("GET", url, undefined, undefined, {
+          expectedNotFound: true,
+          suppressMetrics: true,
+        });
+        data = response.json as typeof data;
+      } catch (error) {
+        if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+          return children;
+        }
+        throw error;
+      }
+      if (!Array.isArray(data.value)) {
+        throw new Error("Plugin control directory response is invalid");
+      }
+      children.push(...data.value);
+      const nextLink = data["@odata.nextLink"];
+      if (nextLink === undefined) {
+        url = null;
+      } else if (typeof nextLink === "string" && nextLink.length > 0) {
+        url = nextLink;
+      } else {
+        throw new Error("Plugin control directory continuation is invalid");
+      }
+    }
+    return children;
+  }
+
+  /** Ensure one plugin-control folder path exists, creating shallower levels
+   *  first. Control-plane metrics are suppressed. */
+  async ensurePluginControlFolder(
+    vaultName: string,
+    relativePath: string,
+  ): Promise<void> {
+    const segments = relativePath.split("/").filter((segment) => segment.length > 0);
+    const storageVaultName = this.getStorageVaultName(vaultName);
+    for (let index = 1; index <= segments.length; index += 1) {
+      const path = segments.slice(0, index).join("/");
+      await this.createFolder(
+        APP_FOLDER_PATHS.pluginItem(storageVaultName, path),
+        true,
+      );
+    }
   }
 
   // ---- Shared Sync Protocol V2 ----
@@ -4058,7 +4701,7 @@ export class OneDriveClient {
   ): Promise<RequestUrlResponse> {
     throwIfAborted(this.abortSignal);
     const url = resolveAuthenticatedGraphUrl(apiPath);
-    const token = await this.acquireToken();
+    const token = await this.acquireToken(options.suppressMetrics === true);
 
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
@@ -4127,7 +4770,9 @@ export class OneDriveClient {
     } = args;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       throwIfAborted(this.abortSignal);
-      const attemptStartedAt = this.beginMetricAttempt(endpoint);
+      const attemptStartedAt = options.suppressMetrics
+        ? 0
+        : this.beginMetricAttempt(endpoint);
       try {
         const timeoutMs = options.perRequestTimeoutMs
           ? requestTimeoutWithCap(options.deadlineMs, options.perRequestTimeoutMs)
@@ -4175,15 +4820,17 @@ export class OneDriveClient {
             ? responsePayloadByteLength(response)
             : 0;
         const observedAttempt = attempt + (options.observationAttemptOffset ?? 0);
-        this.finishMetricAttempt(
-          endpoint,
-          "success",
-          attemptStartedAt,
-          effectiveBytes,
-          observedAttempt > 1 ? effectiveBytes : 0,
-          0,
-          options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
-        );
+        if (!options.suppressMetrics) {
+          this.finishMetricAttempt(
+            endpoint,
+            "success",
+            attemptStartedAt,
+            effectiveBytes,
+            observedAttempt > 1 ? effectiveBytes : 0,
+            0,
+            options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
+          );
+        }
         return response;
       } catch (rawError) {
         const syntheticTimeout = rawError instanceof SyntheticRequestTimeoutError;
@@ -4204,16 +4851,18 @@ export class OneDriveClient {
         const expectedNotFound = options.expectedNotFound === true
           && error.type === OneDriveErrorType.NotFound;
         const observedAttempt = attempt + (options.observationAttemptOffset ?? 0);
-        this.finishMetricAttempt(
-          endpoint,
-          requestAttemptStatus(error, this.abortSignal),
-          attemptStartedAt,
-          0,
-          observedAttempt > 1 ? requestBytes : 0,
-          0,
-          options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
-          expectedNotFound,
-        );
+        if (!options.suppressMetrics) {
+          this.finishMetricAttempt(
+            endpoint,
+            requestAttemptStatus(error, this.abortSignal),
+            attemptStartedAt,
+            0,
+            observedAttempt > 1 ? requestBytes : 0,
+            0,
+            options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
+            expectedNotFound,
+          );
+        }
         // A locally timed-out idempotent read (deadline fired, no HTTP outcome,
         // GET/HEAD cannot double-apply on resend) joins the ordinary transient
         // retry path below instead of abandoning the run — join 弱网「稍后重试」
@@ -5178,10 +5827,7 @@ function retryDelayMs(error: OneDriveError, attempt: number): number {
 
 function requirePluginControlFileVersion(
   value: unknown,
-  label:
-    | "CloudBootstrapV2"
-    | "SharedSyncProtocolV2"
-    | "SharedSyncProtocolV3",
+  label: string,
 ): { id: string; eTag: string } {
   if (!value || typeof value !== "object") {
     throw new Error(`${label} write returned no metadata`);
@@ -5212,8 +5858,37 @@ export function sha256BitLengthWords(totalBytes: number): [number, number] {
   return [Math.floor(totalBitLength / 0x1_0000_0000), totalBitLength >>> 0];
 }
 
-class StreamingSha256 {
-  private static readonly K = [
+/**
+ * Incremental SHA-256 over a byte stream.
+ *
+ * Why a hand-written hasher exists at all: mobile downloads write bytes to disk
+ * as they arrive (`.part` streaming) and the LAN receiver streams into 1 MiB
+ * partitions, so the digest must be computed while the payload flows. WebCrypto
+ * can only digest a complete buffer, which for a 100 MB file would mean a
+ * second full copy in memory — exactly what the mobile path must avoid.
+ *
+ * Throughput is a functional requirement, not vanity: both callers hash the
+ * same bytes their transfer is blocked on, so this loop's speed is a floor
+ * under the achieved transfer rate. The pre-2026-11-21 shape measured
+ * 41.9 MiB/s on a 94.7 MiB file (2.2 s of hashing per file per side); the shape
+ * below measures 81.2 MiB/s (1.94x, 1.14 s) on the same file.
+ * The shape is chosen for that:
+ *   - one 16-word rolling schedule reused across blocks: a fresh 64-word array
+ *     per 64-byte block cost 4x more, dominated by allocation;
+ *   - the first 16 rounds read the message words and compress in the same pass,
+ *     so each scheduled word is written once instead of load-then-reread;
+ *   - rotation is inlined as shift expressions rather than a helper call, which
+ *     keeps the hot loop monomorphic.
+ *
+ * Correctness is pinned byte-for-byte against WebCrypto across block, padding
+ * and chunking boundaries in `tests/onedrive-streaming-sha256.test.ts`.
+ * `digestHex` finalizes the state (single-shot), which is how both callers use it.
+ */
+export class StreamingSha256 {
+  /** Typed array, not a plain array: the hot loop indexes this 64 times per
+   *  block, and a plain array of numeric literals pays a per-read element-kind
+   *  check. Measured inside the full shape change (1.94x overall). */
+  private static readonly K = new Int32Array([
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -5230,7 +5905,7 @@ class StreamingSha256 {
     0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-  ];
+  ]);
 
   private h0 = 0x6a09e667;
   private h1 = 0xbb67ae85;
@@ -5243,6 +5918,8 @@ class StreamingSha256 {
   private pending = new Uint8Array(64);
   private pendingLength = 0;
   private totalBytes = 0;
+  /** One rolling message schedule for the whole stream; index `t & 15`. */
+  private readonly schedule = new Int32Array(16);
 
   update(chunk: Uint8Array): void {
     let offset = 0;
@@ -5307,19 +5984,8 @@ class StreamingSha256 {
   }
 
   private processBlock(block: Uint8Array, offset: number): void {
-    const w = new Uint32Array(64);
-    for (let t = 0; t < 16; t++) {
-      const i = offset + t * 4;
-      w[t] = (block[i] << 24)
-        | (block[i + 1] << 16)
-        | (block[i + 2] << 8)
-        | block[i + 3];
-    }
-    for (let t = 16; t < 64; t++) {
-      const s0 = rotr32(w[t - 15], 7) ^ rotr32(w[t - 15], 18) ^ (w[t - 15] >>> 3);
-      const s1 = rotr32(w[t - 2], 17) ^ rotr32(w[t - 2], 19) ^ (w[t - 2] >>> 10);
-      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
-    }
+    const w = this.schedule;
+    const k = StreamingSha256.K;
     let a = this.h0;
     let b = this.h1;
     let c = this.h2;
@@ -5328,11 +5994,25 @@ class StreamingSha256 {
     let f = this.h5;
     let g = this.h6;
     let h = this.h7;
-    for (let t = 0; t < 64; t++) {
-      const s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+
+    // Rounds 0–15 read the block straight into the schedule and compress it in
+    // the same pass; keeping the two loops identical in the hot path was slower
+    // because every word was written and then re-read from the array.
+    for (let t = 0; t < 16; t += 1) {
+      const i = offset + t * 4;
+      const word = ((block[i] << 24)
+        | (block[i + 1] << 16)
+        | (block[i + 2] << 8)
+        | block[i + 3]) | 0;
+      w[t] = word;
+      const s1 = ((e >>> 6) | (e << 26))
+        ^ ((e >>> 11) | (e << 21))
+        ^ ((e >>> 25) | (e << 7));
       const ch = (e & f) ^ (~e & g);
-      const temp1 = (h + s1 + ch + StreamingSha256.K[t] + w[t]) | 0;
-      const s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+      const temp1 = (h + s1 + ch + k[t] + word) | 0;
+      const s0 = ((a >>> 2) | (a << 30))
+        ^ ((a >>> 13) | (a << 19))
+        ^ ((a >>> 22) | (a << 10));
       const maj = (a & b) ^ (a & c) ^ (b & c);
       const temp2 = (s0 + maj) | 0;
       h = g;
@@ -5344,6 +6024,40 @@ class StreamingSha256 {
       b = a;
       a = (temp1 + temp2) | 0;
     }
+
+    // Rounds 16–63 reuse the 16 slots: `t & 15` is the word leaving the
+    // window, so the schedule needs no 64-word array and no zero fill.
+    for (let t = 16; t < 64; t += 1) {
+      const w15 = w[(t - 15) & 15];
+      const w2 = w[(t - 2) & 15];
+      const s0 = ((w15 >>> 7) | (w15 << 25))
+        ^ ((w15 >>> 18) | (w15 << 14))
+        ^ (w15 >>> 3);
+      const s1 = ((w2 >>> 17) | (w2 << 15))
+        ^ ((w2 >>> 19) | (w2 << 13))
+        ^ (w2 >>> 10);
+      const word = (w[t & 15] + s0 + w[(t - 7) & 15] + s1) | 0;
+      w[t & 15] = word;
+      const rs1 = ((e >>> 6) | (e << 26))
+        ^ ((e >>> 11) | (e << 21))
+        ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + rs1 + ch + k[t] + word) | 0;
+      const rs0 = ((a >>> 2) | (a << 30))
+        ^ ((a >>> 13) | (a << 19))
+        ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (rs0 + maj) | 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) | 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) | 0;
+    }
+
     this.h0 = (this.h0 + a) | 0;
     this.h1 = (this.h1 + b) | 0;
     this.h2 = (this.h2 + c) | 0;
@@ -5353,10 +6067,6 @@ class StreamingSha256 {
     this.h6 = (this.h6 + g) | 0;
     this.h7 = (this.h7 + h) | 0;
   }
-}
-
-function rotr32(x: number, n: number): number {
-  return (x >>> n) | (x << (32 - n));
 }
 
 function responseToText(

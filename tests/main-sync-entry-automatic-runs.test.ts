@@ -1141,4 +1141,72 @@ describe("main sync entry guards", () => {
     plugin.stopAutoSync();
   });
 
+  it("runs the automatic round for WebDAV without a OneDrive login", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    // WebDAV 配置在位；没有任何 OneDrive 登录态。
+    plugin.cloudSettings = {
+      provider: "webdav",
+      webdav: {
+        coordinates: { url: "https://dav.example/dav", username: "u", rootPrefix: "" },
+        credentialRevision: 1,
+        lastTest: null,
+      },
+    };
+    plugin.auth = { authState: { isLoggedIn: false } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    const ensureReady = vi.spyOn(plugin as never, "ensureWebDavSyncReady")
+      .mockResolvedValue(true);
+    const checkAccountBinding = vi.spyOn(plugin as never, "checkAccountBinding");
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "interval") => Promise<boolean>;
+    }).runAutomaticSync("interval");
+
+    expect(consumed).toBe(true);
+    // 走 WebDAV 运行时，而不是 OneDrive 账号绑定闸。
+    expect(ensureReady).toHaveBeenCalledOnce();
+    expect(checkAccountBinding).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledOnce();
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("skips the automatic round when the WebDAV runtime is not ready", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    plugin.cloudSettings = {
+      provider: "webdav",
+      webdav: {
+        coordinates: { url: "https://dav.example/dav", username: "u", rootPrefix: "" },
+        credentialRevision: 1,
+        lastTest: null,
+      },
+    };
+    plugin.auth = { authState: { isLoggedIn: false } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    vi.spyOn(plugin as never, "ensureWebDavSyncReady").mockResolvedValue(false);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "interval") => Promise<boolean>;
+    }).runAutomaticSync("interval");
+
+    // 引导失败＝本轮没有可跑的同步，但不重试（与「已消费」同义）。
+    expect(consumed).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+    expect(plugin.diag.warn).toHaveBeenCalledWith(
+      "execute",
+      "auto sync skipped — WebDAV runtime is not ready",
+      expect.objectContaining({ trigger: "interval" }),
+    );
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
 });
