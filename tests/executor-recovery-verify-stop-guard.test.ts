@@ -154,14 +154,16 @@ describe("recovery verification loop stop checks", () => {
 });
 
 // B7:每个「可执行计划咽喉」都必须先跑社区插件保护，再跑 EasySync 自同步保护。
-// 四个入口 = 普通计划 / 文件夹移动续跑 / corrupt-state 恢复 / remote-scope 恢复。
+// 五个入口 = 普通计划 / 单夹移动续跑 / 新建父目录同轮拓扑续跑 / corrupt-state
+// 恢复 / remote-scope 恢复。
 // 残余（有意记录）：本闸只审计「调用了 protectCommunityPluginPlan 的入口」；
-// 未来若新增一个完全跳过该保护的入口，本闸不会知道 —— 它钉的是当前四处，
+// 未来若新增一个完全跳过该保护的入口，本闸不会知道 —— 它钉的是当前五处，
 // 不是「所有入口都被覆盖」的语义证明。
 describe("community plugin plan protection gate", () => {
   const entries = [
     "private runStep5PrepareExecutablePlan(",
     "private async sealAndRunStagedFolderMoveContinuation(",
+    "private async continueStagedTopologyRoots(",
     "private async runV2CorruptStateEvidenceCollection(",
     "private async runV2RemoteScopeRecovery(",
   ] as const;

@@ -207,6 +207,10 @@ import {
 } from "./deletion-ledger";
 import { pruneExpiredLocalArchiveDirectoriesV1 } from "./local-archive";
 import {
+  resolveRecoveryPathIdentityV1,
+  type RecoveryPathIdentityV1,
+} from "./recovery-path-identity";
+import {
   StateV2ScopeTransitionError,
   StateV2ScopeTransitionStore,
   type StateV2ScopeTransitionFailureReason,
@@ -10884,6 +10888,32 @@ export class StateManager {
    */
   remoteIdForPath(path: string): string | undefined {
     return this.committedAnchorAtPath(path)?.remoteId;
+  }
+
+  /**
+   * 只读：找回读面的路径 → 历史身份。直接命中 committed 锚点时就是它本身；
+   * 新路径还没有锚点（刚改名／刚改上层文件夹名、同步尚未提交）时，沿设备本地
+   * 的改名提示解析回同一个云端对象。采信条件与同步层一致（同步范围、锚点仍
+   * 绑定原路径、目的地在回收站之外、每身份一条、无歧义）；解析不唯一时返回
+   * `pending-rename`，读面据此说明“刚改过名”，不按内容猜身份。
+   *
+   * 零写动作：不写状态、不消费提示、不触发同步。
+   */
+  recoveryIdentityForPath(
+    path: string,
+  ): RecoveryPathIdentityV1 | undefined {
+    const envelope = this.v2Envelope;
+    if (!envelope) return undefined;
+    return resolveRecoveryPathIdentityV1({
+      path,
+      scope: envelope.scope,
+      fileAnchors: Object.values(envelope.anchors.byAnchorId),
+      folderAnchors: envelope.folderAnchors
+        ? Object.values(envelope.folderAnchors.byAnchorId)
+        : [],
+      fileMoveHints: this.data[KEY_LOCAL_FILE_MOVE_HINTS],
+      folderMoveHints: this.data[KEY_LOCAL_FOLDER_MOVE_HINTS],
+    });
   }
 
   /**

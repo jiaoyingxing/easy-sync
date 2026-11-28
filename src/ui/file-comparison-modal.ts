@@ -17,6 +17,12 @@ export interface FileComparisonRow {
 
 export interface FileComparisonAction {
   label: string;
+  /** Shared footer-button variant. Use it instead of a raw class name for
+   *  native intent: `destructive-primary` deletes user files, `destructive`
+   *  only clears rebuildable state, `cta` is the primary action. */
+  variant?: "cta" | "destructive" | "destructive-primary" | "plain";
+  /** Extra plugin-visual class (local/remote tinting). Never a host
+   *  destructive/cancel class — those go through `variant`. */
   className?: string;
   disabled?: boolean;
   onClick: () => void;
@@ -106,6 +112,7 @@ export abstract class FileComparisonModal<T = void> extends EasySyncModal<T> {
     for (const action of actions) {
       addEasySyncFooterButton(btnRow, {
         label: action.label,
+        ...(action.variant ? { variant: action.variant } : {}),
         ...(action.className ? { className: action.className } : {}),
         disabled: action.disabled === true,
         onClick: action.onClick,

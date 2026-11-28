@@ -172,6 +172,28 @@ describe("main sync entry guards", () => {
     expect(saveSyncSettings).toHaveBeenCalledOnce();
   });
 
+  it("drops the provider's cached remote scope after reset", async () => {
+    const plugin = makePlugin();
+    const reset = vi.fn().mockResolvedValue(undefined);
+    const invalidateVaultScope = vi.fn();
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasActivityInFlight: false,
+      invalidateLifecycle: vi.fn(),
+    } as never;
+    plugin.state = { reset } as never;
+    plugin.scanner = { clearScanCache: vi.fn().mockResolvedValue(undefined) } as never;
+    plugin.onedrive = { invalidateVaultScope } as never;
+    vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+
+    await plugin.resetSyncState();
+
+    expect(reset).toHaveBeenCalledOnce();
+    expect(invalidateVaultScope).toHaveBeenCalledWith(
+      plugin.app.vault.getName(),
+    );
+  });
+
   it("allows explicit local-state reset through a V2 load block when no mutation evidence is unresolved", async () => {
     const plugin = makePlugin();
     const reset = vi.fn().mockResolvedValue(undefined);

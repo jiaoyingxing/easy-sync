@@ -1360,6 +1360,68 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   margin-top: 6px;
 }
 
+/* 更新行内联更新内容（2026-11-27）：完整文稿直接跟随动作行，不新增内层
+   滚动/展开控件；隐藏沿用整行 `<details>`。正文吃宿主 `.markdown-rendered`，
+   这里只补行内区块的分隔。 */
+.easy-sync-update-notes {
+  margin-top: var(--size-4-2);
+  padding-top: var(--size-4-2);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.easy-sync-update-note {
+  margin-top: var(--size-4-2);
+}
+
+.easy-sync-update-note + .easy-sync-update-note {
+  padding-top: var(--size-4-2);
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* 侧栏是窄栏，正文吃宿主 markdown 的默认排版会把 h2 放大到超过行标题。
+   这里只把同一份宿主 markdown 压回侧栏字号；字号/字体全部复用现有变量
+   与继承值，不新增字号值或字体族。 */
+.easy-sync-update-notes .markdown-rendered {
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-tight);
+}
+
+.easy-sync-update-notes .markdown-rendered h1,
+.easy-sync-update-notes .markdown-rendered h2,
+.easy-sync-update-notes .markdown-rendered h3,
+.easy-sync-update-notes .markdown-rendered h4 {
+  color: inherit;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  margin: 0.6em 0 0.25em;
+}
+
+.easy-sync-update-notes .markdown-rendered h1:first-child,
+.easy-sync-update-notes .markdown-rendered h2:first-child,
+.easy-sync-update-notes .markdown-rendered h3:first-child,
+.easy-sync-update-notes .markdown-rendered h4:first-child {
+  margin-top: 0;
+}
+
+.easy-sync-update-notes .markdown-rendered ul,
+.easy-sync-update-notes .markdown-rendered ol {
+  margin: 0.25em 0;
+  padding-inline-start: 1.25em;
+}
+
+/* 宿主 markdown 给 li 另挂了一段 margin-left（真宿主实测约 23px）；
+   窄侧栏里它叠在 ul 缩进上，文字被推得很远。这里只归零 li 的额外
+   外边距，列表缩进仍由上面的 padding 控制。 */
+.easy-sync-update-notes .markdown-rendered li {
+  margin-inline-start: 0;
+}
+
+.easy-sync-update-notes .markdown-rendered p {
+  margin: 0.4em 0;
+}
+
 /* ---- Action Chips (inline list buttons) ---- */
 
 .easy-sync-action-chip {
@@ -1935,6 +1997,57 @@ body:not(.is-mobile) .easy-sync-settings-tab .setting-item-control button:not(.c
    没有 `.setting-page`，仍由上面那条规则覆盖。 */
 body:not(.is-mobile) .vertical-tabs-container:has(.vertical-tab-nav-item.is-active[data-setting-id="easy-sync"]) .setting-page .setting-item-control button:not(.clickable-icon) {
   min-width: calc(4em + var(--size-4-3) * 2);
+}
+
+/* 宿主 1.15 手机端把 --interactive-normal 压成 --background-secondary（与灰面同色），
+   普通宿主按钮的底色就“看不出来”（2026-11-28 用户安卓 1.15.0 实测）。按 OpenPlug
+   的平台专用写法：main.ts 以 Platform.isAndroidApp 给 body 挂 `.easy-sync-android`，
+   只在安卓亮色下把这一个按钮底色 token 换回宿主自己在手机弹框里的取值
+   `--background-modifier-hover`（宿主 `.is-phone .modal .modal:not(.mod-lg)` 同款）；
+   不写死颜色、不加描边，iOS / 桌面 / 深色不碰。 */
+body.easy-sync-android:not(.theme-dark) .easy-sync-view,
+body.easy-sync-android:not(.theme-dark) .easy-sync-settings-tab,
+body.easy-sync-android:not(.theme-dark) .vertical-tabs-container:has(.vertical-tab-nav-item.is-active[data-setting-id="easy-sync"]) .setting-page {
+  --interactive-normal: var(--background-modifier-hover);
+}
+
+/* 1.15.0 宿主还没有 1.15.1 给 button.mod-destructive 补的淡红底：安卓 1.15.0 真机
+   「取消同步 / 重置」只剩红字（2026-11-28 实测）。按宿主 1.15.1 的同一条公式补回
+   按钮本该有的底色（仍是 --background-modifier-error 的 10%，不是写死颜色）；
+   1.15.1+ 上与原值相同。实心破坏档（mod-destructive.mod-cta）排除在外。 */
+body.easy-sync-android .easy-sync-view button.mod-destructive:not(.mod-cta),
+body.easy-sync-android .easy-sync-settings-tab button.mod-destructive:not(.mod-cta),
+body.easy-sync-android .vertical-tabs-container:has(.vertical-tab-nav-item.is-active[data-setting-id="easy-sync"]) .setting-page button.mod-destructive:not(.mod-cta),
+/* 同一缺口的 body 级弹框面：离开同步范围的确认键是淡红档（同一底栏另有
+   恢复动作在竞争），不在上面三个容器内。只点名本插件的弹框类，不外溅。 */
+body.easy-sync-android .modal.easy-sync-prompt-modal button.mod-destructive:not(.mod-cta) {
+  background-color: color-mix(in oklch, var(--background-modifier-error) 10%, transparent);
+}
+
+/* 旧 WebView 兜底（照 Resojot callout 2026-11-23 的写法）：宿主 1.15 的手机按钮、
+   列表 chip、悬停底全都建立在 color-mix(in oklch, …) 上；旧安卓 WebView 不支持时
+   整层作废，按钮和 chip 一起透明。门内按宿主同一语义在手机端恢复
+   --background-modifier-hover / active-hover 与 --interactive-normal / hover
+   （亮色黑 6.7%，深色白 10%；破坏档 error-rgb 10%）；新引擎不进门，继续走宿主
+   的 color-mix 精确值。只作用于手机形态，桌面不碰。 */
+@supports not (background: color-mix(in oklch, red 50%, transparent)) {
+  body.is-mobile.theme-light {
+    --background-modifier-hover: rgba(var(--mono-rgb-100, 0, 0, 0), 0.067);
+    --background-modifier-active-hover: rgba(var(--mono-rgb-100, 0, 0, 0), 0.12);
+    --interactive-normal: var(--background-modifier-hover);
+    --interactive-hover: rgba(var(--mono-rgb-100, 0, 0, 0), 0.12);
+  }
+
+  body.is-mobile.theme-dark {
+    --background-modifier-hover: rgba(255, 255, 255, 0.1);
+    --background-modifier-active-hover: rgba(255, 255, 255, 0.16);
+    --interactive-normal: var(--background-modifier-hover);
+    --interactive-hover: rgba(255, 255, 255, 0.16);
+  }
+
+  body.is-mobile button.mod-destructive:not(.mod-cta) {
+    background-color: rgba(var(--background-modifier-error-rgb, 233, 49, 71), 0.1);
+  }
 }
 
 /* 1.13+ 设置页「规则」行被「我知道了」收起后：宿主把组内行间分割线画在每行的

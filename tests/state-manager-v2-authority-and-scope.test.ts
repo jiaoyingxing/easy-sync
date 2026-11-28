@@ -203,6 +203,34 @@ describe("StateManager V2 production controller", () => {
       });
   });
 
+  it("resolves a just-renamed path to its committed history identity without writing", async () => {
+    const harness = makeHarness({ committed: envelope() });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+
+    // 改名事件已经落进设备本地提示；同步还没提交这次移动。
+    expect(await state.recordLocalFileMoveHint("Notes/a.md", "Notes/renamed.md", 10))
+      .toBe(true);
+    expect(await state.recordLocalFolderMoveHint("Notes", "Archive", 20)).toBe(true);
+    const writesBefore = harness.rawAdapter.write.mock.calls.length;
+
+    expect(state.recoveryIdentityForPath("Notes/renamed.md")).toEqual({
+      kind: "resolved",
+      remoteId: "file-a",
+      remoteETag: "etag-a",
+      baselinePath: "Notes/a.md",
+    });
+    // 改的是上层文件夹：前缀翻译回原路径后再找文件锚点。
+    expect(state.recoveryIdentityForPath("Archive/a.md")).toEqual({
+      kind: "resolved",
+      remoteId: "file-a",
+      remoteETag: "etag-a",
+      baselinePath: "Notes/a.md",
+    });
+    expect(state.recoveryIdentityForPath("Notes/missing.md")).toBeUndefined();
+    expect(harness.rawAdapter.write.mock.calls.length).toBe(writesBefore);
+  });
+
   it("publishes new common text to AncestorStoreV2 and reads it only through the anchor", async () => {
     const content = "next common text\n";
     const bytes = new TextEncoder().encode(content);

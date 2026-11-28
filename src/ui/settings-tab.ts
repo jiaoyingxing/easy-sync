@@ -14,11 +14,10 @@ import {
   ButtonComponent,
   Notice,
   PluginSettingTab,
-  SettingGroup,
+  Setting,
   apiVersion,
   requireApiVersion,
   setIcon,
-  type Setting,
   type SettingDefinition,
   type SettingDefinitionItem,
   type SettingDefinitionPage,
@@ -539,31 +538,29 @@ export class EasySyncSettingTab extends PluginSettingTab {
 class EasySyncLegacyHostSettingTab extends EasySyncSettingTab {
   override display(): void {
     this.containerEl.empty();
-    // 用原生分组卡片承载，和 1.12 自带设置页（.setting-group > .setting-items > .setting-item）
-    // 完全同构；SettingGroup 自 1.11.0 可用，旧宿主范围内安全。
-    const group = new SettingGroup(this.containerEl);
-    group.addSetting((setting) => {
-      setting
-        .setName(this.plugin.i18n.t("settings.hostRequirement.title"))
-        .setDesc(
-          this.plugin.i18n.t("settings.hostRequirement.desc", {
-            current: apiVersion,
-            required: this.plugin.manifest.minAppVersion,
-          }),
-        )
-        .addButton((button) => {
-          button
-            .setButtonText(this.plugin.i18n.t("settings.hostRequirement.download"))
-            .setCta()
-            .onClick(() => {
-              window.open(
-                OBSIDIAN_DOWNLOAD_URL,
-                "_blank",
-                "noopener,noreferrer",
-              );
-            });
-        });
-    });
+    // 旧宿主提示页只许用最低版本的 API：`Setting` 自始就有；1.11 才有的分组
+    // 组件在更老的宿主上是 undefined，会让提示页自己也抛错、整页白屏
+    // （2026-11-26 用户反馈旧宿主「设置纯白板」的根因）。单行提示不需要分组卡片。
+    new Setting(this.containerEl)
+      .setName(this.plugin.i18n.t("settings.hostRequirement.title"))
+      .setDesc(
+        this.plugin.i18n.t("settings.hostRequirement.desc", {
+          current: apiVersion,
+          required: this.plugin.manifest.minAppVersion,
+        }),
+      )
+      .addButton((button) => {
+        button
+          .setButtonText(this.plugin.i18n.t("settings.hostRequirement.download"))
+          .setCta()
+          .onClick(() => {
+            window.open(
+              OBSIDIAN_DOWNLOAD_URL,
+              "_blank",
+              "noopener,noreferrer",
+            );
+          });
+      });
   }
 
   // 旧宿主没有 1.13 的 SettingTab.update()：主类的后台刷新改为空操作，
@@ -1387,8 +1384,11 @@ function buildDisplayPage(
       },
       {
         name: t("settings.mobileStatusBar.name"),
-        // 移动端专属开关：定义树常备（定义测试对账），渲染时按平台隐藏。
-        visible: () => platformFacts.isMobileApp,
+        // 移动端专属开关：定义树常备（定义测试对账），渲染时按 UI 形态隐藏
+        // ——桌面常规 UI 不渲染；桌面 app.emulateMobile() 时与真机一致显示
+        // （2026-11-27：判据从 isMobileApp 回到 isMobile，桌面模拟形态
+        // 的宿主已用 `.is-mobile .status-bar` 藏起状态栏，需要这个出口）。
+        visible: () => platformFacts.isMobile,
         render: (setting) => applyMobileStatusBarRow(setting, host),
       },
     ],
@@ -1506,9 +1506,10 @@ export function buildMaintenancePage(
           render: (setting) => {
             setting.controlEl.empty();
             setting.addButton((btn) => {
-              // Destructive style plus a two-step confirm before any state is
-              // cleared.
-              btn.buttonEl.classList.add("mod-warning");
+              // The entry sits in a settings row, so it takes the tinted tier
+              // (no primary action competes here). The accept key inside the
+              // confirm gets the solid tier — see the ConfirmModal options.
+              applyDestructiveButton(btn);
               btn.setButtonText(t("settings.reset.button")).onClick(() => {
                 void (async () => {
                   const confirmed = await new ConfirmModal(
@@ -1520,7 +1521,11 @@ export function buildMaintenancePage(
                     {
                       message: t("settings.reset.confirmMessage"),
                       warning: t("settings.reset.confirmWarning"),
-                      danger: true,
+                      // Accept key = the dialog's only action, so it takes the
+                      // solid tier (2026-11-27 second pass). "Rebuildable" is
+                      // not a reason to drop to tinted; only a competing
+                      // primary action in the same footer would be.
+                      danger: "destroy",
                     },
                   ).awaitConfirm();
                   if (!confirmed) return;
@@ -1533,7 +1538,7 @@ export function buildMaintenancePage(
         },
       ] },
       // 实验性组放在「高级」下方，不新增顶层页；这里只放设置项，运行状态
-      // 归诊断报告与 lan-connect 弹框（2026-11-23 用户点名移除设置页诊断行）。
+      // 归诊断报告（2026-11-23 用户点名移除设置页诊断行）。
       // WebDAV 入口暂放这里（2026-11-24 用户拍板：达到主流可用前不占登录页）。
       { heading: t("settings.experimental.heading"), type: "group", items: [
         {

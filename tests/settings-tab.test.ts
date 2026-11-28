@@ -149,6 +149,15 @@ describe("settings tab", () => {
         "当前版本 1.13.4，EasySync 需要 1.14.0 以上。请更新并重启。",
       );
       expect(setButtonText).toHaveBeenCalledWith("前往官网");
+      // 提示页必须只用基线 API：1.11 以下宿主没有分组组件，用了连提示页
+      // 自己都会抛错（2026-11-26 旧宿主「设置纯白板」的根因）。
+      const source = readSourceFile("src/ui/settings-tab.ts");
+      const legacy = source.slice(
+        source.indexOf("class EasySyncLegacyHostSettingTab"),
+        source.indexOf("export function createEasySyncSettingTab"),
+      );
+      expect(legacy).toContain("new Setting(this.containerEl)");
+      expect(legacy).not.toContain("new SettingGroup");
       // 旧宿主没有 1.13 的 SettingTab.update()：后台刷新入口必须静默。
       expect(() => tab.refreshSyncState()).not.toThrow();
       expect(() => tab.refreshAuthState()).not.toThrow();
@@ -622,7 +631,11 @@ describe("settings tab", () => {
     expect(source).not.toContain("confirmRestrictedDataSelection");
     expect(source).toContain("settings.communityPlugins.data.experimentalItemMessage");
     expect(source).toContain("settings.communityPlugins.data.experimentalItemWithFilesMessage");
-    expect(source).toContain("danger: true");
+    // The accept key is the dialog's only action, so it takes the solid tier
+    // (2026-11-27 second pass). Enabling data sync deletes no file, but it
+    // overwrites the other devices' settings and the copy says so; the tier
+    // follows the button's role in the dialog, not the shape of the loss.
+    expect(source).toContain('danger: "destroy"');
   });
 
   it("ignores a host repaint callback when the outer scope already matches committed state", async () => {

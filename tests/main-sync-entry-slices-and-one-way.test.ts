@@ -962,29 +962,3 @@ describe("executor progress settings refresh", () => {
     expect(block).not.toContain("this.settingsTab?.refreshSyncState();");
   });
 });
-
-describe("LAN chip phase edge", () => {
-  it("refreshes the sidebar ticker on the first byte of a manual LAN serve", () => {
-    const plugin = makePlugin();
-    const refresh = vi.fn();
-    vi.spyOn(plugin, "syncView", "get").mockReturnValue({
-      refreshTransferIndicator: refresh,
-    } as never);
-    const activity = (plugin as never as {
-      lanTransferActivity: { setPhase: (phase: string) => void };
-    }).lanTransferActivity;
-    activity.setPhase("connected");
-    (plugin as never as { lanTransferPhaseOwner: string | null })
-      .lanTransferPhaseOwner = "modal";
-
-    // The manual modal only reports pairing/connected; the first byte flips
-    // the activity to transferring internally, so the owner must notify the
-    // view on that edge (the demand ticker is not polling).
-    plugin.reportLanTransferProgress(1, 100);
-    expect(refresh).toHaveBeenCalledOnce();
-
-    // More chunks in the same transfer need no extra view refresh.
-    plugin.reportLanTransferProgress(2, 100);
-    expect(refresh).toHaveBeenCalledOnce();
-  });
-});

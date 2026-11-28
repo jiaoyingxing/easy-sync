@@ -63,9 +63,11 @@ export function shouldAutoSettleIdenticalRecovery(
 interface OrdinaryResolutionAction {
   choice: ManualMutationResolutionChoiceV1;
   labelKey: keyof LocaleStrings;
-  /** Native intent of the button: `mod-cta` restores the file, `mod-warning`
-   *  removes the only surviving copy, null keeps both directions neutral. */
-  className: "mod-cta" | "mod-warning" | null;
+  /** Shared footer-button variant: `cta` restores the file, `destructive-primary`
+   *  removes the only surviving copy on one side (deletes user content), null
+   *  keeps both directions neutral. Never a raw host class name — the phone
+   *  host demotes the legacy warning class to a neutral fill. */
+  variant: "cta" | "destructive-primary" | null;
 }
 
 /**
@@ -118,14 +120,14 @@ export function resolveOrdinaryResolutionActions(
           labelKey: locationChoice
             ? "syncView.mutationResolution.keepLocal"
             : "syncView.mutationResolution.keepLocalVersion",
-          className: null,
+          variant: null,
         },
         {
           choice: "keep-remote",
           labelKey: locationChoice
             ? "syncView.mutationResolution.keepRemote"
             : "syncView.mutationResolution.keepRemoteVersion",
-          className: null,
+          variant: null,
         },
       ]);
     }
@@ -134,12 +136,12 @@ export function resolveOrdinaryResolutionActions(
         {
           choice: "keep-local",
           labelKey: "syncView.mutationResolution.action.deleteRemote",
-          className: "mod-warning",
+          variant: "destructive-primary",
         },
         {
           choice: "keep-remote",
           labelKey: "syncView.mutationResolution.action.download",
-          className: "mod-cta",
+          variant: "cta",
         },
       ]);
     }
@@ -148,12 +150,12 @@ export function resolveOrdinaryResolutionActions(
         {
           choice: "keep-remote",
           labelKey: "syncView.mutationResolution.action.deleteLocal",
-          className: "mod-warning",
+          variant: "destructive-primary",
         },
         {
           choice: "keep-local",
           labelKey: "syncView.mutationResolution.action.upload",
-          className: "mod-cta",
+          variant: "cta",
         },
       ]);
     }
@@ -168,12 +170,12 @@ export function resolveOrdinaryResolutionActions(
       {
         choice: "keep-local",
         labelKey: "syncView.mutationResolution.keepLocalVersion",
-        className: null,
+        variant: null,
       },
       {
         choice: "keep-remote",
         labelKey: "syncView.mutationResolution.keepRemoteVersion",
-        className: null,
+        variant: null,
       },
     ];
   }
@@ -182,12 +184,12 @@ export function resolveOrdinaryResolutionActions(
       {
         choice: "keep-local",
         labelKey: "syncView.mutationResolution.action.deleteRemote",
-        className: "mod-warning",
+        variant: "destructive-primary",
       },
       {
         choice: "keep-remote",
         labelKey: "syncView.mutationResolution.action.download",
-        className: "mod-cta",
+        variant: "cta",
       },
     ];
   }
@@ -196,12 +198,12 @@ export function resolveOrdinaryResolutionActions(
       {
         choice: "keep-remote",
         labelKey: "syncView.mutationResolution.action.deleteLocal",
-        className: "mod-warning",
+        variant: "destructive-primary",
       },
       {
         choice: "keep-local",
         labelKey: "syncView.mutationResolution.action.upload",
-        className: "mod-cta",
+        variant: "cta",
       },
     ];
   }

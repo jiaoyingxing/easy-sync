@@ -366,6 +366,90 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.completedCount).toBe(2);
   });
 
+  it("shows a download preview immediately and replaces it in place at settlement", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("executing");
+    progress.addCompletedFile({ path: "first.md", status: "upload", actionType: SyncActionType.Upload });
+    progress.addProvisionalCompletedFile({
+      path: "second.md",
+      status: "download",
+      actionType: SyncActionType.Download,
+      fileSize: 42,
+    });
+
+    // The preview is a full row as soon as the bytes land: same list, same
+    // settled-action count the round will report once the group commits.
+    expect(progress.state.completedFiles.map((file) => file.path)).toEqual([
+      "first.md",
+      "second.md",
+    ]);
+    expect(progress.state.completedFiles[1]).toMatchObject({
+      status: "download",
+      actionType: SyncActionType.Download,
+      fileSize: 42,
+      provisional: true,
+    });
+    expect(progress.state.completedCount).toBe(2);
+    expect(progress.provisionalFilePaths()).toEqual(["second.md"]);
+
+    // The durable completion replaces the row where it stands, not as a
+    // second row at the top, and the item is not counted twice.
+    progress.addCompletedFile({
+      path: "second.md",
+      status: "download",
+      actionType: SyncActionType.Download,
+      fileSize: 42,
+    });
+    expect(progress.state.completedFiles.map((file) => file.path)).toEqual([
+      "first.md",
+      "second.md",
+    ]);
+    expect(progress.state.completedFiles[1].provisional).toBeUndefined();
+    expect(progress.state.completedCount).toBe(2);
+    expect(progress.provisionalFilePaths()).toEqual([]);
+  });
+
+  it("flips a preview whose group never committed and drops it from the preview set", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("executing");
+    progress.addProvisionalCompletedFile({
+      path: "a.md",
+      status: "download",
+      actionType: SyncActionType.Download,
+    });
+
+    expect(progress.revertCompletedFile("a.md", "同步已取消")).toBe(true);
+    expect(progress.state.completedFiles[0]).toMatchObject({
+      status: "error",
+      reason: "同步已取消",
+      actionType: SyncActionType.Download,
+    });
+    expect(progress.state.completedFiles[0].provisional).toBeUndefined();
+    expect(progress.provisionalFilePaths()).toEqual([]);
+    // A row already flipped once is never rewritten by a second report.
+    expect(progress.revertCompletedFile("a.md", "同步已取消")).toBe(false);
+  });
+
+  it("settles leftover previews at round end so a non-durable row never reads as success", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("executing");
+    progress.addProvisionalCompletedFile({
+      path: "leftover.md",
+      status: "download",
+      actionType: SyncActionType.Download,
+    });
+
+    progress.finish("同步已取消");
+    expect(progress.state.completedFiles[0]).toMatchObject({
+      path: "leftover.md",
+      status: "error",
+      reason: "同步已取消",
+    });
+    expect(progress.state.completedFiles[0].provisional).toBeUndefined();
+    expect(progress.provisionalFilePaths()).toEqual([]);
+  });
+
+
   it("keeps an already-failed row as the failure it is when a flip is asked twice", () => {
     const progress = new SyncProgressStore();
     progress.setPhase("executing");

@@ -1008,7 +1008,8 @@ export class ConfigSyncModal extends EasySyncModal {
           plugin: displayName,
         }),
         warning: t("settings.communityPlugins.cleanup.confirmWarning"),
-        danger: true,
+        // Deletes the plugin bundle from the cloud.
+        danger: "destroy",
       },
     ).awaitConfirm();
     if (!confirmed) return;
@@ -1227,7 +1228,11 @@ export class ConfigSyncModal extends EasySyncModal {
           ? { steps: copy.steps }
           : { message: t(copy.messageKey, copy.params) }),
         warning: t("settings.communityPlugins.data.experimentalWarning"),
-        danger: true,
+        // Accept key = the dialog's only action → solid tier (2026-11-27
+        // second pass). Enabling data sync deletes no file, but it overwrites
+        // the other devices' settings, and the copy says so; the tier follows
+        // the button's role in the dialog, not the shape of the loss.
+        danger: "destroy",
       },
     ).awaitConfirm();
   }

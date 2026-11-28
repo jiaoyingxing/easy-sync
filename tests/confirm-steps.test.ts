@@ -26,6 +26,64 @@ describe("confirm modal numbered steps (2026-10-31)", () => {
     expect(warningIndex).toBeGreaterThan(stepsIndex);
   });
 
+  // 2026-11-27 user decision: the accept button's weight follows the
+  // consequence. "destroy" (files are deleted) renders the host's solid tier;
+  // "rebuildable" (only local recorded state is cleared) renders the tinted
+  // tier. The option is no longer a boolean, so every call site must state
+  // which one it means.
+  it("maps the danger tier to the matching footer variant", () => {
+    const source = readFileSync(
+      path.resolve(__dirname, "../src/ui/confirm-modal.ts"),
+      "utf8",
+    );
+    expect(source).toContain('this.options?.danger === "destroy" ? "destructive-primary"');
+    expect(source).toContain('this.options?.danger === "rebuildable" ? "destructive"');
+    expect(source).not.toContain("this.options?.danger ?");
+  });
+
+  it("keeps every destructive confirm call site on an explicit tier", () => {
+    const filesToScan = [
+      "src/main.ts",
+      "src/ui/config-sync-modal.ts",
+      "src/ui/mutation-recovery-resolution-modal.ts",
+      "src/ui/settings-page-rows.ts",
+      "src/ui/settings-tab.ts",
+      "src/ui/sync-view.ts",
+    ];
+    const offenders: string[] = [];
+    for (const rel of filesToScan) {
+      const source = readFileSync(path.resolve(__dirname, "..", rel), "utf8");
+      if (/danger:\s*true/u.test(source)) offenders.push(`${rel} (boolean danger)`);
+      const tiers = source.match(/danger:\s*"(destroy|rebuildable)"/gu) ?? [];
+      if (tiers.length === 0) offenders.push(`${rel} (no tier declared)`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  // 2026-11-27 second pass (user correction): the accept key of a
+  // confirmation dialog is that dialog's only action, so it always takes the
+  // solid weight — the host's own `prompt()` calls `setCta()` before the
+  // accept configurator runs. "Rebuildable" is therefore NOT a reason to drop
+  // to the tinted tier; the only reason to drop is another primary action
+  // competing in the same footer. These four sites were mis-tiered.
+  it("puts every confirmation accept key on the solid tier", () => {
+    const filesToScan = [
+      "src/main.ts",
+      "src/ui/config-sync-modal.ts",
+      "src/ui/settings-page-rows.ts",
+      "src/ui/settings-tab.ts",
+    ];
+    const offenders: string[] = [];
+    for (const rel of filesToScan) {
+      const source = readFileSync(path.resolve(__dirname, "..", rel), "utf8");
+      const tiers = source.match(/danger:\s*"(destroy|rebuildable)"/gu) ?? [];
+      if (tiers.some((tier) => tier.endsWith('"rebuildable"'))) {
+        offenders.push(`${rel} (tinted accept key)`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it("pins the batch conflict rules as three lines per direction", () => {
     const zh = new I18n("zh-cn");
     expect(zh.t("syncView.conflict.batchKeepLocalStep.cloudOnly"))

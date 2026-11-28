@@ -394,7 +394,8 @@ export class OneDriveClient {
   private storageVaultNames = new Map<string, string>();
   private vaultScopes = new Map<string, RemoteVaultScope>();
   private abortSignal: AbortSignal | null = null;
-  /** S2a dev-only LAN source: in-memory only, never persisted or sent to Graph. */
+  /** Experimental LAN source owned by the automatic manager: in-memory only,
+   *  never persisted or sent to Graph. */
   private lanContentSource: LanContentSource | null = null;
   /** S5a automatic connection provider; `null` while the setting is off. */
   private lanSourceProvider: LanSourceProvider | null = null;
@@ -474,7 +475,7 @@ export class OneDriveClient {
     this.abortSignal = signal;
   }
 
-  /** S2a: install/remove the dev-only LAN source for the next downloads. */
+  /** Install/remove the experimental LAN source for the next downloads. */
   setLanContentSource(source: LanContentSource | null): void {
     this.lanContentSource = source;
   }

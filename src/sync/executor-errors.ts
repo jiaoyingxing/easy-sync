@@ -14,6 +14,21 @@ export class IncrementalRemoteHierarchyError extends Error {
   }
 }
 
+/**
+ * Signature of a same-path vault folder replacement: a complete remote
+ * snapshot no longer contains the committed files-root identity but still
+ * contains items outside it. A delta cursor can survive that replacement, so
+ * ordinary planning must resolve the live path identity instead of rebuilding
+ * against the dead root. The message keeps the historical hierarchy text for
+ * logs that already match on it.
+ */
+export class RemoteFilesRootReplacedError extends Error {
+  constructor(readonly firstOutsideId: string) {
+    super(`Remote hierarchy outside known files root: ${firstOutsideId}`);
+    this.name = "RemoteFilesRootReplacedError";
+  }
+}
+
 export class MutationRecoveryBlockedError extends Error {
   constructor(
     readonly summary: MutationRecoveryRunSummary,

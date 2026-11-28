@@ -924,6 +924,8 @@ function recoveryReasonKeyV1(
   switch (reason) {
     case "no-remote-identity":
       return "recovery.reason.noRemoteIdentity";
+    case "rename-pending":
+      return "recovery.reason.renamePending";
     case "no-version-history":
       return "recovery.reason.noVersionHistory";
     case "expired":

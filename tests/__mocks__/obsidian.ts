@@ -206,6 +206,37 @@ export abstract class FuzzySuggestModal<T> extends Modal {
   setInstructions(_instructions: Array<{ command: string; purpose: string }>): this { return this; }
 }
 
+/**
+ * Markdown rendering stubs for the sidebar's inline update-notes block.
+ * The real renderer needs the Obsidian app/DOM; unit tests only need the
+ * named exports to exist so modules importing `sync-view` / `main` load.
+ */
+export class Component {
+  load(): void {}
+  unload(): void {}
+}
+
+export class MarkdownRenderChild extends Component {
+  readonly containerEl: HTMLElement;
+
+  constructor(containerEl: HTMLElement) {
+    super();
+    this.containerEl = containerEl;
+  }
+}
+
+export const MarkdownRenderer = {
+  render: vi.fn(
+    async (
+      _app: unknown,
+      markdown: string,
+      el: HTMLElement,
+    ): Promise<void> => {
+      el.textContent = markdown;
+    },
+  ),
+};
+
 // requestUrl — used by OneDrive client
 export interface RequestUrlResponse {
   status: number;

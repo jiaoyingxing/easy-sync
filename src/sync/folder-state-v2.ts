@@ -56,6 +56,14 @@ interface FolderPlanItemV2 {
   reason?: FolderPlanConflictReasonV2;
   /** Complete snapshot roots whose ordinary file actions must be held together. */
   affectedPaths?: string[];
+  /**
+   * Internal topology marker (2026-11-27): this `create-remote` folder is a new
+   * parent that already contains locally moved, anchored subtrees. The canonical
+   * plan withholds their ordinary file actions so one bounded same-run
+   * continuation can create the parent first and then move the old folders.
+   * Never user-visible; only the executor continuation consumes it.
+   */
+  carriesMovedSubtree?: boolean;
   impact: FolderPlanImpactV2;
 }
 
@@ -442,10 +450,37 @@ export function planFolderStateFromViewV2(
 
   const collapsed = collapseCoveredMoves(candidates)
     .sort(comparePlanCandidate);
+  // A new unanchored parent can be the destination of one or more folders the
+  // host moved this session. The folder plan itself has no remote identity for
+  // that parent yet, so it can only create it; mark the create so the canonical
+  // plan holds all descendant file actions instead of uploading copies or
+  // deleting the old cloud paths, and so the executor can run the bounded
+  // create → move → descendant continuation in the same visible round.
+  const carriesMovedSubtree = (item: FolderPlanItemV2): boolean => {
+    if (item.type !== "create-remote") return false;
+    return validLocalMoveHints.some((hint) => {
+      const anchor = anchorByRemoteId.get(hint.remoteId);
+      return Boolean(
+        anchor
+        && anchor.lastPath === hint.fromPath
+        && input.state.fileAnchors.some((entry) =>
+          isDescendant(entry.lastPath, hint.fromPath)
+          && includeFilePath(entry.lastPath))
+        && isAtOrBelow(hint.toPath, item.path)
+        && !isAtOrBelow(hint.fromPath, item.path)
+        && localFoldersExact.has(nfcPath(hint.toPath))
+        && includeFolderPath(hint.toPath),
+      );
+    });
+  };
   return {
     version: 1,
     status: "planned",
-    items: collapsed.map(({ coverage: _coverage, ...item }) => item),
+    items: collapsed.map(({ coverage: _coverage, ...item }) => (
+      carriesMovedSubtree(item)
+        ? { ...item, carriesMovedSubtree: true }
+        : item
+    )),
     counts: countActions(collapsed),
     reviewImpact: calculateReviewImpact(collapsed, input, remotePathById),
     mutations: [],

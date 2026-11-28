@@ -94,6 +94,12 @@ export interface FileProgress {
    *  on history entries written before the field existed; never read by any
    *  decision (see `SyncFileErrorFactV1`). */
   error?: SyncFileErrorFactV1;
+  /** Presentation-only preview row (pipelined downloads): the payload bytes
+   *  are complete but the group's verify/commit has not run yet. The durable
+   *  completion replaces this row in place (same path, no second count); an
+   *  abort or cancel flips it to failed. The round-end guard flips any
+   *  leftover, so a provisional row never reaches history. */
+  provisional?: boolean;
 }
 
 type RemoteScopeRecoveryFailureStage =
@@ -235,6 +241,12 @@ export function retainFileProgress(files: FileProgress[]): FileProgress[] {
 export class SyncProgressStore {
   private _state: SyncProgressState;
 
+  /** Paths whose shown row is still a presentation-only preview (see
+   *  `addProvisionalCompletedFile`). Kept beside the capped row list so the
+   *  durable completion still replaces the count even if the preview row
+   *  itself was pushed out of the retained list. */
+  private provisionalPaths = new Set<string>();
+
   constructor() {
     this._state = {
       phase: "idle",
@@ -257,6 +269,7 @@ export class SyncProgressStore {
 
   /** Reset to idle */
   reset(): void {
+    this.provisionalPaths.clear();
     this._state = {
       phase: "idle",
       current: 0,
@@ -309,6 +322,7 @@ export class SyncProgressStore {
     if (phase === "executing" && options?.keepCompleted !== true) {
       this._state.completedFiles = [];
       this._state.completedCount = 0;
+      this.provisionalPaths.clear();
     }
   }
 
@@ -385,7 +399,17 @@ export class SyncProgressStore {
     this._state.cancelRequested = true;
   }
 
-  finish(): void {
+  /** Round end. `unsettledPreviewReason` flips any preview row whose durable
+   *  completion never arrived: a shown success must not reach history when its
+   *  group never committed. Normal rounds pass it too — the call is a no-op
+   *  once every preview was replaced. */
+  finish(unsettledPreviewReason?: string): void {
+    if (unsettledPreviewReason !== undefined) {
+      for (const path of this.provisionalFilePaths()) {
+        this.revertCompletedFile(path, unsettledPreviewReason);
+      }
+    }
+    this.provisionalPaths.clear();
     this._state.phase = "done";
     this._state.phaseStartedAt = 0;
     this._state.currentFile = "";
@@ -400,11 +424,56 @@ export class SyncProgressStore {
 
   /** Record a completed file */
   addCompletedFile(file: FileProgress): void {
+    // A durable completion for a previewed download replaces the shown row in
+    // place and keeps its one settled-action count: the row was already
+    // visible, and the item must not be counted twice.
+    if (this.provisionalPaths.delete(file.path)) {
+      const rows = this._state.completedFiles;
+      let index = -1;
+      for (let cursor = rows.length - 1; cursor >= 0; cursor--) {
+        if (rows[cursor].path === file.path) {
+          index = cursor;
+          break;
+        }
+      }
+      if (index >= 0) {
+        const next = [...rows];
+        next[index] = file;
+        this._state.completedFiles = retainFileProgress(next);
+      } else {
+        this._state.completedFiles = retainFileProgress([...rows, file]);
+      }
+      return;
+    }
     this._state.completedFiles = retainFileProgress([
       ...this._state.completedFiles,
       file,
     ]);
     this._state.completedCount++;
+  }
+
+  /** Show a pipelined download's row as soon as its payload bytes are complete
+   *  (the same moment the visible `x/y` lookahead rises), before the group's
+   *  verify and commit lanes run. Presentation only: the durable completion
+   *  replaces this row in place, and an abort/cancel flips it to failed. */
+  addProvisionalCompletedFile(file: FileProgress): void {
+    if (
+      this.provisionalPaths.has(file.path)
+      || this._state.completedFiles.some((row) => row.path === file.path)
+    ) {
+      return;
+    }
+    this.provisionalPaths.add(file.path);
+    this._state.completedFiles = retainFileProgress([
+      ...this._state.completedFiles,
+      { ...file, provisional: true },
+    ]);
+    this._state.completedCount++;
+  }
+
+  /** Paths whose rows are still presentation-only previews. */
+  provisionalFilePaths(): string[] {
+    return [...this.provisionalPaths];
   }
 
   /**
@@ -421,11 +490,16 @@ export class SyncProgressStore {
     for (let index = files.length - 1; index >= 0; index--) {
       const file = files[index];
       if (file.path !== path || !isSuccessfulFileProgress(file)) continue;
+      // Drop the presentation-only marker with the flip: the row now owns a
+      // failure outcome, and no durable completion is expected after it.
+      const settled = { ...file };
+      delete settled.provisional;
       this._state.completedFiles = [
         ...files.slice(0, index),
-        { ...file, status: "error", reason, failedAt: Date.now() },
+        { ...settled, status: "error", reason, failedAt: Date.now() },
         ...files.slice(index + 1),
       ];
+      this.provisionalPaths.delete(path);
       return true;
     }
     return false;
@@ -461,6 +535,7 @@ export class SyncProgressStore {
   markStarted(
     activityKind: "fullSync" | "sideAction" | "mutationRecovery" = "fullSync",
   ): void {
+    this.provisionalPaths.clear();
     this._state.activityKind = activityKind;
     this._state.startedAt = Date.now();
     this._state.phaseStartedAt = 0;

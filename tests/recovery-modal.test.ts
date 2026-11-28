@@ -270,8 +270,17 @@ function makeState(input: {
   const reads = { ledger: 0 };
   return {
     reads,
-    remoteIdForPath: vi.fn((path: string) => input.remoteIds?.[path]),
-    remoteETagForPath: vi.fn((path: string) => input.remoteEtags?.[path]),
+    recoveryIdentityForPath: vi.fn((path: string) => {
+      const remoteId = input.remoteIds?.[path];
+      if (!remoteId) return undefined;
+      const remoteETag = input.remoteEtags?.[path];
+      return {
+        kind: "resolved" as const,
+        remoteId,
+        ...(remoteETag === undefined ? {} : { remoteETag }),
+        baselinePath: path,
+      };
+    }),
     get deletionLedgerEntries() {
       reads.ledger += 1;
       return (input.ledger ?? []) as readonly DeletionLedgerEntryV1[];
@@ -1151,6 +1160,17 @@ describe("RecoveryModal 定稿文案钉子（2026-10-20 用户圈定）", () => 
     expect(zh.t("recovery.restoreFailed")).not.toContain("此刻");
     expect(zh.t("recovery.reason.writeFailed")).not.toContain("没能");
     expect(zh.t("recovery.reason.writeFailed")).not.toContain("本机");
+  });
+
+  it("改名未同步的说明双语逐字（2026-11-26）", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    expect(zh.t("recovery.reason.renamePending")).toBe(
+      "这个文件刚改过名，同步完成后可查看历史版本",
+    );
+    expect(en.t("recovery.reason.renamePending")).toBe(
+      "Just renamed — previous versions will be available after the next sync",
+    );
   });
 });
 

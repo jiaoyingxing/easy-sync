@@ -3448,8 +3448,15 @@ describe("canonical plan large-file gate wiring", () => {
       "\n        });",
     );
 
+    // 8. 新建父目录的同轮拓扑续跑候选（continueStagedTopologyRoots）：
+    // 与单夹续跑共用同一设备大文件门。
+    pinSite(
+      "      let candidate = buildCanonicalPlanCandidateV2({",
+      "\n      });",
+    );
+
     // 数量钉住：防止新增接线点只改标题不补断言，或某处字段被别名绕开。
-    expect(source.split(field)).toHaveLength(8);
+    expect(source.split(field)).toHaveLength(9);
   });
 });
 
@@ -3841,5 +3848,99 @@ describe("sibling deferral locality", () => {
         path: "Projects/Delta/note-d.md",
       }),
     ]);
+  });
+
+  it("holds a new parent's moved subtrees for the same-run topology continuation", () => {
+    const state = envelope({
+      folders: [
+        { id: "alpha", name: "Alpha" },
+        { id: "beta", name: "Beta" },
+      ],
+      files: [
+        { id: "alpha-note", name: "note.md", parentId: "alpha" },
+        { id: "beta-note", name: "note.md", parentId: "beta" },
+      ],
+      folderAnchors: [
+        folderAnchor("alpha", "Alpha"),
+        folderAnchor("beta", "Beta"),
+      ],
+      fileAnchors: [
+        fileAnchor("alpha-note", "Alpha/note.md"),
+        fileAnchor("beta-note", "Beta/note.md"),
+      ],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [
+        localFile("00_系统/Alpha/note.md"),
+        localFile("00_系统/Beta/note.md"),
+      ],
+      localFolders: localFolders("00_系统", "00_系统/Alpha", "00_系统/Beta"),
+      localMoveHints: [
+        {
+          version: 1,
+          scope,
+          remoteId: "alpha",
+          fromPath: "Alpha",
+          toPath: "00_系统/Alpha",
+          observedAt: 10,
+        },
+        {
+          version: 1,
+          scope,
+          remoteId: "beta",
+          fromPath: "Beta",
+          toPath: "00_系统/Beta",
+          observedAt: 11,
+        },
+      ],
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(candidate.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.CreateRemoteFolder,
+        path: "00_系统",
+        reviewImpactCount: 5,
+      }),
+    ]);
+    expect(candidate.folderPlan.items).toEqual([
+      expect.objectContaining({
+        type: "create-remote",
+        path: "00_系统",
+        carriesMovedSubtree: true,
+      }),
+    ]);
+    expect(candidate.items.some((item) =>
+      item.type === SyncActionType.Upload
+      || item.type === SyncActionType.Conflict
+      || item.type === SyncActionType.DeleteRemote)).toBe(false);
+  });
+
+  it("does not claim a new parent as a moved subtree without a local move hint", () => {
+    const state = envelope({
+      folders: [{ id: "alpha", name: "Alpha" }],
+      files: [{ id: "alpha-note", name: "note.md", parentId: "alpha" }],
+      folderAnchors: [folderAnchor("alpha", "Alpha")],
+      fileAnchors: [fileAnchor("alpha-note", "Alpha/note.md")],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [localFile("00_系统/Alpha/note.md")],
+      localFolders: localFolders("00_系统", "00_系统/Alpha"),
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(candidate.folderPlan.items).toEqual([
+      expect.objectContaining({
+        type: "create-remote",
+        path: "00_系统",
+      }),
+    ]);
+    expect(candidate.folderPlan.items[0]).not.toHaveProperty(
+      "carriesMovedSubtree",
+    );
   });
 });

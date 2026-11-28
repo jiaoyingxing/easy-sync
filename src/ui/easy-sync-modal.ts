@@ -27,7 +27,10 @@ import {
   type App,
 } from "obsidian";
 import { hostPlatformFacts } from "../obsidian-compat";
-import { applyDestructiveButton } from "./destructive-button";
+import {
+  applyDestructiveButton,
+  applyDestructivePrimaryButton,
+} from "./destructive-button";
 
 /** One selectable row for chooser modals (login methods, migration offer). */
 interface EasySyncModalOptionView {
@@ -165,12 +168,19 @@ export function createEasySyncModalFooter(
   return parentEl.createDiv(classes.join(" "));
 }
 
-type EasySyncFooterButtonVariant = "cta" | "destructive" | "plain" | "link";
+type EasySyncFooterButtonVariant =
+  | "cta"
+  | "destructive"
+  | "destructive-primary"
+  | "plain"
+  | "link";
 
 interface EasySyncFooterButtonOptions {
   label: string;
   /** Defaults to "plain". Every non-CTA variant carries the host
-   *  `mod-cancel` class (phone-only spacing, zero effect on desktop). */
+   *  `mod-cancel` class (phone-only spacing, zero effect on desktop).
+   *  `destructive` is the tinted tier (rebuildable state); `destructive-primary`
+   *  is the solid tier (deletes user files) — see `destructive-button.ts`. */
   variant?: EasySyncFooterButtonVariant;
   /** Extra visual class on the button element (local/remote tinted actions). */
   className?: string;
@@ -182,7 +192,8 @@ interface EasySyncFooterButtonOptions {
  * One footer button. DOM order contract: secondary actions first, primary
  * (CTA) last — the host's mobile `column-reverse` then shows the primary on
  * top and the cancel at the bottom. Destructive styling always goes through
- * `applyDestructiveButton` (never the deprecated API or a bare class).
+ * the two helpers in `destructive-button.ts` (never the deprecated API or a
+ * bare class name).
  */
 export function addEasySyncFooterButton(
   parentEl: HTMLElement,
@@ -192,6 +203,7 @@ export function addEasySyncFooterButton(
   const button = new ButtonComponent(parentEl).setButtonText(options.label);
   if (variant === "cta") button.setCta();
   else if (variant === "destructive") applyDestructiveButton(button);
+  else if (variant === "destructive-primary") applyDestructivePrimaryButton(button);
   else if (variant === "link") button.setClass("mod-link");
   else button.setClass("mod-cancel");
   if (options.className) button.buttonEl.addClass(options.className);

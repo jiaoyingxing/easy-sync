@@ -1059,18 +1059,8 @@ describe("main sync entry guards", () => {
     expect(commands.map((command) => command.id)).toEqual([
       "start-sync",
       "show-detail",
-      "lan-connect",
       "open-recovery",
     ]);
-    // S4: the experimental entry is unavailable while the switch is off.
-    const lanCommand = commands.find((command) => command.id === "lan-connect");
-    expect(lanCommand?.checkCallback).toBeTypeOf("function");
-    (plugin as unknown as { lanAccelerationEnabled: boolean })
-      .lanAccelerationEnabled = false;
-    expect(lanCommand!.checkCallback!(true)).toBe(false);
-    (plugin as unknown as { lanAccelerationEnabled: boolean })
-      .lanAccelerationEnabled = true;
-    expect(lanCommand!.checkCallback!(true)).toBe(true);
     expect(views).toHaveLength(1);
     expect(views[0]?.type).toBe(SYNC_VIEW_TYPE);
     expect(views[0]?.creator).toBeTypeOf("function");

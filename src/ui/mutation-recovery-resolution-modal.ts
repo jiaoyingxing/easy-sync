@@ -285,7 +285,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
       for (const action of labelledActions) {
         ordinaryActions.push({
           label: this.t(action.labelKey),
-          ...(action.className ? { className: action.className } : {}),
+          ...(action.variant ? { variant: action.variant } : {}),
           onClick: () => this.settle(action.choice),
         });
       }
@@ -671,8 +671,10 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualM
           local: this.t("syncView.pluginBundleReview.version", { version: localVersion }),
           remote: this.t("syncView.pluginBundleReview.version", { version: remoteVersion }),
         }),
+        // Either direction overwrites the whole plugin bundle, so the losing
+        // side is replaced: destroy tier.
         messageClass: "modal-title",
-        danger: true,
+        danger: "destroy",
       },
     ).awaitConfirm();
     if (!confirmed) return;

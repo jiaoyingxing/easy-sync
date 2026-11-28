@@ -223,14 +223,16 @@ export function resolveNextUpdateCheckDelay(latest: string | null): number {
  * itself is never cancelled; the race stays subscribed to it, so a late
  * settlement is ignored once the race has settled.
  *
- * Intentionally not merged with `withTimeout` in `src/onedrive/client.ts`:
+ * Shared with `src/update-notes.ts` (the inline release-notes read uses the
+ * same one-shot budget). Intentionally not merged with `withTimeout` in
+ * `src/onedrive/client.ts`:
  * that copy throws the Graph-domain `SyntheticRequestTimeoutError` that error
  * classification branches on, normalizes non-Error rejection records through
  * `toErrorLike`, and uses the active-window compat timers. Sharing one shell
  * would require injecting all three behaviors and would couple this host
  * hygiene helper to the Graph error domain for no behavioral gain.
  */
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: number | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = window.setTimeout(

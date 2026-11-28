@@ -424,6 +424,7 @@ import {
   LocalWriteNotLandedError,
   MutationNotAppliedError,
   MutationRecoveryBlockedError,
+  RemoteFilesRootReplacedError,
   type V2CommittedScopeLossReason,
   V2CommittedScopeUnreachableError,
 } from "./executor-errors";
@@ -12487,6 +12488,31 @@ export class SyncExecutor {
     } finally {
       this.activeLocalDeleteDecisionEntries = null;
     }
+    // A newly created parent that already carries locally moved anchored
+    // subtrees is the same topology transaction as a folder move, only in two
+    // steps: create the parent, then move the old folders into it. The first
+    // plan withholds their file actions, so this bounded continuation can run
+    // both steps inside the same visible sync instead of asking for a second
+    // round.
+    const stagedTopologyRoots = canonicalPlanCandidate?.folderPlan.items
+      .filter((item) => item.type === "create-remote" && item.carriesMovedSubtree)
+      .map((item) => item.path)
+      ?? [];
+    await this.continueStagedTopologyRoots({
+      roots: stagedTopologyRoots,
+      plan,
+      result,
+      operationEpoch,
+      callbacks,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      configDir,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+    });
     // A folder move is a topology transaction in either direction. Only
     // after its receipt/checkpoint has advanced the authority may one fresh
     // scan produce a single bounded descendant plan; never recurse into run().
@@ -12577,6 +12603,256 @@ export class SyncExecutor {
       terminated: null,
       migrationExecutionHold,
     };
+  }
+
+  /**
+   * Finish a newly created parent that already contains locally moved anchored
+   * subtrees, inside the same visible sync.
+   *
+   * The first plan only creates the parent and withholds every descendant
+   * action (`carriesMovedSubtree`). This continuation re-reads the authority,
+   * plans the now-anchored parent's child folder moves, executes them, and then
+   * hands the remaining descendant content to the existing bounded folder-move
+   * continuation. It never recurses into `run()` and never starts a second
+   * user-visible round; a cancellation or failed proof falls back to the
+   * ordinary deferred/stop path.
+   */
+  private async continueStagedTopologyRoots(args: {
+    roots: readonly string[];
+    plan: SyncPlan & { scope: SyncScope };
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    configDir: string;
+    includeCanonicalFilePath: (path: string) => boolean;
+    includeCanonicalFolderPath: (path: string) => boolean;
+    preserveCanonicalFolderPath: (path: string) => boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+  }): Promise<void> {
+    const {
+      roots,
+      plan,
+      result,
+      operationEpoch,
+      callbacks,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      configDir,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+    } = args;
+    if (roots.length === 0) return;
+    for (const root of roots) {
+      if (
+        this.shouldStop(result, operationEpoch)
+        || result.errors !== 0
+        || result.conflicts !== 0
+        || result.deferred !== 0
+        || this.state.mutationLedger.length !== 0
+      ) return;
+      const rootId = this.committedRemoteFolderId(root);
+      if (!rootId) {
+        result.deferred = Math.max(1, result.deferred);
+        return;
+      }
+      const scan = await this.scanner.scanAll(
+        undefined,
+        this.cancelController?.signal,
+      );
+      if (
+        scan.complete === false
+        || scan.failedPaths.length !== 0
+        || scan.folderScanComplete !== true
+        || this.state.mutationLedger.length !== 0
+        || this.shouldStop(result, operationEpoch)
+      ) {
+        result.deferred = Math.max(1, result.deferred);
+        return;
+      }
+      await this.tryDeltaOrFullScan(
+        operationEpoch,
+        result,
+        plan.scope,
+        scan.entries,
+      );
+      if (
+        result.errors !== 0
+        || result.conflicts !== 0
+        || result.deferred !== 0
+        || this.state.mutationLedger.length !== 0
+        || this.shouldStop(result, operationEpoch)
+      ) return;
+      const sourceEnvelope = this.state.getCommittedV2Envelope();
+      if (!sourceEnvelope) {
+        result.deferred = Math.max(1, result.deferred);
+        return;
+      }
+      const includeRootFilePath = (path: string): boolean =>
+        includeCanonicalFilePath(path) && isAtOrBelowPath(path, root);
+      let candidate = buildCanonicalPlanCandidateV2({
+        envelope: sourceEnvelope,
+        localFiles: scan.entries,
+        localFolders: scan.folders ?? [],
+        localFolderScanComplete: true,
+        skippedLarge: scan.skippedLarge,
+        maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
+        localMoveHints: this.state.localFolderMoveHints,
+        localFolderDeleteHints: this.state.localFolderDeleteHints,
+        localFileMoveHints: this.state.localFileMoveHints,
+        includeFilePath: includeRootFilePath,
+        // Folder anchors live at the OLD paths, so the folder scope must stay
+        // complete; only the ordinary file actions are narrowed to the new
+        // parent root. The first plan already withheld this subtree.
+        includeFolderPath: includeCanonicalFolderPath,
+        preserveFolderPath: preserveCanonicalFolderPath,
+        configDir,
+        automaticDeleteLocalFiles: this.planBuildAutomaticDeleteLocalFiles(),
+        syncDirection: this.syncDirection,
+      });
+      if (candidate.status !== "planned") {
+        result.deferred = Math.max(1, result.deferred);
+        return;
+      }
+      candidate = {
+        ...candidate,
+        items: protectEasySyncSelfSyncPlan(
+          protectCommunityPluginPlan(
+            candidate.items,
+            communityPluginSyncPolicy,
+            configDir,
+            scan.entries,
+          ),
+          configDir,
+          this.scanner.pluginId,
+          this.scanner.ownPluginDir,
+        ),
+      };
+      const insideRoot = (path: string | undefined): boolean =>
+        Boolean(path) && isAtOrBelowPath(path!, root);
+      const retainedItems = candidate.items.filter((item) =>
+        insideRoot(item.path) || insideRoot(item.renameFrom));
+      if (retainedItems.length !== candidate.items.length) {
+        this.diag?.warn(
+          "plan",
+          "V2 new-parent continuation dropped actions outside its reviewed root",
+          {
+            root,
+            dropped: candidate.items.length - retainedItems.length,
+            mutations: 0,
+          },
+        );
+        candidate = { ...candidate, items: retainedItems };
+      }
+      const finalized = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: sourceEnvelope,
+        vaultName: this.vaultName,
+        accountId: this.state.boundAccountId ?? "",
+        configDir: getConfigDir(this.scanner.vault),
+        automaticHandlingPolicy,
+        identityConfirmed: this.providerConfirmsIdentity(),
+        syncDirection: this.syncDirection,
+        baselineReconstructionIncomplete: false,
+        pendingContentComparisons: this.state.pendingConflicts.map(
+          (item) => ({
+            path: item.path,
+            contentComparison: item.contentComparison,
+          }),
+        ),
+        resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+      });
+      const latestEnvelope = this.state.getCommittedV2Envelope();
+      if (
+        finalized.baseUpserts.length !== 0
+        || !latestEnvelope
+        || latestEnvelope.meta.commitSeq !== sourceEnvelope.meta.commitSeq
+      ) {
+        result.deferred = Math.max(1, result.deferred);
+        return;
+      }
+      const sealed = sealCanonicalPlanV2({
+        finalized,
+        sourceEnvelope,
+        committedEnvelope: latestEnvelope,
+      });
+      if (sealed.items.length === 0) continue;
+      this.diag?.log(
+        "plan",
+        "V2 new-parent topology continued in the same sync",
+        {
+          root,
+          actions: sealed.items.length,
+          sourceCommitSeq: sourceEnvelope.meta.commitSeq,
+          mutations: 0,
+        },
+      );
+      await this.executePlan(
+        {
+          items: sealed.items,
+          lastTotalFiles: sealed.lastTotalFiles,
+          confirmed: true,
+          scope: { ...sealed.scope },
+          canonicalIdentity: sealed.canonicalIdentity,
+          canonicalReview: sealed.canonicalReview,
+        },
+        result,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        automaticHandlingMetrics,
+        communityPluginSyncPolicy,
+      );
+      if (
+        result.errors !== 0
+        || result.conflicts !== 0
+        || result.deferred !== 0
+        || this.state.mutationLedger.length !== 0
+      ) return;
+      const checkpointEnvelope = this.state.getCommittedV2Envelope();
+      const committedFolderAnchor = checkpointEnvelope
+        ? Object.values(
+            checkpointEnvelope.folderAnchors?.byAnchorId ?? {},
+          ).find((anchor) => anchor.remoteId === rootId)
+        : null;
+      const settled = await this.settleStagedFolderMoveContinuation({
+        checkpointEnvelope,
+        remoteId: rootId,
+        targetRoot: root,
+        sourceCommitSeq: sealed.canonicalIdentity.sourceCommitSeq,
+        moveAuthorizationSettled: true,
+        committedFolderAnchor,
+        plan,
+        result,
+        operationEpoch,
+        callbacks,
+        automaticHandlingPolicy,
+        automaticHandlingMetrics,
+        communityPluginSyncPolicy,
+        includeCanonicalFilePath,
+        includeCanonicalFolderPath,
+        preserveCanonicalFolderPath,
+        resolveCanonicalRemoteContentHash,
+        configDir,
+      });
+      if (!settled) {
+        result.deferred = Math.max(1, result.deferred);
+        this.diag?.warn(
+          "plan",
+          "V2 new-parent topology committed but descendant continuation was not fully proven",
+          { root, mutations: 0 },
+        );
+      }
+    }
   }
 
   /**
@@ -16290,7 +16566,12 @@ export class SyncExecutor {
       this.cancelController = null;
       this.activeSyncScope = null;
       this.running = false;
-      this.progressStore?.finish();
+      // Round-end guard: a preview row whose durable completion never arrived
+      // must not survive as a shown success (and must not reach history).
+      // Normal rounds replaced every preview, so this is a no-op then.
+      this.progressStore?.finish(
+        this.t(this.cancelled ? "result.cancelled" : "syncView.failure.unknown"),
+      );
       callbacks.onStateChange?.();
     }
 
@@ -16710,18 +16991,29 @@ export class SyncExecutor {
     // intent/receipt and checkpoint publication below remain strictly serial
     // per file on every platform.
 
-    await this.runDownloadWindow({
-      plan,
-      result,
-      callbacks,
-      operationEpoch,
-      automaticHandlingPolicy,
-      run,
-      downloads: run.downloads,
-      downloadPolicy: run.downloadPolicy,
-      preparedCommunityPluginDownloads,
-      metrics: run.metrics,
-    });
+    try {
+      await this.runDownloadWindow({
+        plan,
+        result,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        run,
+        downloads: run.downloads,
+        downloadPolicy: run.downloadPolicy,
+        preparedCommunityPluginDownloads,
+        metrics: run.metrics,
+      });
+    } catch (error) {
+      // Any unexpected throw after previews were raised (not only the parked
+      // group error) must not leave a shown success behind; the window itself
+      // already flips its own error/cancel exits, so this is a no-op there.
+      this.revertOutstandingDownloadPreviews(
+        callbacks,
+        this.failureReason(error),
+      );
+      throw error;
+    }
 
     await this.runCleanupWavePhase(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run);
 
@@ -17689,6 +17981,20 @@ export class SyncExecutor {
   ): void {
     for (const completion of completed) {
       callbacks.onFileReverted?.(completion.path, reason);
+    }
+  }
+
+  /** Flip every shown download preview whose durable completion never
+   *  arrived: its transfer bytes were complete, but the group's verify or
+   *  commit lane was skipped (failed, or the round cancelled before it ran).
+   *  A preview row must never survive as a shown success. Display only — the
+   *  mutation ledger and the next round's recovery own the real settlement. */
+  private revertOutstandingDownloadPreviews(
+    callbacks: SyncCallbacks,
+    reason: string,
+  ): void {
+    for (const path of this.progressStore?.provisionalFilePaths() ?? []) {
+      callbacks.onFileReverted?.(path, reason);
     }
   }
 
@@ -19555,6 +19861,18 @@ export class SyncExecutor {
           // this lookahead so the result view only reports settled items.
           processedDownloadTransfers++;
           this.progressStore?.setProcessedCurrent(processedDownloadTransfers);
+          // Same moment, same item: show the row itself too. Otherwise a round
+          // whose group never fills only reveals its details when the window
+          // drains (user report 2026-11-27: small rounds saw the rows flash at
+          // the last instant). The durable completion replaces this row in
+          // place; an abort/cancel flips it visibly. Store-only (like
+          // `setProcessedCurrent`); the onProgress call below refreshes it.
+          this.progressStore?.addProvisionalCompletedFile({
+            path: item.path,
+            status: SyncProgressStore.actionToStatus(item.type),
+            actionType: item.type,
+            fileSize: fileSizeForAction(item, item.type),
+          });
           callbacks.onProgress?.(
             Math.min(run.settled, run.total),
             run.total,
@@ -19655,9 +19973,24 @@ export class SyncExecutor {
       await downloadUrlLookahead?.drain();
     }
     if (groupError !== null) {
+      this.revertOutstandingDownloadPreviews(
+        callbacks,
+        this.failureReason(groupError),
+      );
       throw groupError instanceof Error
         ? groupError
         : new Error(describeThrownValue(groupError));
+    }
+    if (!this.canContinue(operationEpoch, result)) {
+      // The round was stopped before every previewed group committed; the
+      // rows that already showed their bytes as done must flip with the
+      // honest stop reason instead of vanishing with the panel.
+      this.revertOutstandingDownloadPreviews(
+        callbacks,
+        result.authExpired
+          ? this.t("syncView.failure.authExpired")
+          : this.t("result.cancelled"),
+      );
     }
   }
 
@@ -30759,6 +31092,44 @@ export class SyncExecutor {
     );
   }
 
+  /**
+   * A complete remote snapshot that no longer contains the committed files
+   * root but still contains items outside it is the signature of a same-path
+   * vault rebuild. The delta cursor can survive that replacement, so the
+   * ordinary fast path would keep rebuilding against the dead root and abort
+   * with an opaque hierarchy failure. Resolve the live path identity once:
+   * a proven replacement enters the existing V2-only scope recovery; any
+   * probe failure or a still-matching scope keeps the original fail-closed
+   * result.
+   */
+  private async routeProvenRemoteFilesRootReplacement(
+    cause: RemoteFilesRootReplacedError,
+    currentScope: SyncScope,
+  ): Promise<void> {
+    if (!this.state.isV2StateActive || this.state.mutationLedger.length > 0) {
+      return;
+    }
+    let scopeLoss: V2CommittedScopeUnreachableError;
+    try {
+      scopeLoss = await this.resolveV2CommittedScopeLoss(
+        currentScope,
+        new RemoteVaultScopeIdentityError("files-root-invalid"),
+      );
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "remote files root replacement could not be proven; keeping the ordinary hierarchy failure",
+        {
+          firstOutsideId: cause.firstOutsideId,
+          probe: describeError(error),
+          mutations: 0,
+        },
+      );
+      return;
+    }
+    throw scopeLoss;
+  }
+
   private async commitPreparedRemoteState(
     entries: RemoteFileEntry[],
     deltaLink: string | null,
@@ -30891,21 +31262,28 @@ export class SyncExecutor {
     if (!forceCompleteIdentitySnapshot
       && this.state.hasRemoteState
       && this.state.remoteDeltaLink) {
-      const cacheOutcome = await this.refreshIncrementalRemoteCache({
-        operationEpoch,
-        result,
-        syncScope,
-        localEntries,
-        persistPreparedState,
-        persistRemoteProjection,
-        preserveReviewedSourceCommitSeq,
-        currentScope,
-        filesRootId,
-        deltaLink: this.state.remoteDeltaLink,
-      });
-      if (cacheOutcome.terminated) return cacheOutcome.terminated;
-      currentScope = cacheOutcome.scope;
-      filesRootId = cacheOutcome.filesRootId;
+      try {
+        const cacheOutcome = await this.refreshIncrementalRemoteCache({
+          operationEpoch,
+          result,
+          syncScope,
+          localEntries,
+          persistPreparedState,
+          persistRemoteProjection,
+          preserveReviewedSourceCommitSeq,
+          currentScope,
+          filesRootId,
+          deltaLink: this.state.remoteDeltaLink,
+        });
+        if (cacheOutcome.terminated) return cacheOutcome.terminated;
+        currentScope = cacheOutcome.scope;
+        filesRootId = cacheOutcome.filesRootId;
+      } catch (cacheError) {
+        if (cacheError instanceof RemoteFilesRootReplacedError) {
+          await this.routeProvenRemoteFilesRootReplacement(cacheError, currentScope);
+        }
+        throw cacheError;
+      }
     }
 
     // join 弱网「稍后重试」案C (2026-09-19): 断点续扫。部分读取进度持久化在
@@ -31009,6 +31387,9 @@ export class SyncExecutor {
         return { entries, scope: currentScope };
       } catch (e2) {
         if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
+        if (e2 instanceof RemoteFilesRootReplacedError) {
+          await this.routeProvenRemoteFilesRootReplacement(e2, currentScope);
+        }
         // Both delta and full scan failed — if NotFound, the vault folder is empty/new
         if (e2 instanceof RemoteError && e2.type === RemoteErrorType.NotFound) {
           if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
@@ -31917,6 +32298,14 @@ export class SyncExecutor {
       (item) => !descendantIds.has(item.id) && !allowedOutside.has(item.id),
     );
     if (unresolved.length > 0) {
+      // A missing committed root plus out-of-root items is the signature of a
+      // same-path vault replacement. Ordinary planning resolves the live path
+      // identity instead of treating the first outside item as a generic
+      // hierarchy error (2026-11-26 field: cloud folder rebuilt, old delta
+      // cursor survived, old files root kept being used).
+      if (!filesRoot) {
+        throw new RemoteFilesRootReplacedError(unresolved[0].id);
+      }
       throw new Error(`Remote hierarchy outside known files root: ${unresolved[0].id}`);
     }
     return descendants;

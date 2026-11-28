@@ -448,7 +448,11 @@ export function applyCommunityPluginScopeRow(
                     t("settings.communityPlugins.data.experimentalBulkStep.conflict"),
                   ],
                   warning: t("settings.communityPlugins.data.experimentalWarning"),
-                  danger: true,
+                  // Accept key = the dialog's only action → solid tier
+                  // (2026-11-27 second pass). No file is deleted, but "the
+                  // other device's edits are lost" is stated in the steps, and
+                  // that loss is what the solid red reads as.
+                  danger: "destroy",
                 },
               ).awaitConfirm();
               if (!confirmed) return;
@@ -891,7 +895,8 @@ export function applyNotificationPopupsRow(
     renderHint();
 }
 
-/** 移动端常驻状态图标开关行（仅移动端渲染与生效；桌面端不进强显路径）。 */
+/** 移动端常驻状态图标开关行（按 UI 形态渲染与生效，含桌面 app.emulateMobile()；
+ *  桌面常规 UI 不进强显路径）。 */
 export function applyMobileStatusBarRow(
   setting: Setting,
   host: SettingsPageRowHost,

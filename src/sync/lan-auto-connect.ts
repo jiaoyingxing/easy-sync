@@ -57,7 +57,7 @@ import {
   LanPeerSession,
   createLanContentSource,
   normalizeSdp,
-} from "../dev/lan-session";
+} from "./lan-peer-session";
 import {
   compatClearTimeout,
   compatSetTimeout,
@@ -178,7 +178,7 @@ export interface LanAutoConnectLogEvent {
 export interface LanAutoConnectDeps {
   /** Build the provider-neutral cloud signaling transport for this vault. */
   createTransport(): LanSignalTransport;
-  /** Shared six-check sender gate (the dev modal uses the same implementation). */
+  /** Shared six-check sender gate for every sender request. */
   serveGate: LanServeGateDeps;
   /** Install a reusable source into the running client. */
   injectSource(source: LanContentSource): boolean;

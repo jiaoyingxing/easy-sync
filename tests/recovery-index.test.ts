@@ -88,6 +88,12 @@ function makeArchiveAdapter(files: Record<string, number | null>) {
 function makeState(input: {
   remoteIds?: Record<string, string>;
   remoteEtags?: Record<string, string>;
+  /** 显式身份（如改名未同步：查询路径 → 原锚点），优先于 remoteIds。 */
+  identities?: Record<
+    string,
+    | { remoteId: string; remoteETag?: string; baselinePath: string }
+    | "pending-rename"
+  >;
   ledger?: DeletionLedgerEntryV1[];
   baselines?: Record<
     string,
@@ -96,8 +102,22 @@ function makeState(input: {
 }) {
   const baselines = input.baselines ?? {};
   return {
-    remoteIdForPath: vi.fn((path: string) => input.remoteIds?.[path]),
-    remoteETagForPath: vi.fn((path: string) => input.remoteEtags?.[path]),
+    recoveryIdentityForPath: vi.fn((path: string) => {
+      const explicit = input.identities?.[path];
+      if (explicit === "pending-rename") {
+        return { kind: "pending-rename" as const };
+      }
+      if (explicit) return { kind: "resolved" as const, ...explicit };
+      const remoteId = input.remoteIds?.[path];
+      if (!remoteId) return undefined;
+      const remoteETag = input.remoteEtags?.[path];
+      return {
+        kind: "resolved" as const,
+        remoteId,
+        ...(remoteETag === undefined ? {} : { remoteETag }),
+        baselinePath: path,
+      };
+    }),
     deletionLedgerEntries: (input.ledger ?? []) as readonly DeletionLedgerEntryV1[],
     getBaseContent: vi.fn(async (path: string) => baselines[path]?.content),
     baselineFactsForPath: vi.fn((path: string) => {
@@ -304,7 +324,7 @@ describe("RecoveryIndexV1.listRecoveryEntries (path)", () => {
         at: VERSION_1_AT,
         size: 1024,
         availability: "available",
-        handle: { kind: "cloud-version", versionId: "1.0" },
+        handle: { kind: "cloud-version", versionId: "1.0", remoteId: "note-item-id" },
       },
       {
         source: "deleted-record",
@@ -323,7 +343,7 @@ describe("RecoveryIndexV1.listRecoveryEntries (path)", () => {
         at: BASELINE_AT,
         size: 2048,
         availability: "available",
-        handle: { kind: "sync-baseline", hash: NOTE_HASH },
+        handle: { kind: "sync-baseline", hash: NOTE_HASH, baselinePath: NOTE_PATH },
       },
     ]);
     expect(cloud.listDriveItemVersionsById).toHaveBeenCalledWith("note-item-id");
@@ -444,6 +464,7 @@ describe("RecoveryIndexV1 cloud version current-row exclusion", () => {
       handle: {
         kind: "cloud-version",
         versionId: "1.0",
+        remoteId: "item-id",
         downloadUrl: "https://cdn/1.0",
       },
     }]);
@@ -479,6 +500,153 @@ describe("RecoveryIndexV1 cloud version current-row exclusion", () => {
     const entries = await index.listRecoveryEntries({ scope: { path }, now: NOW });
 
     expect(cloudRows(entries)).toEqual(["1.0"]);
+  });
+});
+
+describe("RecoveryIndexV1 改名未同步时的历史身份", () => {
+  const oldPath = "notes/old name.md";
+  const newPath = "notes/new name.md";
+  const versions: DriveItemVersion[] = [
+    {
+      id: "2.0",
+      size: 2048,
+      lastModifiedDateTime: new Date(VERSION_2_AT).toISOString(),
+    },
+    {
+      id: "1.0",
+      size: 1024,
+      lastModifiedDateTime: new Date(VERSION_1_AT).toISOString(),
+    },
+  ];
+
+  it("lists the renamed file's cloud versions and baseline under the new path", async () => {
+    // 改名后、同步提交前：新路径没有锚点，身份沿本机改名提示解析回原锚点。
+    const state = makeState({
+      identities: {
+        [newPath]: {
+          remoteId: "item-id",
+          remoteETag: `"{0B72376E-BD3F-4056-8290-B8ABC68F0B66},2"`,
+          baselinePath: oldPath,
+        },
+      },
+      baselines: {
+        [oldPath]: {
+          hash: NOTE_HASH,
+          size: 2048,
+          at: BASELINE_AT,
+          content: "# 改名前内容\n",
+        },
+      },
+    });
+    const cloud = makeCloud({ versions: { "item-id": versions } });
+    const { index } = makeIndex({ archives: {}, state, cloud });
+
+    const entries = await index.listRecoveryEntries({
+      scope: { path: newPath },
+      now: NOW,
+    });
+
+    // 云端版本挂在新路径名下；“当前版本”按原锚点的写入序号（2.0）摘除。
+    expect(entries.map((entry) => [entry.source, entry.path, entry.at])).toEqual([
+      ["cloud-version", newPath, VERSION_1_AT],
+      ["sync-baseline", newPath, BASELINE_AT],
+    ]);
+    expect(cloud.listDriveItemVersionsById).toHaveBeenCalledWith("item-id");
+    // 基线事实与内容都从原锚点路径取，展示与恢复落点仍用新路径。
+    expect(state.baselineFactsForPath).toHaveBeenCalledWith(oldPath);
+    expect(state.getBaseContent).toHaveBeenCalledWith(oldPath);
+    expect(entries[1]).toMatchObject({
+      size: 2048,
+      availability: "available",
+      handle: { kind: "sync-baseline", hash: NOTE_HASH, baselinePath: oldPath },
+    });
+  });
+
+  it("reports rename-pending instead of guessing when the identity is ambiguous", async () => {
+    const state = makeState({
+      identities: { [newPath]: "pending-rename" },
+    });
+    const cloud = makeCloud({});
+    const { index } = makeIndex({ archives: {}, state, cloud });
+
+    const entries = await index.listRecoveryEntries({
+      scope: { path: newPath },
+      now: NOW,
+    });
+
+    expect(entries).toEqual([{
+      source: "cloud-version",
+      path: newPath,
+      at: NOW,
+      availability: "unavailable",
+      reason: "rename-pending",
+    }]);
+    expect(cloud.listDriveItemVersionsById).not.toHaveBeenCalled();
+  });
+
+  it("reads the version content through the resolved object id", async () => {
+    const state = makeState({
+      identities: {
+        [newPath]: {
+          remoteId: "item-id",
+          remoteETag: `"{0B72376E-BD3F-4056-8290-B8ABC68F0B66},2"`,
+          baselinePath: oldPath,
+        },
+      },
+    });
+    const download = vi.fn(async () => utf8("旧版本内容"));
+    const cloud = makeCloud({ versions: { "item-id": versions }, download });
+    const { index } = makeIndex({ archives: {}, state, cloud });
+
+    const entries = await index.listRecoveryEntries({
+      scope: { path: newPath },
+      now: NOW,
+    });
+    const cloudRow = entries.find((entry) => entry.source === "cloud-version")!;
+
+    const content = await index.readRecoveryContent(cloudRow);
+
+    expect(content.kind).toBe("bytes");
+    expect(decode((content as { bytes: ArrayBuffer }).bytes)).toBe("旧版本内容");
+    // 新路径本身还没有锚点：取内容必须靠条目句柄里的对象 id。
+    expect(download).toHaveBeenCalledWith(expect.objectContaining({
+      driveItemId: "item-id",
+      versionId: "1.0",
+    }));
+  });
+
+  it("reads the renamed file's baseline through the original anchor path", async () => {
+    const state = makeState({
+      identities: {
+        [newPath]: {
+          remoteId: "item-id",
+          remoteETag: `"{0B72376E-BD3F-4056-8290-B8ABC68F0B66},2"`,
+          baselinePath: oldPath,
+        },
+      },
+      baselines: {
+        [oldPath]: {
+          hash: NOTE_HASH,
+          size: 2048,
+          at: BASELINE_AT,
+          content: "# 改名前内容\n",
+        },
+      },
+    });
+    const cloud = makeCloud({ versions: { "item-id": versions } });
+    const { index } = makeIndex({ archives: {}, state, cloud });
+
+    const entries = await index.listRecoveryEntries({
+      scope: { path: newPath },
+      now: NOW,
+    });
+    const baselineRow = entries.find((entry) => entry.source === "sync-baseline")!;
+
+    const content = await index.readRecoveryContent(baselineRow);
+
+    // 行显示在新路径下，内容必须从原锚点路径读：新路径的 getBaseContent 是空的。
+    expect(content).toEqual({ kind: "text", text: "# 改名前内容\n" });
+    expect(state.getBaseContent).toHaveBeenLastCalledWith(oldPath);
   });
 });
 
@@ -746,6 +914,41 @@ describe("RecoveryIndexV1 一致过滤（与当前文件一模一样的不列）
       availability: "unavailable",
       reason: "no-remote-identity",
     }]);
+  });
+
+  it("drops the renamed file's baseline row when the content is unchanged", async () => {
+    // 纯改名：基线仍挂在原路径的锚点上，内容与当前文件相同 ⇒ 不是历史，不占行。
+    const oldPath = "notes/old.md";
+    const newPath = "notes/renamed.md";
+    const state = makeState({
+      identities: {
+        [newPath]: {
+          remoteId: "item-id",
+          remoteETag: `"{0B72376E-BD3F-4056-8290-B8ABC68F0B66},2"`,
+          baselinePath: oldPath,
+        },
+      },
+      baselines: {
+        [oldPath]: {
+          hash: NOTE_HASH,
+          size: 10,
+          at: BASELINE_AT,
+          content: "同一份\n",
+        },
+      },
+    });
+    const { index } = makeFilterIndex({
+      files: { [newPath]: "同一份\n" },
+      state,
+    });
+
+    const entries = await index.listRecoveryEntries({
+      scope: { path: newPath },
+      now: NOW,
+    });
+
+    expect(entries.some((entry) => entry.source === "sync-baseline")).toBe(false);
+    expect(state.getBaseContent).toHaveBeenCalledWith(oldPath);
   });
 
   it("keeps the baseline and archive rows that differ from the current file", async () => {

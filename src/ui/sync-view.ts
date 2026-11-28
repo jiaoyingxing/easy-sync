@@ -1,6 +1,8 @@
 import {
   ButtonComponent,
   ItemView,
+  MarkdownRenderChild,
+  MarkdownRenderer,
   Notice,
   TFile,
   WorkspaceLeaf,
@@ -18,6 +20,7 @@ import {
   type HostPlatformFacts,
 } from "../obsidian-compat";
 import { UpdateReminderModal } from "./update-reminder-modal";
+import { releasePageUrl } from "../update-notes";
 import type EasySyncPlugin from "../main";
 import type { CommunityPluginAdoptionRow } from "../main";
 import { SyncActionType } from "../sync/types";
@@ -1969,6 +1972,9 @@ export class EasySyncSyncView extends ItemView {
   private mutationRecoveryResolutionOpening = false;
   private resolutionRowLocks = new Set<string>();
   private closed = false;
+  /** Markdown children of the inline update-notes block. Re-rendering the
+   *  block or closing the view unloads them so embeds/links stop tracking. */
+  private updateNotesRenderChildren: MarkdownRenderChild[] = [];
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -2049,6 +2055,7 @@ export class EasySyncSyncView extends ItemView {
 
   async onClose(): Promise<void> {
     this.closed = true;
+    this.clearUpdateNotesRenderChildren();
     this.stopLiveTicker();
     if (this.renderFrameId !== null) {
       compatCancelAnimationFrame(this.renderFrameId);
@@ -2454,6 +2461,9 @@ export class EasySyncSyncView extends ItemView {
     this.currentByteProgressEl = null;
     this.statusDetailMode = null;
     this.collapseToggleButtonEl = null;
+    // A full body rebuild detaches the inline update-notes DOM; unload its
+    // markdown children with it. The next update row mounts fresh ones.
+    this.clearUpdateNotesRenderChildren();
     container.empty();
     container.addClass("easy-sync-view");
 
@@ -3797,7 +3807,9 @@ export class EasySyncSyncView extends ItemView {
       case "cancel": {
         const cancelButton = new ButtonComponent(actions)
           .setButtonText(t("syncView.cancelSync"));
-        cancelButton.buttonEl.classList.add("mod-warning");
+        // Cancelling drops this round's progress, but starting again rebuilds
+        // it: tinted tier, not the destroy tier (2026-11-27).
+        applyDestructiveButton(cancelButton);
         cancelButton.onClick(() => {
           void this.plugin.cancelSync();
         });
@@ -4921,6 +4933,9 @@ export class EasySyncSyncView extends ItemView {
     actions.addClass("easy-sync-primary-actions");
     actions.dataset.easySyncPlanRow = "batch-delete";
     const paths = pendingDeletes.map((item) => item.path);
+    // Entry button: it only opens the confirmation gate. The destroy tier
+    // belongs to the confirm key inside that modal (2026-11-27), matching the
+    // batch-conflict row where both entries stay neutral.
     const confirmAllButton = applyDestructiveButton(
       new ButtonComponent(actions),
     );
@@ -4939,7 +4954,8 @@ export class EasySyncSyncView extends ItemView {
                 count: paths.length,
               }),
               warning: t("syncView.delete.confirmAllWarning"),
-              danger: true,
+              // Deleting the whole pending-delete batch removes user files.
+              danger: "destroy",
             },
           ).awaitConfirm();
           if (!confirmed) return;
@@ -5022,6 +5038,96 @@ export class EasySyncSyncView extends ItemView {
         if (choice) this.plugin.snoozeUpdateReminder(choice);
       })();
     });
+    // 更新内容：完整文稿直接挂在动作行下方（2026-11-27 用户拍板：不做弹窗、
+    // 不做预览折叠；整行折叠是唯一隐藏方式）。请求只在行实际渲染时发起，
+    // 加载完成由 main 调 refreshUpdateNotes 局部重绘本块。
+    const notes = body.createDiv("easy-sync-update-notes");
+    notes.dataset.easySyncUpdateNotes = prompt.latest;
+    this.renderUpdateNotesBlock(notes, prompt.latest);
+  }
+
+  /** One inline release-notes block for the update row. */
+  private renderUpdateNotesBlock(container: HTMLElement, latest: string): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    container.empty();
+    this.clearUpdateNotesRenderChildren();
+    container.createDiv("easy-sync-item-reason").setText(
+      t("updateCheck.notesSectionTitle"),
+    );
+    const state = this.plugin.ensureUpdateNotes(latest);
+    if (state.status === "loading") {
+      container.createDiv("easy-sync-item-reason").setText(
+        t("updateCheck.notesLoading"),
+      );
+      return;
+    }
+    if (state.status === "error") {
+      container.createDiv("easy-sync-item-reason").setText(
+        t("updateCheck.notesLoadFailed"),
+      );
+      const links = container.createDiv("easy-sync-item-actions");
+      this.createActionChip(links, t("updateCheck.notesRetry"), "", () => {
+        this.plugin.retryUpdateNotes(latest);
+      });
+      this.createActionChip(
+        links,
+        t("updateCheck.notesOpenInBrowser"),
+        "",
+        () => {
+          window.open(releasePageUrl(latest), "_blank", "noopener,noreferrer");
+        },
+      );
+      return;
+    }
+    if (state.status === "empty") {
+      container.createDiv("easy-sync-item-reason").setText(
+        t("updateCheck.notesEmpty"),
+      );
+      return;
+    }
+    for (const note of state.notes) {
+      const noteEl = container.createDiv("easy-sync-update-note");
+      noteEl.createDiv("easy-sync-item-reason").setText(note.version);
+      const bodyEl = noteEl.createDiv("markdown-rendered");
+      if (note.body.trim().length === 0) {
+        bodyEl.createEl("p", { text: t("updateCheck.notesEmptyRelease") });
+        continue;
+      }
+      const child = new MarkdownRenderChild(bodyEl);
+      child.load();
+      this.updateNotesRenderChildren.push(child);
+      void MarkdownRenderer.render(
+        this.app,
+        note.body,
+        bodyEl,
+        "",
+        child,
+      ).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Local patch for the inline notes block after the notes request settles.
+   * Does not trigger a full `render()`: the update row's own content key is
+   * unchanged, and a whole-view rebuild would reset the sidebar scroll.
+   */
+  refreshUpdateNotes(latest: string): void {
+    if (this.closed) return;
+    const containers = this.containerEl.querySelectorAll<HTMLElement>(
+      "[data-easy-sync-update-notes]",
+    );
+    for (const container of Array.from(containers)) {
+      if (container.dataset.easySyncUpdateNotes === latest) {
+        this.renderUpdateNotesBlock(container, latest);
+        return;
+      }
+    }
+  }
+
+  private clearUpdateNotesRenderChildren(): void {
+    for (const child of this.updateNotesRenderChildren.splice(0)) {
+      child.unload();
+    }
   }
 
   private renderPendingIssue(
@@ -5510,7 +5616,8 @@ export class EasySyncSyncView extends ItemView {
               : "syncView.scopeCrossing.confirmMessageFile",
             { path: snapshot.fromPath },
           ),
-          danger: true,
+          // Leaving the sync scope deletes the cloud copy.
+          danger: "destroy",
         },
       ).awaitConfirm();
       if (!confirmed) return;
@@ -5661,7 +5768,8 @@ export class EasySyncSyncView extends ItemView {
         {
           steps,
           warning: t("syncView.mutationResolution.deleteConfirmWarning"),
-          danger: true,
+          // Deletes the only surviving copy on the other side.
+          danger: "destroy",
         },
       ).awaitConfirm();
     }
@@ -5706,7 +5814,8 @@ export class EasySyncSyncView extends ItemView {
       {
         message,
         warning: t("syncView.mutationResolution.deleteConfirmWarning"),
-        danger: true,
+        // Deletes the only surviving copy on the other side.
+        danger: "destroy",
       },
     ).awaitConfirm();
   }
@@ -6840,7 +6949,8 @@ export class EasySyncSyncView extends ItemView {
                 t("syncView.conflict.batchKeepLocalStep.localOnly"),
                 t("syncView.conflict.batchKeepLocalStep.both"),
               ],
-              danger: true,
+              // Batch keep-local deletes files that exist only in the cloud.
+              danger: "destroy",
             },
           ).awaitConfirm();
           if (!confirmed) return;
@@ -6868,7 +6978,8 @@ export class EasySyncSyncView extends ItemView {
                 t("syncView.conflict.batchKeepRemoteStep.cloudOnly"),
                 t("syncView.conflict.batchKeepRemoteStep.both"),
               ],
-              danger: true,
+              // Batch keep-remote deletes files that exist only locally.
+              danger: "destroy",
             },
           ).awaitConfirm();
           if (!confirmed) return;

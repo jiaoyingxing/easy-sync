@@ -10,7 +10,9 @@
  * - 总列表（`global`）只聚合本机留档与删除记录：**不扫云端版本**（按方案定案，
  *   列表秒开、不浪费云端请求）；按路径查询才列该文件的云端版本。
  * - 云端版本要求该路径在本机有同步身份（committed 锚点的远端 id）：没有身份时
- *   不猜、不按路径去云端找，如实标不可用。
+ *   不猜、不按路径去云端找，如实标不可用。刚改名、同步尚未提交时，身份沿本机
+ *   改名提示解析回同一个云端对象（`recovery-path-identity`）；解析不唯一时
+ *   如实标 `rename-pending`，不换一个身份猜。
  * - 云端版本列表里的「当前版本」不成行（版本内容端点 400，且当前内容本就在库里）：
  *   按锚点 eTag 尾号精确摘除，锚点没有可解析 eTag 时摘第一条（列表 newest→oldest）。
  * - 时刻一律本机时钟毫秒；排序＝按 `at` 倒序，同 `at` 时来源顺序固定
@@ -27,6 +29,7 @@ import {
   listLocalArchiveEntriesV1,
   localArchiveFilePathV1,
 } from "./local-archive";
+import type { RecoveryPathIdentityV1 } from "./recovery-path-identity";
 
 export type RecoverySource =
   | "local-archive"
@@ -37,6 +40,8 @@ export type RecoverySource =
 export type RecoveryUnavailableReason =
   /** 该路径没有 committed 远端身份，云端版本面无从查起。 */
   | "no-remote-identity"
+  /** 该路径刚改过名、同步尚未提交，改名证据不足以唯一确定云端身份。 */
+  | "rename-pending"
   /** 有远端身份，但服务端一份保留版本都没有。 */
   | "no-version-history"
   /** 有身份/有历史，但内容此刻取不回来（含列表或传输失败）。 */
@@ -50,10 +55,18 @@ export type RecoveryHandleV1 =
   | {
     kind: "cloud-version";
     versionId: string;
+    /** 该版本所属的云端对象；改名未同步时查询路径本身还没有锚点，取内容靠它。 */
+    remoteId: string;
     /** 列出条目自带的即时下载链接：一次性凭据，只在本次会话里用，不持久化。 */
     downloadUrl?: string;
   }
-  | { kind: "sync-baseline"; hash: string };
+  | {
+    kind: "sync-baseline";
+    hash: string;
+    /** 持有同步基线的 committed 锚点路径。刚改名时查询路径还没有锚点，
+     *  读取内容必须回到原路径；句柄只在本次会话内使用，不持久化。 */
+    baselinePath: string;
+  };
 
 export interface RecoveryEntryV1 {
   source: RecoverySource;
@@ -86,8 +99,8 @@ export interface RecoveryIndexDepsV1 {
   /** 插件目录：留档夹 `<pluginDir>/archive/<戳>/` 落在它下面。 */
   pluginDir: string;
   state: {
-    remoteIdForPath(path: string): string | undefined;
-    remoteETagForPath(path: string): string | undefined;
+    /** 只读：查询路径 → 历史身份；刚改名时沿本机改名提示解析。 */
+    recoveryIdentityForPath(path: string): RecoveryPathIdentityV1 | undefined;
     /** Optional so older tests/state doubles without the sidecar hook still
      *  type-check; the real StateManager always exposes it. */
     ensureDeletionLedgerLoaded?(): Promise<void>;
@@ -175,7 +188,7 @@ export class RecoveryIndexV1 {
       case "cloud-version":
         return this.readCloudVersionContent(entry, handle);
       case "sync-baseline":
-        return this.readSyncBaselineContent(entry.path);
+        return this.readSyncBaselineContent(handle.baselinePath);
     }
   }
 
@@ -207,8 +220,9 @@ export class RecoveryIndexV1 {
         entries.push(deletionRecordEntryV1(record, now));
       }
     }
-    entries.push(...await this.cloudVersionEntries(path, now));
-    const baseline = await this.syncBaselineEntry(path);
+    const identity = this.deps.state.recoveryIdentityForPath(path);
+    entries.push(...await this.cloudVersionEntries(path, now, identity));
+    const baseline = await this.syncBaselineEntry(path, identity);
     if (baseline) entries.push(baseline);
     return entries;
   }
@@ -253,27 +267,29 @@ export class RecoveryIndexV1 {
   private async cloudVersionEntries(
     path: string,
     now: number,
+    identity: RecoveryPathIdentityV1 | undefined,
   ): Promise<RecoveryEntryV1[]> {
-    const remoteId = this.deps.state.remoteIdForPath(path);
-    if (!remoteId) {
+    if (!identity) {
       return [unavailableCloudVersionEntryV1(path, now, "no-remote-identity")];
+    }
+    if (identity.kind === "pending-rename") {
+      return [unavailableCloudVersionEntryV1(path, now, "rename-pending")];
     }
     let versions: DriveItemVersion[];
     try {
-      versions = await this.deps.cloud.listDriveItemVersionsById(remoteId);
+      versions = await this.deps.cloud.listDriveItemVersionsById(
+        identity.remoteId,
+      );
     } catch {
       return [unavailableCloudVersionEntryV1(path, now, "content-unavailable")];
     }
-    versions = withoutCurrentVersionV1(
-      versions,
-      this.deps.state.remoteETagForPath(path),
-    );
+    versions = withoutCurrentVersionV1(versions, identity.remoteETag);
     if (versions.length === 0) {
       return [unavailableCloudVersionEntryV1(path, now, "no-version-history")];
     }
     const entries: RecoveryEntryV1[] = [];
     for (const version of versions) {
-      const entry = cloudVersionEntryV1(version, path);
+      const entry = cloudVersionEntryV1(version, path, identity.remoteId);
       if (entry) entries.push(entry);
     }
     // 有历史但一条都排不上时间轴（缺 id／缺时刻）：如实说取不回，不假装没有历史。
@@ -282,13 +298,21 @@ export class RecoveryIndexV1 {
       : [unavailableCloudVersionEntryV1(path, now, "content-unavailable")];
   }
 
-  private async syncBaselineEntry(path: string): Promise<RecoveryEntryV1 | null> {
+  private async syncBaselineEntry(
+    path: string,
+    identity: RecoveryPathIdentityV1 | undefined,
+  ): Promise<RecoveryEntryV1 | null> {
+    // 刚改名时同步基线仍挂在原路径的锚点上；纯改名内容与当前文件相同，会被下面
+    // 的一致过滤摘掉，改名同时改了内容才会作为“改名前的内容”出现。
+    const baselinePath = identity?.kind === "resolved"
+      ? identity.baselinePath
+      : path;
     // 无基线＝该源缺席（不是"不可用"）：省略。
-    const facts = this.deps.state.baselineFactsForPath(path);
+    const facts = this.deps.state.baselineFactsForPath(baselinePath);
     if (!facts) return null;
     let content: string | undefined;
     try {
-      content = await this.deps.state.getBaseContent(path);
+      content = await this.deps.state.getBaseContent(baselinePath);
     } catch {
       content = undefined;
     }
@@ -310,7 +334,7 @@ export class RecoveryIndexV1 {
       size: facts.size,
       availability: content === undefined ? "unavailable" : "available",
       ...(content === undefined ? { reason: "content-unavailable" as const } : {}),
-      handle: { kind: "sync-baseline", hash: facts.hash },
+      handle: { kind: "sync-baseline", hash: facts.hash, baselinePath },
     };
   }
 
@@ -393,13 +417,11 @@ export class RecoveryIndexV1 {
     entry: RecoveryEntryV1,
     handle: RecoveryHandleV1 & { kind: "cloud-version" },
   ): Promise<RecoveryContentV1> {
-    const remoteId = this.deps.state.remoteIdForPath(entry.path);
-    if (!remoteId) return { kind: "unavailable", reason: "no-remote-identity" };
     try {
       return {
         kind: "bytes",
         bytes: await this.deps.cloud.downloadDriveItemVersionContent({
-          driveItemId: remoteId,
+          driveItemId: handle.remoteId,
           versionId: handle.versionId,
           downloadUrl: handle.downloadUrl,
           size: entry.size,
@@ -472,6 +494,7 @@ function withoutCurrentVersionV1(
 function cloudVersionEntryV1(
   version: DriveItemVersion,
   path: string,
+  remoteId: string,
 ): RecoveryEntryV1 | null {
   if (typeof version.id !== "string" || version.id.length === 0) return null;
   const at = typeof version.lastModifiedDateTime === "string"
@@ -491,6 +514,7 @@ function cloudVersionEntryV1(
     handle: {
       kind: "cloud-version",
       versionId: version.id,
+      remoteId,
       ...(downloadUrl === undefined ? {} : { downloadUrl }),
     },
   };

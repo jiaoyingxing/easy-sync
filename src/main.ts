@@ -19,6 +19,12 @@ import {
   type UpdateCheckStorage,
   type UpdateReminderSnooze,
 } from "./update-check";
+import {
+  fetchPendingUpdateNotes,
+  resolveUpdateNotesDisplayState,
+  type UpdateNotesDisplayState,
+  type UpdateReleaseNote,
+} from "./update-notes";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
 import {
   AuthError,
@@ -189,12 +195,7 @@ import {
   isLanDiagnosticLogEntry,
   LAN_DIAGNOSTIC_LOG_LIMIT,
 } from "./sync/diagnostic-lan-evidence";
-import {
-  resolveLanServeFile,
-  type LanServeGateDeps,
-  type LanServeRequest,
-  type LanServeResult,
-} from "./sync/lan-serve-gate";
+import type { LanServeGateDeps } from "./sync/lan-serve-gate";
 import type {
   LanAutoConnectManager as LanAutoConnectManagerType,
 } from "./sync/lan-auto-connect";
@@ -443,6 +444,10 @@ function webDavTestFailureMessage(
     reason: i18n.t(`settings.cloudTest.failed.${kind}`),
   });
 }
+
+/** Android-only body class: the host 1.15 mobile shell flattens host button
+ *  tokens (see styles.css). Desktop / iOS never get this class. */
+const EASY_SYNC_ANDROID_CLASS = "easy-sync-android";
 
 /** Plugin data keys for sync settings */
 const KEY_SYNC_INTERVAL = "sync-interval";
@@ -906,13 +911,6 @@ export default class EasySyncPlugin extends Plugin {
   /** 局域网会话阶段与实测速率（实验性）。只服务侧栏既有速度胶囊的图标与
    *  字节槽：会话在就优先显示局域网，会话结束即回到云读数。 */
   private lanTransferActivity = new LanTransferActivity();
-  /** 谁在向上面那枚胶囊上报（实验弹框 / 自动连接）。两者共用同一读数通道，
-   *  但生命周期互不隶属：弹框关闭时的 `null` 不能清掉自动连接的活会话
-   *  （S5b 交叉场景）。 */
-  private lanTransferPhaseOwner: "modal" | "auto" | null = null;
-  /** 自动连接最近一次上报的阶段；弹框把显示权让回时据此恢复。 */
-  private lanAutoTransferPhase: "pairing" | "connected" | "transferring" | null =
-    null;
 
   // M14: single serialized write queue for PluginData — prevents
   // StateManager.save() / saveSyncSettings() / auth profile writes
@@ -931,8 +929,8 @@ export default class EasySyncPlugin extends Plugin {
     readonly view: Readonly<Record<string, unknown>>;
   } | null = null;
   private pluginDataLoadPromise: Promise<Record<string, unknown> | null> | null = null;
-  /** Dev-only LAN pairing fallback when host SecretStorage is unavailable.
-   *  Never persisted; production product UI will own the real local copy. */
+  /** In-memory fallback for the LAN pairing secret when host SecretStorage is
+   *  unavailable. Used by the automatic manager; never persisted itself. */
   private lanPairingFallbackSecret: string | null = null;
   /** S5a automatic LAN manager, loaded on first switch-on and stopped on
    *  switch-off/unload. Dynamically imported: never in the startup closure. */
@@ -1311,6 +1309,9 @@ export default class EasySyncPlugin extends Plugin {
   // ---- Lifecycle ----
 
   async onload(): Promise<void> {
+    if (this.platformFacts.isAndroidApp && typeof document !== "undefined") {
+      document.body.classList.add(EASY_SYNC_ANDROID_CLASS);
+    }
     this.startupPerformance.begin(
       this.platformFacts.isMobileApp ? "mobile" : "desktop",
     );
@@ -1631,87 +1632,6 @@ export default class EasySyncPlugin extends Plugin {
         void this.activateSyncView();
       },
     });
-    // S4 experimental LAN entry: visible only while the switch is on (the
-    // checkCallback reads the live setting). The modal is still dynamically
-    // imported so WebRTC/session/signaling code stays out of the startup
-    // closure.
-    this.addCommand({
-      id: "lan-connect",
-      // Normal sync now connects automatically; this entry stays as the
-      // diagnostic and manual-fallback path (S5b) — the name says so because
-      // the host command palette has no separate description slot.
-      name: this.i18n.t("command.lanConnect"),
-      checkCallback: (checking) => {
-        if (!this.lanAccelerationEnabled) return false;
-        if (checking) return true;
-        void import("./dev/lan-session-modal")
-          .then(({ openLanSessionModal }) => {
-            openLanSessionModal(this.app, {
-              t: this.i18n.t.bind(this.i18n),
-              // S5a: the dev modal shares the one six-check implementation
-              // with the automatic manager; neither can relax it.
-              resolveServeFile: (request) => this.resolveLanServeFileForHost(request),
-              injectSource: (source) => {
-                if (this.onedrive === null) return false;
-                this.onedrive.setLanContentSource(source);
-                return true;
-              },
-              startSync: () => {
-                void this.startManualSync();
-              },
-              clearSource: () => {
-                this.onedrive?.setLanContentSource(null);
-              },
-              getOnedriveClient: () => this.onedrive,
-              getVaultName: () => this.app.vault.getName(),
-              loadLanPairingSecretRaw: async () => {
-                try {
-                  const stored = await this.loadSecret(KEY_LAN_PAIRING_SECRET);
-                  return stored ?? this.lanPairingFallbackSecret;
-                } catch {
-                  return this.lanPairingFallbackSecret;
-                }
-              },
-              saveLanPairingSecretRaw: async (value) => {
-                this.lanPairingFallbackSecret = value;
-                try {
-                  await this.saveSecret(KEY_LAN_PAIRING_SECRET, value);
-                } catch {
-                  // Dev fallback keeps the in-memory copy for this session.
-                }
-              },
-              logServeComplete: (result) => {
-                // One line per completed LAN transfer: byte count and the
-                // meta→ack duration are the only evidence a real-device run
-                // can produce for throughput without a separate probe.
-                const mibPerSecond = result.contentMs > 0
-                  ? result.bytes / 1024 / 1024 / (result.contentMs / 1000)
-                  : 0;
-                this.diag?.log("execute", "LAN serve complete", {
-                  path: result.path,
-                  bytes: result.bytes,
-                  contentMs: result.contentMs,
-                  mibPerSecond: Number(mibPerSecond.toFixed(2)),
-                });
-              },
-              // 侧栏既有速度胶囊的图标与字节槽：会话在显示局域网阶段，
-              // 结束即回云读数。不新增文案、不新增显示面。
-              setLanPhase: (phase) => {
-                this.setLanTransferPhase(phase);
-              },
-              reportLanProgress: (downloaded, total) => {
-                this.reportLanTransferProgress(downloaded, total);
-              },
-            });
-          })
-          .catch((error: unknown) => {
-            new Notice(this.i18n.t("lanSession.loadFailed", {
-              error: error instanceof Error ? error.message : String(error),
-            }));
-          });
-        return true;
-      },
-    });
     this.registerRecoveryUi();
     this.startupPerformance.markUiReady();
 
@@ -1958,6 +1878,14 @@ export default class EasySyncPlugin extends Plugin {
   private updateLastKnownLatest: string | null = null;
   private updateSnooze: UpdateReminderSnooze | null = null;
   private updateCheckTimer: number | null = null;
+  /** Inline release-notes read for the sidebar update row. One cache entry per
+   *  published latest; the request itself only starts when the row renders. */
+  private updateNotesCache: {
+    latest: string;
+    notes: readonly UpdateReleaseNote[];
+  } | null = null;
+  private updateNotesError: { latest: string } | null = null;
+  private updateNotesLoad: { latest: string } | null = null;
   /** Version written in the plugin folder's manifest.json; unlike
    *  `this.manifest.version` it advances without a reload. */
   private installedManifestVersion: string | null = null;
@@ -2056,6 +1984,71 @@ export default class EasySyncPlugin extends Plugin {
     window.open(`obsidian://show-plugin?id=${encodeURIComponent(this.manifest.id)}`);
   }
 
+  /**
+   * Inline release notes for the update row (2026-11-27). Reads once per
+   * published latest, only when the row actually renders; a cached result
+   * makes later renders immediate. A failed read is a row-local error with
+   * explicit retry / browser exits — never a Notice.
+   */
+  ensureUpdateNotes(latest: string): UpdateNotesDisplayState {
+    const state = resolveUpdateNotesDisplayState({
+      latest,
+      cache: this.updateNotesCache,
+      error: this.updateNotesError,
+    });
+    if (
+      this.updateNotesCache?.latest !== latest
+      && this.updateNotesError?.latest !== latest
+      && this.updateNotesLoad?.latest !== latest
+    ) {
+      this.startUpdateNotesLoad(latest);
+    }
+    return state;
+  }
+
+  retryUpdateNotes(latest: string): void {
+    if (this.updateNotesLoad?.latest === latest) return;
+    this.updateNotesError = null;
+    this.startUpdateNotesLoad(latest);
+    this.syncView?.refreshUpdateNotes(latest);
+  }
+
+  private startUpdateNotesLoad(latest: string): void {
+    this.updateNotesLoad = { latest };
+    void fetchPendingUpdateNotes(
+      (opts) => requestUrl(opts),
+      this.manifest.version,
+      latest,
+    )
+      .then((notes) => {
+        // The fetch can outlive the plugin (unload during flight): a stale
+        // continuation must not write bookkeeping or refresh a dead view.
+        if (this.unloaded) return;
+        if (notes === null) {
+          this.updateNotesError = { latest };
+          this.diag.log("lifecycle", "update notes unavailable", { latest });
+          return;
+        }
+        this.updateNotesCache = { latest, notes };
+        this.updateNotesError = null;
+        this.diag.log("lifecycle", "update notes loaded", {
+          latest,
+          count: notes.length,
+        });
+      })
+      .catch(() => {
+        if (!this.unloaded) this.updateNotesError = { latest };
+      })
+      .finally(() => {
+        if (this.updateNotesLoad?.latest === latest) this.updateNotesLoad = null;
+        if (this.unloaded) return;
+        // Local patch only: the update row is rebuilt by its own render path,
+        // so a notes read must not trigger a full sync-view render (which
+        // would also reset the sidebar scroll position).
+        this.syncView?.refreshUpdateNotes(latest);
+      });
+  }
+
   snoozeUpdateReminder(choice: "snooze" | "skipVersion"): void {
     const latest = this.updateLastKnownLatest;
     if (!latest) return;
@@ -2142,6 +2135,9 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   onunload(): void {
+    if (typeof document !== "undefined") {
+      document.body.classList.remove(EASY_SYNC_ANDROID_CLASS);
+    }
     this.unloaded = true;
     if (this.updateCheckTimer !== null) {
       window.clearTimeout(this.updateCheckTimer);
@@ -3101,7 +3097,11 @@ export default class EasySyncPlugin extends Plugin {
       {
         message: t("settings.reset.forceMessage"),
         warning: t("settings.reset.forceWarning"),
-        danger: true,
+        // Second gate of the same reset flow, and heavier than the first: it
+        // also terminates tracking of unresolved operations. Accept key = the
+        // dialog's only action → solid tier (2026-11-27 second pass). The
+        // extra severity lives in the copy, not in the colour.
+        danger: "destroy",
       },
     ).awaitConfirm();
   }
@@ -5828,6 +5828,13 @@ export default class EasySyncPlugin extends Plugin {
         });
         return;
       }
+      // The provider may still hold the pre-reset folder identities: reset
+      // clears the local baseline but the client caches resolved scopes for
+      // the session. Reset is the user's exit from a dead cloud scope, so drop
+      // that cache and let the next round resolve the live path again instead
+      // of reusing the old root (2026-11-26 field: cloud vault rebuilt, reset
+      // appeared ineffective because the old filesRootId kept coming back).
+      this.onedrive?.invalidateVaultScope(this.app.vault.getName());
       // V2 participation is part of the discarded local baseline. Keep the
       // user's current sync settings, then let the next V2 join rebuild a new
       // participation projection from those settings and current file facts.
@@ -8771,7 +8778,7 @@ export default class EasySyncPlugin extends Plugin {
           createTransport: () => {
             const active = this.onedrive;
             if (active === null) throw new Error("LAN client is not ready");
-            // Same OneDrive-backed control-file adapter the dev modal uses.
+            // The same OneDrive-backed control-file adapter used for signaling.
             return createOneDriveLanSignalTransport(
               active,
               this.app.vault.getName(),
@@ -8799,9 +8806,7 @@ export default class EasySyncPlugin extends Plugin {
             });
           },
           savePairing: (raw) => this.saveLanPairingSecret(raw),
-          // The sidebar chip is display-only and shared with the dev modal.
-          // `applyLanTransferPhase` keeps the two owners from clearing each
-          // other's live session when one of them closes.
+          // The sidebar chip is display-only; this manager is its only writer.
           reportPhase: (phase) => this.setLanAutoTransferPhase(phase),
           reportProgress: (downloaded, total) => {
             this.reportLanAutoTransferProgress(downloaded, total);
@@ -8828,7 +8833,7 @@ export default class EasySyncPlugin extends Plugin {
     this.lanAutoConnectLoad = load;
   }
 
-  /** Shared six-check sender gate deps for both LAN callers. */
+  /** Six-check sender gate deps for the automatic LAN manager. */
   private lanServeGateDeps(): LanServeGateDeps {
     return {
       isReady: () => this.state !== null && this.scanner !== null,
@@ -8852,13 +8857,6 @@ export default class EasySyncPlugin extends Plugin {
       readLocalBytes: (path) => this.app.vault.adapter.readBinary(path),
       hashBytes: (bytes) => sha256Hex(bytes),
     };
-  }
-
-  /** Dev modal + automatic manager share this exact entry. */
-  private async resolveLanServeFileForHost(
-    request: LanServeRequest,
-  ): Promise<LanServeResult | { error: string }> {
-    return resolveLanServeFile(this.lanServeGateDeps(), request);
   }
 
   private async saveLanPairingSecret(raw: string): Promise<void> {
@@ -10633,93 +10631,23 @@ export default class EasySyncPlugin extends Plugin {
     return this.lanTransferActivity.getIndicator();
   }
 
-  /** 会话阶段由实验弹框在生命周期节点上报；`null` 表示会话结束。 */
-  setLanTransferPhase(phase: Parameters<
-    LanTransferActivity["setPhase"]
-  >[0]): void {
-    this.applyLanTransferPhase("modal", phase);
-  }
-
-  /** 传输字节进度（发送端上线字节／接收端已收字节）。只在会话进行时上报。 */
-  reportLanTransferProgress(downloaded: number, total: number): void {
-    // Byte progress only means something for the session that owns the chip.
-    if (this.lanTransferPhaseOwner !== "modal") return;
-    if (this.lanTransferActivity.reportProgress(downloaded, total)) {
-      // The modal reports only pairing/connected; the first byte flips the
-      // activity to `transferring` internally, so the demand ticker must be
-      // armed on that edge (and stopped when the payload settles).
-      this.syncView?.refreshTransferIndicator();
-    }
-  }
-
-  /** 自动连接管理器上报阶段；同一枚胶囊，生命周期与弹框并列。 */
+  /** 自动连接管理器上报会话阶段；`null` 表示会话结束。 */
   setLanAutoTransferPhase(phase: Parameters<
     LanTransferActivity["setPhase"]
   >[0]): void {
-    this.applyLanTransferPhase("auto", phase);
+    this.lanTransferActivity.setPhase(phase);
+    // Phase changes are rare; the sidebar's live ticker is demand-driven, so
+    // each write also refreshes the chip immediately and arms the ticker.
+    this.syncView?.refreshTransferIndicator();
   }
 
-  /** 自动连接管理器上报字节进度。 */
+  /** 自动连接管理器上报字节进度（发送端上线字节／接收端已收字节）。 */
   reportLanAutoTransferProgress(downloaded: number, total: number): void {
-    if (this.lanTransferPhaseOwner !== "auto") return;
+    // The first byte flips the activity to `transferring`; the demand ticker
+    // must be armed on that edge and stopped when the payload settles.
     if (this.lanTransferActivity.reportProgress(downloaded, total)) {
       this.syncView?.refreshTransferIndicator();
     }
-  }
-
-  /**
-   * 局域网胶囊的唯一写入点。
-   *
-   * 两个来源（实验弹框、自动连接）是并列的会话，不是主从关系，但共用一枚
-   * 胶囊就必须有归属规则：
-   *  - 弹框是用户显式打开的诊断窗口，打开期间持有显示权；自动连接的后报只
-   *    更新「弹框关闭后的回退值」，不得抢走图标；
-   *  - 弹框关闭时的 `null` 不得清掉自动连接仍活的会话——显示权交还给自动
-   *    连接最近一次阶段，只有它也为空时才真正熄灭；
-   *  - 任一方报告 `null` 只作用于自己持有的显示权，另一方的会话不受影响。
-   */
-  private applyLanTransferPhase(
-    owner: "modal" | "auto",
-    phase: Parameters<LanTransferActivity["setPhase"]>[0],
-  ): void {
-    if (owner === "auto") {
-      this.lanAutoTransferPhase = phase;
-      if (phase === null) {
-        if (this.lanTransferPhaseOwner !== "auto") return;
-        this.lanTransferPhaseOwner = null;
-        this.applyLanActivityPhase(null);
-        return;
-      }
-      // The open dialog outranks the background session on the shared chip.
-      if (this.lanTransferPhaseOwner === "modal") return;
-      this.lanTransferPhaseOwner = "auto";
-      this.applyLanActivityPhase(phase);
-      return;
-    }
-    if (phase === null) {
-      if (this.lanTransferPhaseOwner !== "modal") return;
-      this.lanTransferPhaseOwner = null;
-      const fallback = this.lanAutoTransferPhase;
-      if (fallback === null) {
-        this.applyLanActivityPhase(null);
-        return;
-      }
-      this.lanTransferPhaseOwner = "auto";
-      this.applyLanActivityPhase(fallback);
-      return;
-    }
-    this.lanTransferPhaseOwner = "modal";
-    this.applyLanActivityPhase(phase);
-  }
-
-  /** Phase changes are rare; the sidebar's live ticker is demand-driven now,
-   *  so each write also refreshes the chip immediately and arms the ticker.
-   *  Per-chunk byte progress keeps riding the ticker that the phase opened. */
-  private applyLanActivityPhase(
-    phase: Parameters<LanTransferActivity["setPhase"]>[0],
-  ): void {
-    this.lanTransferActivity.setPhase(phase);
-    this.syncView?.refreshTransferIndicator();
   }
 
   /**
@@ -12213,6 +12141,7 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("");
     lines.push(`**生成时间**: ${fmt(now.getTime())}`);
     lines.push(`**插件版本**: ${this.manifest.version}`);
+    lines.push(`**Obsidian 版本**: ${apiVersion}`);
     lines.push(`**仓库名**: ${this.app.vault.getName()}`);
     // 昵称为空白／不可见时回退账号名（邮箱/UPN），两者都没有才按「已登录」兜底。
     lines.push(`**登录账号**: ${auth?.isLoggedIn ? resolveAccountDisplayName(auth.displayName, auth.accountName, "已登录") : "未登录"}`);
@@ -13027,11 +12956,17 @@ export default class EasySyncPlugin extends Plugin {
    * 移动端常驻状态图标开关的应用入口（方案单 20261012-225046）：移动端宿主
    * DOM 里存在一个官方隐藏的 `.status-bar` 元素，桌面状态项就在其中
    * （20261012-215203 实测强显可行）。本方法只决定「现役状态项在移动端是否
-   * 可见」，不新建任何 UI；桌面端不进本路径（显示隔离，桌面状态栏体系与
-   * 设置项不受影响）。
+   * 可见」，不新建任何 UI。
+   *
+   * 判据是 UI 形态（`isMobile`）而不是设备语义（`isMobileApp`，2026-11-27
+   * 回改 ddcb6fdf 的扫改）：宿主用 `.is-mobile .status-bar { display: none }`
+   * 隐藏状态栏，该规则同样作用于桌面 `app.emulateMobile()` 形态；此时桌面
+   * 状态栏已被宿主藏起，不补显就没有任何常驻状态出口（用户 2026-11-27 现场：
+   * 桌面模拟平板形态右下角空）。真机与桌面模拟因此同判据、同观感。桌面常规
+   * UI（`isMobile=false`）仍不碰状态栏与设置项，显示隔离不变。
    */
   applyMobileStatusBar(): void {
-    if (!this.platformFacts.isMobileApp) return;
+    if (!this.platformFacts.isMobile) return;
     if (this.mobileStatusBar) {
       this.enableMobileStatusBar();
     } else {
@@ -13152,7 +13087,13 @@ export default class EasySyncPlugin extends Plugin {
     );
     if (!statusBar) return;
     const navbar = document.querySelector<HTMLElement>(".mobile-navbar");
-    if (!navbar) {
+    // 平板形态的宿主仍保留 `.mobile-navbar` 元素，只用 `body.is-tablet
+    // .mobile-navbar { display: none }` 藏起来；按存在性判断会让图标悬空
+    // 52px（2026-11-27 实测：DOM 在、computed height 仍报 52px）。按计算
+    // 样式判可见，平板与无导航栏形态同一条路径。
+    const navbarHidden = !navbar
+      || window.getComputedStyle(navbar).display === "none";
+    if (navbarHidden) {
       // 平板等无导航栏形态：不预留底部占位（导航栏出现时由 Observer 重算）。
       statusBar.style.removeProperty("margin-bottom");
       return;

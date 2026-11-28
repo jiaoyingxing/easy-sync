@@ -198,7 +198,7 @@ describe("buildSettingDefinitions", () => {
       t("settings.localOnlyIgnored.name"),
       t("settings.reset.name"),
       // 实验性组放在「高级」之后，不新增顶层页；只放设置项，运行诊断
-      // 归诊断报告与 lan-connect 弹框（2026-11-23 移除设置页诊断行）。
+      // 归诊断报告（2026-11-23 移除设置页诊断行）。
       // WebDAV 入口暂放这里（2026-11-24 用户拍板，达到主流可用前不占登录页）。
       t("settings.experimental.heading"),
       t("settings.webdav.connection.name"),
@@ -210,6 +210,36 @@ describe("buildSettingDefinitions", () => {
       .toContain(t("settings.syncContent.heading"));
     expect(labels(pageItems(t("settings.group.display"))))
       .not.toContain(t("settings.group.display"));
+  });
+
+  it("shows the mobile status icon row by UI mode, including desktop emulateMobile", () => {
+    const plugin = createMockPlugin();
+    const i18n = new I18n("zh-cn");
+    const t = i18n.t.bind(i18n);
+    const facts = (isMobile: boolean) => ({
+      isDesktopApp: !isMobile,
+      isMobileApp: false,
+      isIosApp: false,
+      isAndroidApp: false,
+      isDesktop: !isMobile,
+      isMobile,
+    });
+    const rowVisible = (isMobile: boolean): boolean | undefined => {
+      const defs = buildSettingDefinitions(t, plugin, undefined, undefined, facts(isMobile));
+      const displayPage = defs.find(
+        (def) => (def as { name?: string }).name === t("settings.group.display"),
+      ) as { items?: Array<{ name?: string; visible?: () => boolean }> } | undefined;
+      return displayPage?.items?.find(
+        (item) => item.name === t("settings.mobileStatusBar.name"),
+      )?.visible?.();
+    };
+
+    // 桌面常规 UI：不渲染该行（桌面状态栏体系不受影响）。
+    expect(rowVisible(false)).toBe(false);
+    // 桌面 app.emulateMobile()（isMobile=true、isMobileApp=false）：与真机一致
+    // 显示——宿主此时已用 `.is-mobile .status-bar` 藏起桌面状态栏，
+    // 这一行是该形态下唯一的常驻图标出口（2026-11-27 回归）。
+    expect(rowVisible(true)).toBe(true);
   });
 
   it("renders every definition without throwing", () => {
@@ -921,7 +951,10 @@ describe("declarative reset button", () => {
     return items.find((i) => i.name === i18n.t("settings.reset.name"));
   }
 
-  it("applies the destructive mod-warning style to the reset button", () => {
+  // 重置只清本机记录的同步状态、不碰任何文件，所以和「退出登录／停用」同档：
+  // 走共享 helper 的 tinted 破坏性样式，不裸写 mod-warning（裸类在手机端被宿主
+  // 降级成中性底、桌面端却是实心红，跨平台自相矛盾）。
+  it("applies the shared destructive helper (not a bare class) to the reset button", () => {
     const plugin = createMockPlugin();
     const i18n = new I18n("zh-cn");
     const defs = buildSettingDefinitions(i18n.t.bind(i18n), plugin);
@@ -930,21 +963,25 @@ describe("declarative reset button", () => {
 
     const setting = new Setting({} as HTMLElement) as never;
     const addClass = vi.fn();
+    const setDestructive = vi.fn();
     const btn = new ButtonComponent({} as HTMLElement) as unknown as {
       buttonEl: { classList: { add: (c: string) => void } };
       setButtonText: (t: string) => unknown;
       onClick: (cb: () => void | Promise<void>) => unknown;
+      setDestructive: () => unknown;
     };
     (btn as unknown as { buttonEl: unknown }).buttonEl = { classList: { add: addClass } };
     let clickHandler: (() => void | Promise<void>) | null = null;
     btn.setButtonText = (() => btn) as never;
     btn.onClick = ((cb: () => void | Promise<void>) => { clickHandler = cb; return btn; }) as never;
+    btn.setDestructive = (() => { setDestructive(); return btn; }) as never;
     vi.spyOn(setting as never, "addButton").mockImplementation(
       (cb: (b: unknown) => void) => { cb(btn); return setting; },
     );
     resetItem!.render!(setting);
 
-    expect(addClass).toHaveBeenCalledWith("mod-warning");
+    expect(setDestructive).toHaveBeenCalledTimes(1);
+    expect(addClass).not.toHaveBeenCalledWith("mod-warning");
   });
 
   it("calls resetSyncState only after the confirm modal is accepted", async () => {
@@ -1174,8 +1211,10 @@ describe("declarative completeness", () => {
       };
     let clickHandler: (() => void) | null = null;
     let buttonText = "";
+    let addButtonCalls = 0;
     vi.spyOn(withUpdate as never, "addButton").mockImplementation(
       (cb: (b: unknown) => void) => {
+        addButtonCalls += 1;
         const btn = {
           setButtonText: (label: string) => {
             buttonText = label;
@@ -1194,6 +1233,8 @@ describe("declarative completeness", () => {
     // 定稿文案（2026-10-02 用户拍板）：存在句，不与版本标签混淆。
     expect(chip.textContent).toBe("有新版本");
     expect(chip.textContent).toBe(i18n.t("updateCheck.chip"));
+    // 2026-11-27 收敛：更新内容只在侧栏内联展示，设置页不回流第二个入口。
+    expect(addButtonCalls).toBe(1);
     expect(buttonText).toBe(i18n.t("settings.about.updateNow"));
     clickHandler!();
     expect(plugin.openUpdatePage).toHaveBeenCalledTimes(1);

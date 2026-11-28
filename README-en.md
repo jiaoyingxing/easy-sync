@@ -117,7 +117,7 @@ The `files` directory contains the vault files included in sync, and you can bro
 
 ### 2.2 How data is transferred
 
-Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files. The plugin checks for new releases through GitHub raw files (`raw.githubusercontent.com`) first and a public CDN (jsDelivr) as fallback — it reads the latest version number only and uploads nothing; if both fail, it silently retries after one hour.
+Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files. The plugin checks for new releases through GitHub raw files (`raw.githubusercontent.com`) first and a public CDN (jsDelivr) as fallback — it reads the latest version number only. When the sidebar shows an update prompt, it reads that version’s public release notes from GitHub Releases (`api.github.com`). Neither request uploads anything; if both version-check sources fail, it silently retries after one hour.
 
 The current Microsoft permissions are:
 

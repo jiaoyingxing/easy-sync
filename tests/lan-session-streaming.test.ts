@@ -8,7 +8,7 @@ import {
   createLanContentSource,
   type LanPartitionSink,
   type LanPathResult,
-} from "../src/dev/lan-session";
+} from "../src/sync/lan-peer-session";
 import type { LanContentHint } from "../src/sync/lan-content-source";
 
 const MIB = 1024 * 1024;

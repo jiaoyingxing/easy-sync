@@ -538,9 +538,9 @@ describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
       "keep-local",
       "keep-remote",
     ]);
-    expect(actions?.map((action) => action.className)).toEqual([
-      "mod-warning",
-      "mod-cta",
+    expect(actions?.map((action) => action.variant)).toEqual([
+      "destructive-primary",
+      "cta",
     ]);
   });
 
@@ -556,9 +556,9 @@ describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
       "keep-remote",
       "keep-local",
     ]);
-    expect(actions?.map((action) => action.className)).toEqual([
-      "mod-warning",
-      "mod-cta",
+    expect(actions?.map((action) => action.variant)).toEqual([
+      "destructive-primary",
+      "cta",
     ]);
   });
 
@@ -571,7 +571,7 @@ describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
       "syncView.mutationResolution.keepLocal",
       "syncView.mutationResolution.keepRemote",
     ]);
-    expect(actions?.every((action) => action.className === null)).toBe(true);
+    expect(actions?.every((action) => action.variant === null)).toBe(true);
   });
 
   it("uses the version wording when the two copies diverged", () => {
@@ -584,7 +584,7 @@ describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
       "syncView.mutationResolution.keepLocalVersion",
       "syncView.mutationResolution.keepRemoteVersion",
     ]);
-    expect(actions?.every((action) => action.className === null)).toBe(true);
+    expect(actions?.every((action) => action.variant === null)).toBe(true);
   });
 
   it("offers a version choice when the move converged on one path with diverged content", () => {
@@ -604,7 +604,7 @@ describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
       "keep-local",
       "keep-remote",
     ]);
-    expect(actions?.every((action) => action.className === null)).toBe(true);
+    expect(actions?.every((action) => action.variant === null)).toBe(true);
   });
 
   it("drops an unavailable direction instead of rendering it", () => {
@@ -695,9 +695,9 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
       "keep-local",
       "keep-remote",
     ]);
-    expect(actions?.map((action) => action.className)).toEqual([
-      "mod-warning",
-      "mod-cta",
+    expect(actions?.map((action) => action.variant)).toEqual([
+      "destructive-primary",
+      "cta",
     ]);
   });
 
@@ -714,9 +714,9 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
       "keep-remote",
       "keep-local",
     ]);
-    expect(actions?.map((action) => action.className)).toEqual([
-      "mod-warning",
-      "mod-cta",
+    expect(actions?.map((action) => action.variant)).toEqual([
+      "destructive-primary",
+      "cta",
     ]);
   });
 
@@ -731,7 +731,7 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     ]);
     // Both directions overwrite a recoverable version: no danger colour, no
     // restored-file CTA.
-    expect(actions?.every((action) => action.className === null)).toBe(true);
+    expect(actions?.every((action) => action.variant === null)).toBe(true);
   });
 
   it("leaves whole-bundle reviews on their own wording", () => {

@@ -125,6 +125,119 @@ import {
   commitOneFileRevision,
 } from "./helpers/state-v2-activation-harness";
 
+async function prepareNewParentTopologyHarness(
+  content = "same-name moved subtree",
+) {
+  const bytes = new TextEncoder().encode(content);
+  const hash = await sha256Hex(bytes);
+  const localEntries = [
+    {
+      ...localA,
+      path: "Alpha/note.md",
+      hash,
+      size: bytes.byteLength,
+    },
+    {
+      ...localA,
+      path: "Beta/note.md",
+      hash,
+      size: bytes.byteLength,
+    },
+  ];
+  const baseEntries = [
+    {
+      ...baseA,
+      path: "Alpha/note.md",
+      hash,
+      size: bytes.byteLength,
+      eTag: "etag-alpha-note",
+    },
+    {
+      ...baseA,
+      path: "Beta/note.md",
+      hash,
+      size: bytes.byteLength,
+      eTag: "etag-beta-note",
+    },
+  ];
+  const remote = [
+    {
+      id: "folder-alpha",
+      name: "Alpha",
+      folder: { childCount: 1 },
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-folder-alpha",
+      cTag: "ctag-folder-alpha",
+    },
+    {
+      id: "folder-beta",
+      name: "Beta",
+      folder: { childCount: 1 },
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-folder-beta",
+      cTag: "ctag-folder-beta",
+    },
+    {
+      id: "file-alpha",
+      name: "note.md",
+      size: bytes.byteLength,
+      file: { hashes: { sha256Hash: hash } },
+      parentReference: { id: "folder-alpha" },
+      eTag: "etag-alpha-note",
+      cTag: "ctag-alpha-note",
+    },
+    {
+      id: "file-beta",
+      name: "note.md",
+      size: bytes.byteLength,
+      file: { hashes: { sha256Hash: hash } },
+      parentReference: { id: "folder-beta" },
+      eTag: "etag-beta-note",
+      cTag: "ctag-beta-note",
+    },
+  ];
+  const harness = makeHarness({
+    base: baseEntries,
+    local: localEntries,
+    localFolders: [{ path: "Alpha" }, { path: "Beta" }],
+    remoteItems: remote,
+    initialFiles: {
+      "Alpha/note.md": content,
+      "Beta/note.md": content,
+    },
+  });
+  await harness.state.load();
+  expect((await harness.executor.run(
+    "manual",
+    {},
+    false,
+    undefined,
+    { activateV2State: true },
+  )).success).toBe(true);
+
+  harness.localFolderPaths.delete("Alpha");
+  harness.localFolderPaths.delete("Beta");
+  harness.localFolderPaths.add("00_系统");
+  harness.localFolderPaths.add("00_系统/Alpha");
+  harness.localFolderPaths.add("00_系统/Beta");
+  for (const entry of harness.localEntryState) {
+    entry.path = entry.path.replace(/^(Alpha|Beta)\//, "00_系统/$1/");
+  }
+  harness.files.delete("Alpha/note.md");
+  harness.files.delete("Beta/note.md");
+  harness.files.set("00_系统/Alpha/note.md", content);
+  harness.files.set("00_系统/Beta/note.md", content);
+  expect(await harness.state.recordLocalFolderMoveHint(
+    "Alpha",
+    "00_系统/Alpha",
+  )).toBe(true);
+  expect(await harness.state.recordLocalFolderMoveHint(
+    "Beta",
+    "00_系统/Beta",
+  )).toBe(true);
+  return { harness, content, bytes, hash };
+}
+
 describe("V1 to V2 controlled production activation", () => {
   it("rebinds an unchanged same-path replacement once and the next V2 round stays zero", async () => {
     const harness = makeHarness();
@@ -2445,6 +2558,274 @@ describe("V1 to V2 controlled production activation", () => {
       conflicts: 0,
       errors: 0,
     });
+  });
+
+  it("creates a new parent and moves two same-name folders in one visible run", async () => {
+    const content = "same-name moved subtree";
+    const bytes = new TextEncoder().encode(content);
+    const hash = await sha256Hex(bytes);
+    const localEntries = [
+      {
+        ...localA,
+        path: "Alpha/note.md",
+        hash,
+        size: bytes.byteLength,
+      },
+      {
+        ...localA,
+        path: "Beta/note.md",
+        hash,
+        size: bytes.byteLength,
+      },
+    ];
+    const baseEntries = [
+      {
+        ...baseA,
+        path: "Alpha/note.md",
+        hash,
+        size: bytes.byteLength,
+        eTag: "etag-alpha-note",
+      },
+      {
+        ...baseA,
+        path: "Beta/note.md",
+        hash,
+        size: bytes.byteLength,
+        eTag: "etag-beta-note",
+      },
+    ];
+    const remote = [
+      {
+        id: "folder-alpha",
+        name: "Alpha",
+        folder: { childCount: 1 },
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-folder-alpha",
+        cTag: "ctag-folder-alpha",
+      },
+      {
+        id: "folder-beta",
+        name: "Beta",
+        folder: { childCount: 1 },
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-folder-beta",
+        cTag: "ctag-folder-beta",
+      },
+      {
+        id: "file-alpha",
+        name: "note.md",
+        size: bytes.byteLength,
+        file: { hashes: { sha256Hash: hash } },
+        parentReference: { id: "folder-alpha" },
+        eTag: "etag-alpha-note",
+        cTag: "ctag-alpha-note",
+      },
+      {
+        id: "file-beta",
+        name: "note.md",
+        size: bytes.byteLength,
+        file: { hashes: { sha256Hash: hash } },
+        parentReference: { id: "folder-beta" },
+        eTag: "etag-beta-note",
+        cTag: "ctag-beta-note",
+      },
+    ];
+    const harness = makeHarness({
+      base: baseEntries,
+      local: localEntries,
+      localFolders: [{ path: "Alpha" }, { path: "Beta" }],
+      remoteItems: remote,
+      initialFiles: {
+        "Alpha/note.md": content,
+        "Beta/note.md": content,
+      },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    harness.localFolderPaths.delete("Alpha");
+    harness.localFolderPaths.delete("Beta");
+    harness.localFolderPaths.add("00_系统");
+    harness.localFolderPaths.add("00_系统/Alpha");
+    harness.localFolderPaths.add("00_系统/Beta");
+    for (const entry of harness.localEntryState) {
+      entry.path = entry.path.replace(/^(Alpha|Beta)\//, "00_系统/$1/");
+    }
+    harness.files.delete("Alpha/note.md");
+    harness.files.delete("Beta/note.md");
+    harness.files.set("00_系统/Alpha/note.md", content);
+    harness.files.set("00_系统/Beta/note.md", content);
+    expect(await harness.state.recordLocalFolderMoveHint(
+      "Alpha",
+      "00_系统/Alpha",
+    )).toBe(true);
+    expect(await harness.state.recordLocalFolderMoveHint(
+      "Beta",
+      "00_系统/Beta",
+    )).toBe(true);
+
+    const moved = await harness.executor.run("manual");
+    expect(moved).toMatchObject({
+      success: true,
+      foldersCreated: 1,
+      foldersMoved: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.localFolderPaths.has("00_系统")).toBe(true);
+    expect(harness.localFolderPaths.has("00_系统/Alpha")).toBe(true);
+    expect(harness.localFolderPaths.has("00_系统/Beta")).toBe(true);
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "00_系统/Alpha/note.md",
+    )).toBeTruthy();
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "00_系统/Beta/note.md",
+    )).toBeTruthy();
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersCreated: 0,
+      foldersMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+  });
+
+  it("uploads a local edit after moving a new parent's folders in the same run", async () => {
+    const { harness, content } = await prepareNewParentTopologyHarness();
+    const edited = `${content} local edit`;
+    const editedBytes = new TextEncoder().encode(edited);
+    const editedHash = await sha256Hex(editedBytes);
+    const entry = harness.localEntryState.find(
+      (candidate) => candidate.path === "00_系统/Alpha/note.md",
+    )!;
+    entry.hash = editedHash;
+    entry.size = editedBytes.byteLength;
+    entry.mtime++;
+    harness.files.set("00_系统/Alpha/note.md", edited);
+    harness.mutations.uploadFile.mockImplementationOnce(async () =>
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "00_系统/Alpha/note.md",
+        editedBytes.byteLength,
+        editedHash,
+        "etag-upload-after-new-parent",
+      ));
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      foldersCreated: 1,
+      foldersMoved: 2,
+      uploaded: 1,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "00_系统/Alpha/note.md",
+    )?.file?.hashes).toMatchObject({ sha256Hash: editedHash });
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "00_系统/Beta/note.md",
+    )).toBeTruthy();
+  });
+
+  it("deletes a removed descendant after moving a new parent's folders", async () => {
+    const { harness } = await prepareNewParentTopologyHarness();
+    const index = harness.localEntryState.findIndex(
+      (candidate) => candidate.path === "00_系统/Beta/note.md",
+    );
+    expect(index).toBeGreaterThanOrEqual(0);
+    harness.localEntryState.splice(index, 1);
+    harness.files.delete("00_系统/Beta/note.md");
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      foldersCreated: 1,
+      foldersMoved: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 1,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "00_系统/Beta/note.md",
+    )).toBeFalsy();
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "00_系统/Alpha/note.md",
+    )).toBeTruthy();
+  });
+
+  it("keeps both sides after a remote edit during a new parent's folder move", async () => {
+    const { harness, content } = await prepareNewParentTopologyHarness();
+    const localEdited = `${content} local edit`;
+    const localBytes = new TextEncoder().encode(localEdited);
+    const localHash = await sha256Hex(localBytes);
+    const entry = harness.localEntryState.find(
+      (candidate) => candidate.path === "00_系统/Alpha/note.md",
+    )!;
+    entry.hash = localHash;
+    entry.size = localBytes.byteLength;
+    entry.mtime++;
+    harness.files.set("00_系统/Alpha/note.md", localEdited);
+    const remoteEdited = `${content} remote edit`;
+    const remoteBytes = new TextEncoder().encode(remoteEdited);
+    const remoteHash = await sha256Hex(remoteBytes);
+    const moveRemoteFolder = vi.mocked(
+      harness.mutations.moveItemById,
+    ).getMockImplementation()!;
+    harness.mutations.moveItemById.mockImplementationOnce(async (...args) => {
+      const moved = await moveRemoteFolder(...args);
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "00_系统/Alpha/note.md",
+        remoteBytes.byteLength,
+        remoteHash,
+        "etag-remote-edit-after-new-parent-move",
+      );
+      return moved;
+    });
+
+    const result = await harness.executor.run("manual");
+    expect(result).toMatchObject({
+      success: true,
+      foldersCreated: 1,
+      foldersMoved: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.state.pendingConflicts).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path: "00_系统/Alpha/note.md",
+      }),
+    ]);
+    expect(harness.files.get("00_系统/Alpha/note.md")).toBe(localEdited);
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
   });
 
   it.each([

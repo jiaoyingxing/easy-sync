@@ -555,20 +555,52 @@ describe("download group verify/commit pipeline (2026-11-08)", () => {
       progressStore,
     });
 
-    const runPromise = fixture.executor.run("manual", {});
+    const runPromise = fixture.executor.run("manual", {
+      onFileComplete: (path, actionType, success, reason, fileSize) => {
+        progressStore.completeCurrentItem();
+        progressStore.addCompletedFile({
+          path,
+          status: success
+            ? SyncProgressStore.actionToStatus(actionType)
+            : "error",
+          actionType,
+          reason,
+          fileSize,
+          ...(success ? {} : { failedAt: Date.now() }),
+        });
+      },
+    });
     await within(secondTransferStarted.promise, "second transfer starts");
 
     // One file is downloaded, the second is still in flight, and nothing has
-    // settled: the visible counter is already 1/8.
+    // settled: the visible counter is already 1/8, and the completed list
+    // already carries that file's row (same beat as the counter) instead of
+    // waiting for the group commit.
     expect(progressStore.state.current).toBe(0);
     expect(progressStore.state.processedCurrent).toBe(1);
     expect(resolveRoundProgressCurrent(progressStore.state)).toBe(1);
     expect(progressStore.state.phaseMetric).toBeUndefined();
+    expect(progressStore.state.completedFiles.map((file) => file.path)).toEqual([
+      entries[0].path,
+    ]);
+    expect(progressStore.state.completedFiles[0]).toMatchObject({
+      status: "download",
+      actionType: "download",
+      provisional: true,
+    });
+    expect(progressStore.state.completedCount).toBe(1);
 
     releaseSecondTransfer.resolve();
     const result = await within(runPromise, "round finishes");
     expect(result.downloaded).toBe(GROUP);
     expect(progressStore.state.current).toBe(GROUP);
+    // The durable completions replaced the previews in place: one row and one
+    // settled-action count per file, no presentation marker left.
+    expect(progressStore.state.completedCount).toBe(GROUP);
+    expect(progressStore.provisionalFilePaths()).toEqual([]);
+    expect(
+      progressStore.state.completedFiles.every((file) => file.provisional !== true),
+    ).toBe(true);
     // The lookahead is gone at the result; settled items own the final count.
     expect(progressStore.state.processedCurrent).toBeUndefined();
     expect(resolveRoundProgressCurrent(progressStore.state)).toBe(GROUP);
@@ -600,5 +632,49 @@ describe("download group verify/commit pipeline (2026-11-08)", () => {
     expect(state.mutationLedger).toHaveLength(GROUP);
     expect(state.mutationLedger.every((record) => record.receipt === null)).toBe(true);
     expect(state.baseSnapshot).toEqual([]);
+  });
+
+  it("flips download previews when the round cancels before their group commits", async () => {
+    // A preview is shown when the bytes land; if cancellation stops the group
+    // before its commit, the row must flip to failed instead of surviving as
+    // a success that never became durable.
+    Platform.isMobile = false;
+    const entries = makeEntries(GROUP);
+    const progressStore = new SyncProgressStore();
+    let executorRef: SyncExecutor | null = null;
+    let downloadCalls = 0;
+    const downloadFile = vi.fn(async () => {
+      downloadCalls++;
+      if (downloadCalls === 2) executorRef?.cancel();
+      return CONTENT.slice(0);
+    });
+    const fixture = makeFixture({
+      entries,
+      downloadFile,
+      getDriveItemMetadataByIds: vi.fn(async (ids: readonly string[]) =>
+        metadataReader(entries)(ids)),
+      progressStore,
+    });
+    executorRef = fixture.executor;
+    const reverted: Array<{ path: string; reason: string }> = [];
+
+    const result = await fixture.executor.run("manual", {
+      onFileReverted: (path, reason) => {
+        reverted.push({ path, reason });
+        progressStore.revertCompletedFile(path, reason);
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(reverted.length).toBeGreaterThan(0);
+    expect(reverted.every((row) => row.reason === "result.cancelled")).toBe(true);
+    expect(progressStore.provisionalFilePaths()).toEqual([]);
+    expect(progressStore.state.completedFiles.length).toBeGreaterThan(0);
+    expect(
+      progressStore.state.completedFiles.every((file) => file.status === "error"),
+    ).toBe(true);
+    expect(
+      progressStore.state.completedFiles.every((file) => file.provisional !== true),
+    ).toBe(true);
   });
 });

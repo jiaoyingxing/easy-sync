@@ -2193,6 +2193,218 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("stages V2 scope recovery when a surviving delta cursor bridges a rebuilt files root", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    await harness.executor.run("manual");
+    const activated = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      harness.state.planReviewAuthorization!,
+      { acknowledgeMigrationRisk: true },
+    );
+    expect(activated.success).toBe(true);
+    expect((await harness.executor.run("manual")).success).toBe(true);
+    expect(harness.state.remoteDeltaLink).toBeTruthy();
+
+    vi.mocked(harness.client.restoreVaultScope).mockReturnValue(true);
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: ReturnType<typeof vi.fn>;
+    }).restoreVaultScopeByIdentity = vi.fn().mockRejectedValue(
+      new OneDriveError(
+        OneDriveErrorType.NotFound,
+        "committed files root missing",
+        404,
+      ),
+    );
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    vi.mocked(harness.client.initVaultScope).mockClear();
+    const replacementItems: DriveItem[] = [
+      {
+        id: replacementScope.filesRootId,
+        name: "files",
+        folder: { childCount: 1 },
+        parentReference: { id: replacementScope.vaultFolderId },
+        eTag: "etag-root-live",
+      },
+      {
+        id: "folder-notes-live",
+        name: "Notes",
+        folder: { childCount: 1 },
+        parentReference: { id: replacementScope.filesRootId },
+        eTag: "etag-folder-notes-live",
+      },
+      {
+        id: "file-a-live",
+        name: "a.md",
+        size: localA.size,
+        file: { hashes: { sha256Hash: hashA } },
+        parentReference: { id: "folder-notes-live" },
+        eTag: "etag-a-live",
+        cTag: "ctag-a-live",
+      },
+    ];
+    harness.getDelta.mockReset();
+    harness.getDelta.mockResolvedValue({
+      value: replacementItems,
+      "@odata.deltaLink": "https://graph.example/delta-live",
+    });
+
+    const paused = await harness.executor.run("auto");
+
+    expect(paused).toEqual(expect.objectContaining({
+      success: false,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 1,
+      errors: 0,
+      message: "result.v2ScopeRecoveryPending",
+    }));
+    expect(harness.state.activeV2RemoteScopeRecovery).toMatchObject({
+      reason: "committed-scope-unreachable",
+      observedScope: {
+        accountId: scope.accountId,
+        ...replacementScope,
+      },
+    });
+    expect(harness.client.initVaultScope).toHaveBeenCalledWith(
+      "testVault",
+      { createMissing: false },
+    );
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("stages V2 scope recovery when the rebuilt files root is empty", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    await harness.executor.run("manual");
+    const activated = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      harness.state.planReviewAuthorization!,
+      { acknowledgeMigrationRisk: true },
+    );
+    expect(activated.success).toBe(true);
+    expect((await harness.executor.run("manual")).success).toBe(true);
+    expect(harness.state.remoteDeltaLink).toBeTruthy();
+
+    vi.mocked(harness.client.restoreVaultScope).mockReturnValue(true);
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: ReturnType<typeof vi.fn>;
+    }).restoreVaultScopeByIdentity = vi.fn().mockRejectedValue(
+      new OneDriveError(
+        OneDriveErrorType.NotFound,
+        "committed files root missing",
+        404,
+      ),
+    );
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    vi.mocked(harness.client.initVaultScope).mockClear();
+    // 新 files 文件夹里什么都没有：唯一可辨别的新身份就是它自己。空投影不能
+    // 按旧根提交（否则本地文件会被规划成“远端已删除”），仍须进入 scope 恢复。
+    harness.getDelta.mockReset();
+    harness.getDelta.mockResolvedValue({
+      value: [{
+        id: replacementScope.filesRootId,
+        name: "files",
+        folder: { childCount: 0 },
+        parentReference: { id: replacementScope.vaultFolderId },
+        eTag: "etag-root-live",
+      }],
+      "@odata.deltaLink": "https://graph.example/delta-live-empty",
+    });
+
+    const paused = await harness.executor.run("auto");
+
+    expect(paused).toEqual(expect.objectContaining({
+      success: false,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 1,
+      errors: 0,
+      message: "result.v2ScopeRecoveryPending",
+    }));
+    expect(harness.state.activeV2RemoteScopeRecovery).toMatchObject({
+      reason: "committed-scope-unreachable",
+      observedScope: {
+        accountId: scope.accountId,
+        ...replacementScope,
+      },
+    });
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("keeps the hierarchy failure when the live path still resolves to the committed scope", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    await harness.executor.run("manual");
+    const activated = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      harness.state.planReviewAuthorization!,
+      { acknowledgeMigrationRisk: true },
+    );
+    expect(activated.success).toBe(true);
+    expect((await harness.executor.run("manual")).success).toBe(true);
+
+    vi.mocked(harness.client.restoreVaultScope).mockReturnValue(true);
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: ReturnType<typeof vi.fn>;
+    }).restoreVaultScopeByIdentity = vi.fn().mockRejectedValue(
+      new OneDriveError(
+        OneDriveErrorType.NotFound,
+        "committed files root missing",
+        404,
+      ),
+    );
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue({
+      driveId: scope.driveId,
+      vaultFolderId: scope.vaultFolderId,
+      filesRootId: scope.filesRootId,
+    });
+    harness.getDelta.mockReset();
+    harness.getDelta.mockResolvedValue({
+      value: [{
+        id: "root-live",
+        name: "files",
+        folder: { childCount: 0 },
+        parentReference: { id: "vault-live" },
+        eTag: "etag-root-live",
+      }],
+      "@odata.deltaLink": "https://graph.example/delta-live",
+    });
+
+    const failed = await harness.executor.run("auto");
+
+    expect(failed.success).toBe(false);
+    expect(failed.errors).toBe(1);
+    expect(failed.message).toBe("result.syncFailed");
+    expect(harness.diag.error).toHaveBeenCalledWith(
+      "execute",
+      "sync run failed unexpectedly",
+      expect.stringContaining("Remote hierarchy outside known files root"),
+    );
+    expect(harness.state.hasV2RemoteScopeRecovery).toBe(false);
+    expectNoFileMutations(harness.mutations);
+  });
+
   it("publishes a complete recovered lineage that a zero-state device joins", async () => {
     const harness = makeHarness();
     await harness.state.load();

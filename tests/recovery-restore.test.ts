@@ -139,8 +139,12 @@ function makeRecoveryIndex(input: {
   const vault = makeVault(input.files ?? {}, input.vaultOptions);
   const baselines = input.baselines ?? {};
   const state = {
-    remoteIdForPath: vi.fn((path: string) => input.remoteIds?.[path]),
-    remoteETagForPath: vi.fn(() => undefined),
+    recoveryIdentityForPath: vi.fn((path: string) => {
+      const remoteId = input.remoteIds?.[path];
+      return remoteId
+        ? { kind: "resolved" as const, remoteId, baselinePath: path }
+        : undefined;
+    }),
     deletionLedgerEntries: [] as readonly DeletionLedgerEntryV1[],
     getBaseContent: vi.fn(async (path: string) => baselines[path]),
     baselineFactsForPath: vi.fn(() => undefined),
@@ -182,6 +186,7 @@ function cloudEntry(): RecoveryEntryV1 {
     handle: {
       kind: "cloud-version",
       versionId: "1.0",
+      remoteId: "note-item-id",
       downloadUrl: "https://cdn/1.0",
     },
   };
@@ -194,7 +199,7 @@ function baselineEntry(): RecoveryEntryV1 {
     at: STAMP_AT,
     size: BASELINE_TEXT.length,
     availability: "available",
-    handle: { kind: "sync-baseline", hash: NOTE_HASH },
+    handle: { kind: "sync-baseline", hash: NOTE_HASH, baselinePath: NOTE_PATH },
   };
 }
 
@@ -543,6 +548,34 @@ describe("restoreRecoveryEntryV1", () => {
     expect(result).toEqual({ kind: "copy", newPath: NOTE_PATH });
     expect(decode(await vault.adapter.readBinary(NOTE_PATH)))
       .toBe(BASELINE_TEXT);
+  });
+
+  it("restores a renamed file's baseline from the original anchor path", async () => {
+    const oldPath = "notes/old name.md";
+    const newPath = "notes/new name.md";
+    const { vault, index } = makeRecoveryIndex({
+      baselines: { [oldPath]: BASELINE_TEXT },
+    });
+
+    const result = await restoreRecoveryEntryV1({
+      index,
+      entry: {
+        ...baselineEntry(),
+        path: newPath,
+        handle: {
+          kind: "sync-baseline",
+          hash: NOTE_HASH,
+          baselinePath: oldPath,
+        },
+      },
+      adapter: vault.adapter,
+      cloud: makeCloudRestore(),
+      tmpDir: TMP_DIR,
+    });
+
+    // 恢复落点仍是新路径；内容从原锚点路径的基线读出。
+    expect(result).toEqual({ kind: "copy", newPath });
+    expect(decode(await vault.adapter.readBinary(newPath))).toBe(BASELINE_TEXT);
   });
 
   it("writes the recovered copy next to a live file instead of over it", async () => {

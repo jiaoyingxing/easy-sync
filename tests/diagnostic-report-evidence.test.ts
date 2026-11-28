@@ -594,3 +594,22 @@ describe("recent plugin data write evidence", () => {
     expect(lines[0]).not.toContain("1700000000");
   });
 });
+
+describe("diagnostic report host version", () => {
+  it("records the host Obsidian version next to the plugin version", () => {
+    // 旧宿主设置页白屏、登录不持久等问题要靠宿主 App 版本一轮定因；报告头
+    // 只有插件版本时，排查者还得回头问用户「关于」页。运行时 apiVersion 与
+    // 插件版本并列，且必须在仓库名之前。
+    const source = readFileSync("src/main.ts", "utf8");
+    const pluginVersion = source.indexOf(
+      'lines.push(`**插件版本**: ${this.manifest.version}`)',
+    );
+    const hostVersion = source.indexOf(
+      'lines.push(`**Obsidian 版本**: ${apiVersion}`)',
+    );
+    const vaultName = source.indexOf('lines.push(`**仓库名**');
+    expect(pluginVersion).toBeGreaterThan(-1);
+    expect(hostVersion).toBeGreaterThan(pluginVersion);
+    expect(vaultName).toBeGreaterThan(hostVersion);
+  });
+});

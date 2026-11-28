@@ -8,6 +8,7 @@ interface FakeStatusBar {
   removeClass: ReturnType<typeof vi.fn>;
   setCssProps: ReturnType<typeof vi.fn>;
   removeProperty: ReturnType<typeof vi.fn>;
+  setProperty: ReturnType<typeof vi.fn>;
 }
 
 function createFakeStatusBar(): FakeStatusBar {
@@ -20,13 +21,14 @@ function createFakeStatusBar(): FakeStatusBar {
   });
   const setCssProps = vi.fn((_props: Record<string, string>) => undefined);
   const removeProperty = vi.fn((_name: string) => undefined);
+  const setProperty = vi.fn((_name: string, _value: string) => undefined);
   const element = {
     addClass,
     removeClass,
     setCssProps,
-    style: { removeProperty, setProperty: vi.fn() },
+    style: { removeProperty, setProperty },
   } as unknown as HTMLElement;
-  return { element, addClass, removeClass, setCssProps, removeProperty };
+  return { element, addClass, removeClass, setCssProps, removeProperty, setProperty };
 }
 
 interface PluginHarness {
@@ -65,24 +67,36 @@ describe("mobile status bar", () => {
   const previousWindow = (globalThis as { window?: Window }).window;
   let statusBar: FakeStatusBar;
   let statusBarPresent: boolean;
+  let navbar: HTMLElement | null;
+  let navbarDisplay: string;
 
   beforeEach(() => {
+    // 判据是 UI 形态：真机与桌面 app.emulateMobile() 同一条路径
+    // （2026-11-27 回归：桌面模拟移动端曾因 isMobileApp 门整条跳过，
+    // 而宿主已用 `.is-mobile .status-bar` 隐藏桌面状态栏，右下角全空）。
     Platform.isMobile = true;
-    Platform.isMobileApp = true;
+    Platform.isMobileApp = false;
     statusBar = createFakeStatusBar();
     statusBarPresent = true;
-    const querySelector = vi.fn((selector: string) =>
-      selector === ".is-mobile .app-container .status-bar" && statusBarPresent
-        ? statusBar.element
-        : null,
-    );
+    navbar = null;
+    navbarDisplay = "none";
+    const querySelector = vi.fn((selector: string) => {
+      if (selector === ".is-mobile .app-container .status-bar") {
+        return statusBarPresent ? statusBar.element : null;
+      }
+      if (selector === ".mobile-navbar") return navbar;
+      return null;
+    });
     (globalThis as { document?: Document }).document = {
       querySelector,
     } as unknown as Document;
     (globalThis as { window?: Window }).window = {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
-      getComputedStyle: () => ({ getPropertyValue: () => "50px" }),
+      getComputedStyle: () => ({
+        display: navbarDisplay,
+        getPropertyValue: () => "52px",
+      }),
     } as unknown as Window;
   });
 
@@ -132,6 +146,47 @@ describe("mobile status bar", () => {
     expect(statusBar.removeProperty).toHaveBeenCalledWith("margin-bottom");
     expect(isRetryArmed(plugin)).toBe(false);
     expect(workspaceOffref).toHaveBeenCalledOnce();
+  });
+
+  it("does nothing on the normal desktop UI", () => {
+    Platform.isMobile = false;
+    const { plugin, workspaceOn, layoutReadyCallbacks } = makePlugin();
+    const enable = vi.spyOn(plugin as never, "enableMobileStatusBar");
+    const disable = vi.spyOn(plugin as never, "disableMobileStatusBar");
+
+    plugin.applyMobileStatusBar();
+
+    expect(enable).not.toHaveBeenCalled();
+    expect(disable).not.toHaveBeenCalled();
+    expect(workspaceOn).not.toHaveBeenCalled();
+    expect(layoutReadyCallbacks).toHaveLength(0);
+    expect(statusBar.addClass).not.toHaveBeenCalled();
+  });
+
+  it("does not reserve navbar space when the tablet navbar is display:none", () => {
+    // 平板形态的宿主保留 `.mobile-navbar` 元素但把它藏起来；按存在性判断会
+    // 让状态图标悬空（2026-11-27 实测 52px）。
+    navbar = {} as HTMLElement;
+    navbarDisplay = "none";
+    const { plugin } = makePlugin();
+
+    (plugin as never as { refreshMobileStatusBarOffset: () => void })
+      .refreshMobileStatusBarOffset();
+
+    expect(statusBar.removeProperty).toHaveBeenCalledWith("margin-bottom");
+    expect(statusBar.setProperty).not.toHaveBeenCalled();
+  });
+
+  it("reserves the navbar height when the navbar is actually laid out", () => {
+    navbar = {} as HTMLElement;
+    navbarDisplay = "flex";
+    const { plugin } = makePlugin();
+
+    (plugin as never as { refreshMobileStatusBarOffset: () => void })
+      .refreshMobileStatusBarOffset();
+
+    expect(statusBar.setProperty).toHaveBeenCalledWith("margin-bottom", "52px");
+    expect(statusBar.removeProperty).not.toHaveBeenCalled();
   });
 
   it("retries exactly once when the host status-bar element stays absent", () => {

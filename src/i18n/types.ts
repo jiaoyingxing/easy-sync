@@ -524,108 +524,6 @@ export interface LocaleStrings {
   // ---- Commands ----
   "command.syncNow": string;
   "command.showDetail": string;
-  "command.lanConnect": string;
-
-  // ---- LAN session (experimental) ----
-  "lanSession.loadFailed": string;
-  "lanSession.title": string;
-  "lanSession.intro": string;
-  "lanSession.role.sender": string;
-  "lanSession.role.receiver": string;
-  "lanSession.mode.cloud": string;
-  "lanSession.mode.manual": string;
-  "lanSession.manual.summary": string;
-  "lanSession.close": string;
-  "lanSession.cloud.sender.heading": string;
-  "lanSession.cloud.sender.desc": string;
-  "lanSession.cloud.sender.publish": string;
-  "lanSession.cloud.sender.cancel": string;
-  "lanSession.cloud.receiver.heading": string;
-  "lanSession.cloud.receiver.desc": string;
-  "lanSession.cloud.receiver.join": string;
-  "lanSession.cloud.receiver.cancel": string;
-  "lanSession.cloud.receiver.start": string;
-  "lanSession.manual.sender.desc": string;
-  "lanSession.manual.sender.generateOffer": string;
-  "lanSession.manual.sender.offerLabel": string;
-  "lanSession.manual.sender.copyOffer": string;
-  "lanSession.manual.sender.answerLabel": string;
-  "lanSession.manual.sender.connect": string;
-  "lanSession.manual.receiver.desc": string;
-  "lanSession.manual.receiver.generateAnswer": string;
-  "lanSession.manual.receiver.answerLabel": string;
-  "lanSession.manual.receiver.copyAnswer": string;
-  "lanSession.manual.receiver.inject": string;
-  "lanSession.copyLabel.offer": string;
-  "lanSession.copyLabel.answer": string;
-  "lanSession.status.syncStarted": string;
-  "lanSession.status.senderHint": string;
-  "lanSession.status.receiverHint": string;
-  "lanSession.status.modeCloud": string;
-  "lanSession.status.modeManual": string;
-  "lanSession.status.pairingReady": string;
-  "lanSession.status.offerPublished": string;
-  "lanSession.status.waitAnswerTimeout": string;
-  "lanSession.status.findingOffer": string;
-  "lanSession.status.offerFound": string;
-  "lanSession.status.answerPublished": string;
-  "lanSession.status.receiving": string;
-  "lanSession.status.receiverReady": string;
-  "lanSession.status.answerReceived": string;
-  "lanSession.status.refusedPath": string;
-  "lanSession.status.servingPath": string;
-  "lanSession.status.sending": string;
-  "lanSession.status.servedPath": string;
-  "lanSession.status.connected": string;
-  "lanSession.status.candidatesPublished": string;
-  "lanSession.status.waitingPairing": string;
-  "lanSession.status.cancelled": string;
-  "lanSession.status.failed": string;
-  "lanSession.status.iceGathering": string;
-  "lanSession.status.offerGenerated": string;
-  "lanSession.status.answerGenerated": string;
-  "lanSession.status.dcWaiting": string;
-  "lanSession.status.sourceInjected": string;
-  "lanSession.status.copyEmpty": string;
-  "lanSession.status.copied": string;
-  "lanSession.status.copyFailed": string;
-  "lanSession.status.generateOfferFailed": string;
-  "lanSession.status.connectFailed": string;
-  "lanSession.status.generateAnswerFailed": string;
-  "lanSession.status.injectFailed": string;
-  "lanSession.ice.complete": string;
-  "lanSession.ice.short": string;
-  "lanSession.ice.timeout": string;
-  "lanSession.label.host": string;
-  "lanSession.label.joiner": string;
-  "lanSession.stats": string;
-  "lanSession.error.clientNotReady": string;
-  "lanSession.error.activeSession": string;
-  "lanSession.error.publishConflict": string;
-  "lanSession.error.publishRejected": string;
-  "lanSession.error.activeInvalid": string;
-  "lanSession.error.waitOfferTimeout": string;
-  "lanSession.error.offerClosed": string;
-  "lanSession.error.offerValidation": string;
-  "lanSession.error.offerWriteTimeout": string;
-  "lanSession.error.offerType": string;
-  "lanSession.error.offerSdpEmpty": string;
-  "lanSession.error.answerRejected": string;
-  "lanSession.error.alreadyAnswered": string;
-  "lanSession.error.answerClosed": string;
-  "lanSession.error.answerValidation": string;
-  "lanSession.error.answerSdpEmpty": string;
-  "lanSession.error.dcNotInitialized": string;
-  "lanSession.error.dcTimeout": string;
-  "lanSession.error.pairingCorrupt": string;
-  "lanSession.error.cancelled": string;
-  "lanSession.error.noPairing": string;
-  "lanSession.error.pairingCreate": string;
-  "lanSession.error.manualNeedOffer": string;
-  "lanSession.error.manualNeedAnswer": string;
-  "lanSession.error.manualOfferInput": string;
-  "lanSession.error.manualAnswerInput": string;
-  "lanSession.error.dcNotEstablished": string;
 
   // ---- Sync Progress ----
   "progress.scanningLocal": string;
@@ -822,7 +720,6 @@ export interface LocaleStrings {
 
   // ---- General ----
   "general.unknown": string;
-
 
   // ---- Conflict/Delete Feedback Notices ----
   "notice.conflict.keptLocal": string;
@@ -1242,6 +1139,13 @@ export interface LocaleStrings {
   "updateCheck.optionSkipVersion": string;
   "updateCheck.confirm": string;
   "updateCheck.cancel": string;
+  "updateCheck.notesSectionTitle": string;
+  "updateCheck.notesLoading": string;
+  "updateCheck.notesLoadFailed": string;
+  "updateCheck.notesEmpty": string;
+  "updateCheck.notesEmptyRelease": string;
+  "updateCheck.notesRetry": string;
+  "updateCheck.notesOpenInBrowser": string;
 
   // ---- File version recovery (找回入口：命令＋文件菜单项＋弹框) ----
   "recovery.recentTitle": string;
@@ -1259,6 +1163,7 @@ export interface LocaleStrings {
   "recovery.source.cloudVersion": string;
   "recovery.source.syncBaseline": string;
   "recovery.reason.noRemoteIdentity": string;
+  "recovery.reason.renamePending": string;
   "recovery.reason.noVersionHistory": string;
   "recovery.reason.contentUnavailable": string;
   "recovery.reason.expired": string;

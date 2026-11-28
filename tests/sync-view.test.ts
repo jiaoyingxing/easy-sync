@@ -5041,7 +5041,8 @@ describe("buildSyncViewContentKey", () => {
     expect(section).toContain('t("syncView.delete.confirmAllTitle"');
     expect(section).toContain('t("syncView.delete.confirmAllMessage"');
     expect(section).toContain('t("syncView.delete.confirmAllWarning"');
-    expect(section).toContain("danger: true");
+    // Batch delete removes user files: solid destructive tier.
+    expect(section).toContain('danger: "destroy"');
     expect(section).toContain(".awaitConfirm()");
     expect(section).toContain("if (!confirmed) return");
     expect(section).toContain("plugin.confirmRemoteDeletes");
@@ -5283,6 +5284,23 @@ describe("buildSyncViewContentKey · update reminder row (2026-10-13 修复)", (
       source.indexOf("this.lastContentKey = contentKey"),
     );
     expect(keyCall).toContain("updatePrompt,");
+  });
+
+  it("renders the full release notes inline from the update row", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const start = source.indexOf("private renderUpdateAvailableItem(");
+    const slice = source.slice(
+      start,
+      source.indexOf("private renderPendingIssue(", start),
+    );
+    // 行内完整文稿：动作行下方挂 notes 容器，请求只在行渲染时发起。
+    expect(slice).toContain("renderUpdateNotesBlock(");
+    expect(slice).toContain("data-easy-sync-update-notes");
+    expect(slice).toContain('t("updateCheck.notesSectionTitle")');
+    expect(slice).toContain("ensureUpdateNotes(");
+    // 2026-11-27 收敛：侧栏不做「查看详情」或预览折叠。
+    expect(source).not.toContain("updateCheck.notesShowDetails");
+    expect(source).not.toContain("updateCheck.notesHideDetails");
   });
 });
 
@@ -7518,7 +7536,7 @@ describe("conflict batch row (2026-10-23)", () => {
     expect(renderer).toContain("syncView.conflict.batchKeepRemoteStep.cloudOnly");
     // 入口两颗按钮同色（中性），危险色只留给两个确认弹框的确认键。
     expect(renderer).not.toContain("applyDestructiveButton");
-    expect(renderer.match(/danger: true/g) ?? []).toHaveLength(2);
+    expect(renderer.match(/danger: "destroy"/g) ?? []).toHaveLength(2);
     expect(renderer).not.toContain("版本历史");
     expect(renderer).not.toContain("version history");
     expect(source).toContain('case "batchConflict":');

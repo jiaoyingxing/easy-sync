@@ -1,12 +1,14 @@
 /**
- * Dev-only LAN peer session for S2a (manual SDP, desktop↔desktop).
+ * LAN peer session for the experimental LAN acceleration content channel.
  *
- * The receiver asks for `{path, eTag, size}`. The sender's handler checks its
- * V2 base entry (local sha256 ↔ cloud eTag) and returns the bytes plus that
- * attested sha256. The receiver verifies the downloaded bytes against it; the
- * existing post-download eTag re-read confirms the cloud version. This module
- * is dynamically imported by the hidden `lan-session-dev` command and is not
- * product code.
+ * The automatic connection manager owns the handshake and constructs this
+ * session once the data channel is open. The receiver asks for
+ * `{path, eTag, size}`; the sender's handler checks its V2 base entry (local
+ * sha256 ↔ cloud eTag) and returns the bytes plus that attested sha256. The
+ * receiver verifies the downloaded bytes against it, and the existing
+ * post-download eTag re-read confirms the cloud version. Kept behind the
+ * manager's dynamic import so WebRTC and the session code stay out of the
+ * startup closure; this module has no UI.
  */
 import { sha256Hex } from "../crypto";
 import { StreamingSha256 } from "../onedrive/client";
@@ -830,55 +832,6 @@ export function createLanContentSource(
       }
     },
   };
-}
-
-export async function waitForIceGathering(
-  pc: RTCPeerConnection,
-  timeoutMs = 12000,
-): Promise<"complete" | "timeout"> {
-  if (pc.iceGatheringState === "complete") return "complete";
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result: "complete" | "timeout"): void => {
-      if (settled) return;
-      settled = true;
-      pc.removeEventListener("icegatheringstatechange", onStateChange);
-      window.clearTimeout(timer);
-      resolve(result);
-    };
-    const onStateChange = (): void => {
-      if (pc.iceGatheringState === "complete") finish("complete");
-    };
-    const timer = window.setTimeout(() => finish("timeout"), timeoutMs);
-    pc.addEventListener("icegatheringstatechange", onStateChange);
-  });
-}
-
-export async function waitForDataChannelOpen(
-  dc: RTCDataChannel,
-  timeoutMs = 20000,
-): Promise<void> {
-  if (dc.readyState === "open") return;
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const finish = (error?: Error): void => {
-      if (settled) return;
-      settled = true;
-      dc.removeEventListener("open", onOpen);
-      dc.removeEventListener("close", onClose);
-      window.clearTimeout(timer);
-      if (error) reject(error);
-      else resolve();
-    };
-    const onOpen = (): void => finish();
-    const onClose = (): void => finish(new Error("LAN data channel closed before open"));
-    const timer = window.setTimeout(
-      () => finish(new Error("LAN data channel open timeout")),
-      timeoutMs,
-    );
-    dc.addEventListener("open", onOpen, { once: true });
-    dc.addEventListener("close", onClose, { once: true });
-  });
 }
 
 /** Keep the parser's required final line break (S1 probe finding). */

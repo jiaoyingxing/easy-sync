@@ -1078,6 +1078,37 @@ function composeCanonicalActionsV2(
     });
   }
 
+  // The create marker protects the new parent's subtree below. The old cloud
+  // paths of the folders being moved need the same hold: without it the file
+  // planner could read "old path missing locally" as a remote deletion while
+  // the same content is waiting under the new parent. Only hints that still
+  // match their committed folder anchor and actually target a marked create
+  // participate; unrelated moves keep their ordinary semantics.
+  const stagedCreateRoots = folderPlan.items
+    .filter((item) => item.type === "create-remote" && item.carriesMovedSubtree)
+    .map((item) => item.path);
+  const stagedChildFolderPaths = new Set<string>();
+  if (stagedCreateRoots.length > 0) {
+    for (const hint of input.localMoveHints ?? []) {
+      const anchor = state.folderAnchorByRemoteId.get(hint.remoteId);
+      if (
+        !anchor
+        || anchor.lastPath !== hint.fromPath
+        || !stagedCreateRoots.some((root) =>
+          isAtOrBelowPath(hint.toPath, root))
+      ) continue;
+      protectedRoots.add(hint.fromPath);
+      stagedChildFolderPaths.add(hint.fromPath);
+      stagedChildFolderPaths.add(hint.toPath);
+    }
+  }
+  const isStagedChildPath = (path: string | undefined): boolean =>
+    Boolean(path)
+    && [...stagedChildFolderPaths].some((root) =>
+      isAtOrBelowPath(path!, root));
+  const isStagedChildItem = (item: SyncPlanItem): boolean =>
+    isStagedChildPath(item.path) || isStagedChildPath(item.renameFrom);
+
   const leafUnanchoredRoots = [...unanchoredProtectedRoots].filter(
     (root) =>
       ![...unanchoredProtectedRoots].some(
@@ -1187,11 +1218,11 @@ function composeCanonicalActionsV2(
     unanchoredDescendantEvidence,
     items: [
       ...createItems,
-      ...moveItems,
-      ...identityItems,
+      ...moveItems.filter((item) => !isStagedChildItem(item)),
+      ...identityItems.filter((item) => !isStagedChildItem(item)),
       ...fileItems,
-      ...deleteItems,
-      ...deferredItems,
+      ...deleteItems.filter((item) => !isStagedChildItem(item)),
+      ...deferredItems.filter((item) => !isStagedChildItem(item)),
     ],
   };
 }
@@ -1214,6 +1245,7 @@ interface ApplyCreateRemoteFolderItemInputV2 {
   canonicalFolderPathById: ReadonlyMap<string, string>;
   plannedRemoteCreates: ReadonlySet<string>;
   plannedRemoteFolderPaths: ReadonlyMap<string, string>;
+  protectedRoots: Set<string>;
   createItems: SyncPlanItem[];
   deferredItems: SyncPlanItem[];
 }
@@ -1234,6 +1266,7 @@ function applyCreateRemoteFolderItemV2({
   canonicalFolderPathById,
   plannedRemoteCreates,
   plannedRemoteFolderPaths,
+  protectedRoots,
   createItems,
   deferredItems,
 }: ApplyCreateRemoteFolderItemInputV2): void {
@@ -1280,12 +1313,21 @@ function applyCreateRemoteFolderItemV2({
   createItems.push({
     type: SyncActionType.CreateRemoteFolder,
     path: item.path,
+    ...(item.carriesMovedSubtree
+      ? { reviewImpactCount: Math.max(1, item.impact.files + item.impact.folders) }
+      : {}),
     folder: {
       parentRemoteId,
       parentPath: parent,
       parentRemoteETag: parentNode?.eTag,
     },
   });
+  if (item.carriesMovedSubtree) {
+    // Hold every ordinary action under the new parent (including copies that
+    // look like rename candidates) until the bounded same-run continuation has
+    // created this folder and moved the anchored subtrees into it.
+    protectedRoots.add(item.path);
+  }
   return;
 }
 
@@ -1588,6 +1630,7 @@ function applyFolderPlanItemV2(args: {
       canonicalFolderPathById,
       plannedRemoteCreates,
       plannedRemoteFolderPaths,
+      protectedRoots,
       createItems,
       deferredItems,
     });

@@ -5,7 +5,7 @@ import {
   createEasySyncModalFooter,
   EasySyncModal,
 } from "./easy-sync-modal";
-import { applyDestructiveButton } from "./destructive-button";
+import { applyDestructivePrimaryButton } from "./destructive-button";
 import type {
   EmptyFolderResolutionSnapshotV1,
   FolderLocationResolutionSnapshotV1,
@@ -101,7 +101,8 @@ export class EmptyFolderResolutionModal extends EasySyncModal<EmptyFolderResolut
         ? this.t("syncView.emptyFolder.deleteDescription")
         : this.t("syncView.emptyFolder.deleteUnavailableDescription"));
     if (this.snapshot.remoteETag) {
-      deleteSetting.addButton((button) => applyDestructiveButton(button)
+      // Deletes the cloud folder that other devices still see: solid tier.
+      deleteSetting.addButton((button) => applyDestructivePrimaryButton(button)
         .setButtonText(this.t("syncView.emptyFolder.deleteConfirm"))
         .onClick(() => this.settle({ action: "delete" })));
     }
@@ -185,7 +186,8 @@ export class EmptyFolderResolutionModal extends EasySyncModal<EmptyFolderResolut
         ? this.t("syncView.folderSubtree.deleteDescription")
         : this.t("syncView.folderSubtree.deleteUnavailableDescription"));
     if (root?.remoteETag) {
-      deleteSetting.addButton((button) => applyDestructiveButton(button)
+      // Deletes the cloud subtree that other devices still see: solid tier.
+      deleteSetting.addButton((button) => applyDestructivePrimaryButton(button)
         .setButtonText(this.t("syncView.folderSubtree.delete"))
         .onClick(() => this.settle({ action: "delete-subtree" })));
     }

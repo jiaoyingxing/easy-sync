@@ -87,7 +87,15 @@ export class ConfirmModal extends EasySyncModal<boolean> {
        *  one sentence and zero-file actions stay paragraphs (2026-10-31). */
       steps?: readonly string[];
       warning?: string;
-      danger?: boolean;
+      /** Destructive tier of the accept button (2026-11-27 user decision).
+       *  Required whenever accepting is destructive, so every call site states
+       *  the consequence instead of inheriting a default:
+       *  - `"destroy"` — accepting deletes user files or overwrites the only
+       *    surviving copy → host solid tier (`setDestructive().setCta()`).
+       *  - `"rebuildable"` — accepting only clears rebuildable local state
+       *    (reset, sign-out, unbind) → host tinted tier (`setDestructive()`).
+       *  Omit for non-destructive confirms (accept is the ordinary CTA). */
+      danger?: "destroy" | "rebuildable";
       /** Extra class for the message paragraph; omit for a plain paragraph
        *  written identically to the warning line. */
       messageClass?: string;
@@ -144,7 +152,9 @@ export class ConfirmModal extends EasySyncModal<boolean> {
     });
     addEasySyncFooterButton(btnRow, {
       label: this.confirmLabel,
-      variant: this.options?.danger ? "destructive" : "cta",
+      variant: this.options?.danger === "destroy" ? "destructive-primary"
+        : this.options?.danger === "rebuildable" ? "destructive"
+        : "cta",
       onClick: () => {
         this.settle(true);
       },
